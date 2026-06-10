@@ -1,0 +1,11 @@
+{
+  "experiments": [
+    {
+      "experiment": "H1",
+      "rows": 12,
+      "summary_rows": 3,
+      "elapsed_s": 0.02788,
+      "out_dir": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/out/h1245_h3_synthetic_smoke/h1"
+    }
+  ]
+}

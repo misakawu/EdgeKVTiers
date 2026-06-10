@@ -1,0 +1,63 @@
+{
+  "experiment": "H4",
+  "trace_source": "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+  "objects": 88,
+  "requests": 500,
+  "token_ref": 72733,
+  "m_budgets": [
+    1600.0,
+    2200.0,
+    3000.0
+  ],
+  "epsilon_norms": [
+    0.002,
+    0.004,
+    0.008
+  ],
+  "epsilon_abs_values": [
+    145.466,
+    290.932,
+    581.864
+  ],
+  "repeats": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "baselines": [
+    {
+      "method": "ragcache_pgdsf_approx",
+      "policy": "pgdsf",
+      "offload_keep_threshold": 1.1
+    },
+    {
+      "method": "static-int4",
+      "policy": "static-int4",
+      "offload_keep_threshold": 1.1
+    },
+    {
+      "method": "lpe-only",
+      "policy": "score",
+      "offload_keep_threshold": 1.1
+    },
+    {
+      "method": "tms-tiered",
+      "policy": "tiered",
+      "offload_keep_threshold": 1.1
+    }
+  ],
+  "base_config": {
+    "mu_kv_mb_per_token": 0.12,
+    "c_re_ms_per_token": 0.12,
+    "d_deser_ms": 3.0,
+    "seed": 4,
+    "m_budget_mb": 800.0,
+    "bw_gbps": 8.0,
+    "epsilon": 4.0,
+    "offload_keep_threshold": 0.35,
+    "trace_requests": 500,
+    "warmup_requests": 50
+  }
+}

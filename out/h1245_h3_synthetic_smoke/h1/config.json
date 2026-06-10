@@ -1,0 +1,32 @@
+{
+  "experiment": "H1",
+  "trace_source": "synthetic",
+  "objects": 38,
+  "requests": 60,
+  "token_ref": 4293,
+  "policies": [
+    "lru",
+    "lfu",
+    "score",
+    "tiered"
+  ],
+  "m_budgets": [
+    3000.0,
+    3400.0,
+    3800.0
+  ],
+  "epsilon_abs": 4.0,
+  "epsilon_norm": 0.0009317493594223154,
+  "base_config": {
+    "mu_kv_mb_per_token": 0.12,
+    "c_re_ms_per_token": 0.12,
+    "d_deser_ms": 3.0,
+    "seed": 1,
+    "m_budget_mb": 800.0,
+    "bw_gbps": 8.0,
+    "epsilon": 4.0,
+    "offload_keep_threshold": 1.1,
+    "trace_requests": 60,
+    "warmup_requests": 50
+  }
+}

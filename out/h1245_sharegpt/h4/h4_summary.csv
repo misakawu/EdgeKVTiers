@@ -1,0 +1,10 @@
+experiment,m_budget_mb,epsilon_abs,epsilon_norm,score_only_mean_p95_ms,tms_mean_p95_ms,tms_improvement_vs_score_pct,best_baseline_mean_p95_ms,tms_improvement_vs_best_pct,tms_qloss_ok_all_repeats,passes_tiered_below_score,passes_25pct_gate
+H4,1600.0,145.466,0.002,212.4,198.636,6.480226,212.4,6.480226,True,True,False
+H4,1600.0,290.932,0.004,212.4,180.6,14.971751,212.4,14.971751,True,True,False
+H4,1600.0,581.864,0.008,212.4,162.33,23.573446,117.012,-38.729361,True,True,False
+H4,2200.0,145.466,0.002,190.518,185.946,2.399773,190.518,2.399773,True,True,False
+H4,2200.0,290.932,0.004,190.518,177.72,6.717476,190.518,6.717476,True,True,False
+H4,2200.0,581.864,0.008,190.518,104.646,45.072906,104.646,0.0,True,True,False
+H4,3000.0,145.466,0.002,170.4,177.72,-4.295775,170.4,-4.295775,True,False,False
+H4,3000.0,290.932,0.004,170.4,145.308,14.725352,170.4,14.725352,True,True,False
+H4,3000.0,581.864,0.008,170.4,104.646,38.588028,104.646,0.0,True,True,False

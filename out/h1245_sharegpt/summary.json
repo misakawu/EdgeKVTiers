@@ -1,0 +1,32 @@
+{
+  "experiments": [
+    {
+      "experiment": "H1",
+      "rows": 12,
+      "summary_rows": 3,
+      "elapsed_s": 0.726525,
+      "out_dir": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/out/h1245_sharegpt/h1"
+    },
+    {
+      "experiment": "H2",
+      "rows": 18,
+      "summary_rows": 6,
+      "elapsed_s": 1.837926,
+      "out_dir": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/out/h1245_sharegpt/h2"
+    },
+    {
+      "experiment": "H4",
+      "rows": 180,
+      "summary_rows": 9,
+      "elapsed_s": 10.638134,
+      "out_dir": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/out/h1245_sharegpt/h4"
+    },
+    {
+      "experiment": "H5",
+      "rows": 35,
+      "object_rows": 3080,
+      "elapsed_s": 0.230853,
+      "out_dir": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/out/h1245_sharegpt/h5"
+    }
+  ]
+}
