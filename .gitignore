@@ -1,0 +1,25 @@
+# Runtime outputs and experiment artifacts
+out/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local tool state
+.venv/
+venv/
+env/
+.env
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# New files are expected to be source/docs only unless explicitly staged.
+*
+!*/
+!*.py
+!*.md
+!.gitignore
