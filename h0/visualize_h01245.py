@@ -104,13 +104,16 @@ def plot_h4(h1245_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h1245_dir / "h4" / "h4_summary.csv")
     budgets = sorted({as_float(row, "m_budget_mb") for row in rows})
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 4.5))
-    for budget in budgets:
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for idx, budget in enumerate(budgets):
+        color = colors[idx % len(colors)]
         sub = [row for row in rows if as_float(row, "m_budget_mb") == budget]
         sub.sort(key=lambda row: as_float(row, "epsilon_norm"))
         axes[0].plot(
             [as_float(row, "epsilon_norm") for row in sub],
             [as_float(row, "tms_mean_p95_ms") for row in sub],
             marker="o",
+            color=color,
             label=f"TMS {int(budget)} MB",
         )
         axes[0].plot(
@@ -118,12 +121,14 @@ def plot_h4(h1245_dir: Path, out_dir: Path, plt) -> None:
             [as_float(row, "score_only_mean_p95_ms") for row in sub],
             linestyle="--",
             marker="x",
+            color=color,
             label=f"score {int(budget)} MB",
         )
         axes[1].plot(
             [as_float(row, "epsilon_norm") for row in sub],
             [as_float(row, "tms_improvement_vs_score_pct") for row in sub],
             marker="o",
+            color=color,
             label=f"{int(budget)} MB",
         )
     axes[0].set_xlabel("epsilon_norm")
