@@ -1,0 +1,22 @@
+{
+  "seed": 11,
+  "trace": {
+    "source": "synthetic",
+    "seed": 11,
+    "requests": 300,
+    "max_requests": 240
+  },
+  "device_profile": {
+    "name": "edge_smoke",
+    "m_budget_mb": 520.0,
+    "bw_gbps": 2.0,
+    "mu_kv_mb_per_token": 0.12,
+    "c_re_ms_per_token": 0.12,
+    "d_deser_ms": 6.0
+  },
+  "epsilon_norm": 0.0002,
+  "policy": "tiered",
+  "rrs_mode": "rrs",
+  "warmup_requests": 30,
+  "offload_keep_threshold": 0.35
+}
