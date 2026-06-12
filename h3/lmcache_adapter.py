@@ -11,10 +11,14 @@ installed cache layer exposes. The adapter therefore supports two common forms:
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "h0"))
 
 import run_h0
 
