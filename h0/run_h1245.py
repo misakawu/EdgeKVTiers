@@ -13,17 +13,15 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import run_h0
-import h3_lmcache_adapter
+
 
 
 REPO_ROOT = run_h0.REPO_ROOT
 sim = run_h0.sim
 
-DEFAULT_OUT_DIR = REPO_ROOT / "out" / "h1245"
+DEFAULT_OUT_DIR = REPO_ROOT / "h0" / "out" / "h1245"
 DEFAULT_MAX_SESSIONS = 200
 DEFAULT_MAX_REQUESTS = 500
-DEFAULT_H3_EVENT_SAMPLE = 200
-
 H1_M_BUDGETS = [3000.0, 3400.0, 3800.0]
 H1_POLICIES = ["lru", "lfu", "score", "tiered"]
 
@@ -79,39 +77,16 @@ def write_config(out_dir: Path, data: dict) -> None:
     run_h0.write_json(out_dir / "config.json", data)
 
 
-def write_h3_outputs(
-    *,
-    out_root: Path,
-    objects: Sequence[object],
-    requests: Sequence[object],
-    trace_source: str,
-    sample_events: bool,
-    sample_limit: int,
-) -> None:
-    token_ref = sim.token_ref_for_objects(objects)
-    h3_lmcache_adapter.write_h3_contract(out_root, trace_source=trace_source, token_ref=token_ref)
-    if not sample_events:
-        return
+def pct_delta(before: float, after: float) -> float:
+    if abs(before) < 1e-12:
+        return 0.0
+    return round((before - after) / before * 100.0, 6)
 
-    cfg = sim.SimConfig(
-        seed=3,
-        trace_requests=min(len(requests), sample_limit),
-        m_budget_mb=520.0,
-        bw_gbps=2.0,
-        epsilon=sim.denormalize_epsilon(0.0002, token_ref),
-        d_deser_ms=6.0,
-        warmup_requests=0,
-    )
-    _, raw_events = sim.run_one(
-        objects,
-        list(requests)[:sample_limit],
-        cfg,
-        policy="tiered",
-        rrs_mode="rrs",
-        emit_events=True,
-    )
-    enriched = run_h0.enrich_events(raw_events, objects, cfg, "h3_edge_sample")
-    h3_lmcache_adapter.write_h3_event_sample(out_root, enriched, limit=sample_limit)
+
+def pct_gap(after: float, before: float) -> float:
+    if abs(before) < 1e-12:
+        return 0.0
+    return round((after - before) / before * 100.0, 6)
 
 
 def run_h1(objects: Sequence[object], requests: Sequence[object], trace_source: str, out_dir: Path) -> dict:
@@ -146,11 +121,8 @@ def run_h1(objects: Sequence[object], requests: Sequence[object], trace_source: 
                 "score_p95_ms": score_p95,
                 "lru_p95_ms": lru_p95,
                 "lfu_p95_ms": lfu_p95,
-                "improvement_vs_lru_pct": round((lru_p95 - score_p95) / lru_p95 * 100.0, 6),
-                "improvement_vs_best_lru_lfu_pct": round(
-                    (best_baseline - score_p95) / best_baseline * 100.0,
-                    6,
-                ),
+                "improvement_vs_lru_pct": pct_delta(lru_p95, score_p95),
+                "improvement_vs_best_lru_lfu_pct": pct_delta(best_baseline, score_p95),
                 "passes_20pct_lru_gate": score_p95 <= lru_p95 * 0.80,
             }
         )
@@ -216,7 +188,7 @@ def run_h2(objects: Sequence[object], requests: Sequence[object], trace_source: 
                 "rrs_p95_ms": rrs_p95,
                 "best_fixed_p95_ms": fixed_best,
                 "rrs_not_worse_than_best_fixed": rrs_p95 <= fixed_best + 1e-9,
-                "rrs_gap_vs_best_fixed_pct": round((rrs_p95 - fixed_best) / fixed_best * 100.0, 6),
+                "rrs_gap_vs_best_fixed_pct": pct_gap(rrs_p95, fixed_best),
                 "rrs_recompute_ratio": by_mode["rrs"]["recompute_ratio"],
                 "rrs_restore_ratio": by_mode["rrs"]["restore_ratio"],
             }
@@ -298,14 +270,11 @@ def run_h4(objects: Sequence[object], requests: Sequence[object], trace_source: 
                     "epsilon_norm": round(epsilon_norm, 9),
                     "score_only_mean_p95_ms": round(score_only_p95, 6),
                     "tms_mean_p95_ms": round(tms_p95, 6),
-                    "tms_improvement_vs_score_pct": round((score_only_p95 - tms_p95) / score_only_p95 * 100.0, 6),
+                    "tms_improvement_vs_score_pct": pct_delta(score_only_p95, tms_p95),
                     "best_baseline_mean_p95_ms": round(baseline_best, 6),
-                    "tms_improvement_vs_best_pct": round(
-                        (baseline_best - tms_p95) / baseline_best * 100.0
-                        if baseline_best != float("inf")
-                        else 0.0,
-                        6,
-                    ),
+                    "tms_improvement_vs_best_pct": pct_delta(baseline_best, tms_p95)
+                    if baseline_best != float("inf")
+                    else 0.0,
                     "tms_qloss_ok_all_repeats": method_means["tms-tiered"]["qloss_ok"],
                     "passes_tiered_below_score": tms_p95 < score_only_p95,
                     "passes_25pct_gate": baseline_best != float("inf") and tms_p95 <= baseline_best * 0.75,
@@ -488,9 +457,6 @@ def main() -> None:
     parser.add_argument("--trace-path", default=str(run_h0.DEFAULT_SHAREGPT_TRACE_PATH))
     parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
-    parser.add_argument("--h3-contract", action="store_true", help="Write LMCache/vLLM H3 adapter contract files.")
-    parser.add_argument("--emit-h3-events", action="store_true", help="Write an H0-to-H3 hook event sample JSONL.")
-    parser.add_argument("--h3-event-limit", type=int, default=DEFAULT_H3_EVENT_SAMPLE)
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR))
     args = parser.parse_args()
 
@@ -512,16 +478,6 @@ def main() -> None:
             "max_requests": args.max_requests,
         },
     )
-    if args.h3_contract or args.emit_h3_events:
-        write_h3_outputs(
-            out_root=out_root,
-            objects=objects,
-            requests=requests,
-            trace_source=trace_source,
-            sample_events=args.emit_h3_events,
-            sample_limit=args.h3_event_limit,
-        )
-
     runners = {
         "h1": run_h1,
         "h2": run_h2,

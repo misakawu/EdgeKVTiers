@@ -461,11 +461,10 @@ flowchart TD
 
 文件：[h0/run_h1245.py](/D:/EdgeKVTiers/h0/run_h1245.py:1)
 
-`run_h1245.py` 的职责是在 `H0` 已经统一好的 trace 装载逻辑和 `sim.py` 的解析仿真逻辑之上，批量运行 `H1/H2/H4/H5`。它本身不实现新的状态机，而是复用：
+`run_h1245.py` 的职责是在 `H0` 已经统一好的 trace 装载逻辑和 `sim.py` 的解析仿真逻辑之上，批量运行 `H1/H2/H4/H5`。它本身不实现新的状态机，也不再承担 H3 接入导出；H3 已升级为独立的 `h3/run_h3.py` 策略层验证入口。它复用：
 
 1. `sim.py`：作为所有实验的底层代价模型和仿真执行器。
 2. `run_h0.py`：作为 trace 装载、标准输出和部分事件标准化工具。
-3. `h3_lmcache_adapter.py`：在需要时输出 H3 插件契约和 H0/H3 语义对齐样例。
 
 ### 3.1 调用层级关系
 
@@ -479,9 +478,8 @@ flowchart TD
    5. `run_h0.write_csv(...)`
    6. `run_h0.enrich_events(...)`
 2. 通过 `sim = run_h0.sim` 共享同一个 `sim.py` 模块实例。
-3. 通过 `h3_lmcache_adapter` 复用 H3 hook 契约导出逻辑。
 
-因此 `H1245` 不是独立环境，而是构建在 `H0 + sim` 之上的实验批处理层。
+因此 `H1245` 不是独立环境，而是构建在 `H0 + sim` 之上的实验批处理层；H3 的 LMCache/vLLM 外围策略层放在 `h3/` 单独维护。
 
 ### 3.2 顶层配置与实验选择逻辑
 
@@ -531,21 +529,7 @@ flowchart TD
 1. 将实验配置快照输出为 `config.json`。
 2. 统一所有 `H1/H2/H4/H5` 的配置输出格式。
 
-`write_h3_outputs(...)`
-
-作用：
-
-1. 当命令行启用 `--h3-contract` 或 `--emit-h3-events` 时，导出 H3 相关辅助产物。
-
-具体流程：
-
-1. 计算 `token_ref`。
-2. 调用 `h3_lmcache_adapter.write_h3_contract(...)` 输出 H3 hook 契约。
-3. 若启用样例事件导出，则：
-   1. 构造一组专门用于 H3 样例的 `SimConfig`。
-   2. 调用 `sim.run_one(...)` 跑一段短 trace。
-   3. 调用 `run_h0.enrich_events(...)` 将原始事件提升为 H0 标准事件。
-   4. 调用 `h3_lmcache_adapter.write_h3_event_sample(...)` 输出 H0/H3 语义对齐样例。
+默认输出目录为 `h0/out/h1245`。H0 的 replay 输出也应落在 `h0/out/...`，H3 的策略层接入产物统一落在 `h3/out/...`。
 
 ### 3.4 `H1` 的代码逻辑
 
@@ -711,14 +695,13 @@ flowchart TD
 3. 调用 `load_h0_trace(...)` 加载统一 trace。
 4. 计算 `token_ref`。
 5. 输出 `trace.resolved.json`。
-6. 若启用 H3 相关选项，则调用 `write_h3_outputs(...)`。
-7. 根据实验名从 `runners` 字典中选取：
+6. 根据实验名从 `runners` 字典中选取：
    1. `run_h1`
    2. `run_h2`
    3. `run_h4`
    4. `run_h5`
-8. 逐个实验执行并将结果写入对应子目录。
-9. 汇总所有实验结果为 `summary.json`。
+7. 逐个实验执行并将结果写入对应子目录。
+8. 汇总所有实验结果为 `summary.json`。
 
 调用关系如下：
 
@@ -729,10 +712,6 @@ flowchart TD
     C --> C1[run_h0.load_trace]
     C1 --> C2[sim trace loaders]
     A --> D[write trace.resolved.json]
-    A --> E[optional write_h3_outputs]
-    E --> E1[sim.run_one short sample]
-    E --> E2[run_h0.enrich_events]
-    E --> E3[h3_lmcache_adapter outputs]
     A --> F[runners dict]
     F --> G[run_h1]
     F --> H[run_h2]
@@ -950,7 +929,7 @@ flowchart TD
 
 当前问题：
 
-1. [h0/h3_lmcache_adapter.py](/D:/EdgeKVTiers/h0/h3_lmcache_adapter.py:1) 已有 `on_admit/on_reuse/on_pressure/on_evict` 适配层。
+1. [h3/lmcache_adapter.py](/D:/EdgeKVTiers/h3/lmcache_adapter.py:1) 已有 `on_admit/on_reuse/on_pressure/on_evict` 适配层。
 2. 当前 `HookResult` 更接近日志对象，而不是正式执行契约。
 
 所需调整：

@@ -175,9 +175,9 @@ def plot_h5(h1245_dir: Path, out_dir: Path, plt) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize H0/H1245 result summaries.")
-    parser.add_argument("--h0-dir", default=str(REPO_ROOT / "out" / "h0_sharegpt_server_edge"))
-    parser.add_argument("--h1245-dir", default=str(REPO_ROOT / "out" / "h1245_sharegpt"))
-    parser.add_argument("--out", default=str(REPO_ROOT / "out" / "h01245_visuals"))
+    parser.add_argument("--h0-dir", default=str(REPO_ROOT / "h0" / "out" / "h0_sharegpt_server_edge"))
+    parser.add_argument("--h1245-dir", default=str(REPO_ROOT / "h0" / "out" / "h1245_sharegpt"))
+    parser.add_argument("--out", default=str(REPO_ROOT / "h0" / "out" / "h01245_visuals"))
     args = parser.parse_args()
 
     import matplotlib

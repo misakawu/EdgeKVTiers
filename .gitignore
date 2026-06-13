@@ -23,3 +23,10 @@ env/
 !*.py
 !*.md
 !.gitignore
+# Keep relocated experiment artifacts visible to Git when they already belong
+# to this repo-level experiment record.
+!h0/out/h01245_visuals/**
+!h0/out/h0_sharegpt_server_edge/**
+!h0/out/h1245_h3_synthetic_smoke/**
+!h0/out/h1245_sharegpt/**
+!h3/out/h1245_h3_synthetic_smoke/**
