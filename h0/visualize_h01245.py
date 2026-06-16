@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 from typing import Dict, List
 
@@ -13,6 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_csv(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
     with path.open("r", encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
 
@@ -29,6 +32,8 @@ def ensure_out(path: Path) -> Path:
 
 def plot_h0(h0_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h0_dir / "summary.csv")
+    if not rows:
+        return
     labels = [row["device_profile"] for row in rows]
     p95 = [as_float(row, "ttft_p95_ms") for row in rows]
     mean = [as_float(row, "ttft_mean_ms") for row in rows]
@@ -55,6 +60,8 @@ def plot_h0(h0_dir: Path, out_dir: Path, plt) -> None:
 
 def plot_h1(h1245_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h1245_dir / "h1" / "h1_results.csv")
+    if not rows:
+        return
     policies = ["lru", "lfu", "score", "tiered"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for policy in policies:
@@ -78,6 +85,8 @@ def plot_h1(h1245_dir: Path, out_dir: Path, plt) -> None:
 
 def plot_h2(h1245_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h1245_dir / "h2" / "h2_results.csv")
+    if not rows:
+        return
     modes = ["always-restore", "always-recompute", "rrs"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for mode in modes:
@@ -102,6 +111,8 @@ def plot_h2(h1245_dir: Path, out_dir: Path, plt) -> None:
 
 def plot_h4(h1245_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h1245_dir / "h4" / "h4_summary.csv")
+    if not rows:
+        return
     budgets = sorted({as_float(row, "m_budget_mb") for row in rows})
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 4.5))
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -144,9 +155,33 @@ def plot_h4(h1245_dir: Path, out_dir: Path, plt) -> None:
     fig.savefig(out_dir / "h4_quality_benefit.png", dpi=180)
     plt.close(fig)
 
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for idx, budget in enumerate(budgets):
+        color = colors[idx % len(colors)]
+        sub = [row for row in rows if as_float(row, "m_budget_mb") == budget]
+        sub.sort(key=lambda row: as_float(row, "epsilon_norm"))
+        ax.plot(
+            [as_float(row, "epsilon_norm") for row in sub],
+            [as_float(row, "tms_improvement_vs_best_pct") for row in sub],
+            marker="o",
+            color=color,
+            label=f"{int(budget)} MB",
+        )
+    ax.axhline(25.0, color="black", linestyle="--", linewidth=1.0, label="P1 gate 25%")
+    ax.set_xlabel("epsilon_norm")
+    ax.set_ylabel("Improvement vs best valid baseline (%)")
+    ax.set_title("H4 P1 gate check")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "h4_p1_gate.png", dpi=180)
+    plt.close(fig)
+
 
 def plot_h5(h1245_dir: Path, out_dir: Path, plt) -> None:
     rows = read_csv(h1245_dir / "h5" / "h5_grid.csv")
+    if not rows:
+        return
     tier_rank = {"full": 0, "int8": 1, "int4": 2, "sparse_k": 3}
     bws = sorted({as_float(row, "bw_gbps") for row in rows})
     eps = sorted({as_float(row, "epsilon_norm") for row in rows})
@@ -165,11 +200,74 @@ def plot_h5(h1245_dir: Path, out_dir: Path, plt) -> None:
     ax.set_yticklabels([str(v) for v in eps])
     ax.set_xlabel("BW (GB/s)")
     ax.set_ylabel("epsilon_norm")
+    for y_idx, epsilon in enumerate(eps):
+        for x_idx, bw in enumerate(bws):
+            cell = by_cell[(bw, epsilon)]
+            if str(cell.get("phase_boundary_cell", "")).lower() == "true":
+                ax.scatter([x_idx], [y_idx], marker="x", color="white", linewidths=1.8)
     ax.set_title("H5 quality-bandwidth phase surface")
     cbar = fig.colorbar(image, ax=ax, ticks=list(tier_rank.values()))
     cbar.ax.set_yticklabels(list(tier_rank.keys()))
     fig.tight_layout()
     fig.savefig(out_dir / "h5_phase_surface.png", dpi=180)
+    plt.close(fig)
+
+    tau_rows = read_csv(h1245_dir / "h5" / "h5_tau.csv")
+    if tau_rows:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        for epsilon in eps:
+            sub = [row for row in tau_rows if as_float(row, "epsilon_norm") == epsilon]
+            sub.sort(key=lambda row: as_float(row, "bw_gbps"))
+            ax.plot(
+                [as_float(row, "bw_gbps") for row in sub],
+                [as_float(row, "kendall_tau") for row in sub],
+                marker="o",
+                label=f"eps {epsilon:g}",
+            )
+        ax.axhline(0.8, color="black", linestyle="--", linewidth=1.0, label="tau gate 0.8")
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("BW (GB/s)")
+        ax.set_ylabel("Kendall tau")
+        ax.set_title("H5 prediction rank agreement")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(fontsize=8, ncol=2)
+        fig.tight_layout()
+        fig.savefig(out_dir / "h5_kendall_tau.png", dpi=180)
+        plt.close(fig)
+
+
+def plot_go_nogo(h1245_dir: Path, out_dir: Path, plt) -> None:
+    report_path = h1245_dir / "go_nogo_report.json"
+    failures = read_csv(h1245_dir / "failure_cases.csv")
+    if not report_path.exists():
+        return
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    gates = report.get("gates", {})
+    labels = list(gates.keys())
+    values = [1 if gates[key] else 0 for key in labels]
+    colors = ["#2f9e44" if value else "#c92a2a" for value in values]
+
+    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 4.5))
+    axes[0].barh(range(len(labels)), values, color=colors)
+    axes[0].set_yticks(range(len(labels)))
+    axes[0].set_yticklabels(labels, fontsize=8)
+    axes[0].set_xlim(0, 1)
+    axes[0].set_xticks([0, 1])
+    axes[0].set_xticklabels(["fail", "pass"])
+    axes[0].set_title(f"Go/No-Go: {report.get('status', 'unknown')}")
+
+    by_type: Dict[str, int] = {}
+    for row in failures:
+        kind = str(row.get("case_id", "UNKNOWN")).split("-")[0]
+        by_type[kind] = by_type.get(kind, 0) + 1
+    if by_type:
+        axes[1].bar(list(by_type.keys()), list(by_type.values()), color="#4c6ef5")
+    axes[1].set_ylabel("cases")
+    axes[1].set_title("Extracted failure cases")
+    axes[1].grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "go_nogo_summary.png", dpi=180)
     plt.close(fig)
 
 
@@ -192,6 +290,7 @@ def main() -> None:
     plot_h2(h1245_dir, out_dir, plt)
     plot_h4(h1245_dir, out_dir, plt)
     plot_h5(h1245_dir, out_dir, plt)
+    plot_go_nogo(h1245_dir, out_dir, plt)
     print(f"visualizations written to {out_dir}")
 
 

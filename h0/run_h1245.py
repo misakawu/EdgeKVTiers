@@ -10,7 +10,7 @@ import statistics
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import run_h0
 
@@ -34,6 +34,7 @@ H4_REPEATS = [1, 2, 3, 4, 5]
 H4_BASELINES = [
     {"method": "ragcache_pgdsf_approx", "policy": "pgdsf", "offload_keep_threshold": 1.1},
     {"method": "static-int4", "policy": "static-int4", "offload_keep_threshold": 1.1},
+    {"method": "static-sparse-k", "policy": "static-sparse-k", "offload_keep_threshold": 1.1},
     {"method": "lpe-only", "policy": "score", "offload_keep_threshold": 1.1},
     {"method": "tms-tiered", "policy": "tiered", "offload_keep_threshold": 1.1},
 ]
@@ -87,6 +88,30 @@ def pct_gap(after: float, before: float) -> float:
     if abs(before) < 1e-12:
         return 0.0
     return round((after - before) / before * 100.0, 6)
+
+
+def calibration_metadata() -> dict:
+    return {
+        "source": "analytical_defaults",
+        "status": "placeholder_until_real_calibration",
+        "sim_tiers": sim.TIERS,
+        "missing_external_inputs": [
+            "real_vllm_ttft_hit_rate_memory_peak",
+            "measured_c_re_mu_kv_d_deser",
+            "kivi_kvquant_quality_triples",
+            "h2o_snapkv_sparse_k_quality_triples",
+        ],
+    }
+
+
+def write_events_sample(path: Path, events: Iterable[dict], *, limit: int = 500) -> int:
+    rows = []
+    for idx, event in enumerate(events):
+        if idx >= limit:
+            break
+        rows.append(event)
+    run_h0.write_jsonl(path, rows)
+    return len(rows)
 
 
 def run_h1(objects: Sequence[object], requests: Sequence[object], trace_source: str, out_dir: Path) -> dict:
@@ -166,11 +191,15 @@ def run_h2(objects: Sequence[object], requests: Sequence[object], trace_source: 
         cfg = sim.config_with(base_cfg, bw_gbps=bw)
         costs = cost_snapshot(objects, cfg)
         for rrs_mode in H2_RRS_MODES:
-            metrics, _ = sim.run_one(objects, requests, cfg, policy="tiered", rrs_mode=rrs_mode)
+            metrics, raw_events = sim.run_one(
+                objects, requests, cfg, policy="tiered", rrs_mode=rrs_mode, emit_events=True
+            )
             row = sim.metrics_row(metrics, "H2")
             row.update(costs)
             row["critical_bw_gbps"] = round(cfg.mu_kv_mb_per_token / max(cfg.c_re_ms_per_token, 1e-9), 6)
             rows.append(row)
+            enriched_events = run_h0.enrich_events(raw_events, objects, cfg, f"h2_bw_{bw:g}_{rrs_mode}")
+            write_events_sample(out_dir / "events" / f"bw_{bw:g}_{rrs_mode}.jsonl", enriched_events)
 
     summary_rows: List[dict] = []
     for bw in H2_BW_GRID:
@@ -210,6 +239,8 @@ def run_h2(objects: Sequence[object], requests: Sequence[object], trace_source: 
             "epsilon_abs": base_cfg.epsilon,
             "epsilon_norm": sim.normalize_qloss(base_cfg.epsilon, token_ref),
             "base_config": asdict(base_cfg),
+            "event_samples": "events/*.jsonl",
+            "calibration": calibration_metadata(),
         },
     )
     return {"experiment": "H2", "rows": len(rows), "summary_rows": len(summary_rows), "elapsed_s": round(time.perf_counter() - started, 6)}
@@ -238,6 +269,13 @@ def run_h4(objects: Sequence[object], requests: Sequence[object], trace_source: 
                     row["method"] = baseline["method"]
                     row["epsilon_norm_cfg"] = round(epsilon_norm, 9)
                     row["qloss_within_budget"] = row["qloss_peak_abs"] <= epsilon_abs + 1e-9
+                    row["TTFT_p95"] = row["ttft_p95_ms"]
+                    row["QLoss_abs"] = row["qloss_peak_abs"]
+                    row["QLoss_norm"] = row["qloss_peak_norm"]
+                    row["M_peak"] = row["memory_peak_mb"]
+                    row["N_mig"] = row["migrations"]
+                    row["T_policy"] = 0.0
+                    row["c_mig"] = 0.0
                     rows.append(row)
 
     summary_rows: List[dict] = []
@@ -278,6 +316,7 @@ def run_h4(objects: Sequence[object], requests: Sequence[object], trace_source: 
                     "tms_qloss_ok_all_repeats": method_means["tms-tiered"]["qloss_ok"],
                     "passes_tiered_below_score": tms_p95 < score_only_p95,
                     "passes_25pct_gate": baseline_best != float("inf") and tms_p95 <= baseline_best * 0.75,
+                    "gate_basis": "analytical_simulation_calibrated_inputs_pending",
                 }
             )
 
@@ -297,6 +336,8 @@ def run_h4(objects: Sequence[object], requests: Sequence[object], trace_source: 
             "repeats": H4_REPEATS,
             "baselines": H4_BASELINES,
             "base_config": asdict(base_cfg),
+            "calibration": calibration_metadata(),
+            "pgdsf_note": "ragcache_pgdsf_approx uses simulator PGDSF-style cost density, not RAGCache code.",
         },
     )
     return {"experiment": "H4", "rows": len(rows), "summary_rows": len(summary_rows), "elapsed_s": round(time.perf_counter() - started, 6)}
@@ -356,6 +397,147 @@ def dominant_tier(tiers: Sequence[str]) -> str:
     for q in tiers:
         counts[q] = counts.get(q, 0) + 1
     return max(counts, key=lambda q: (counts[q], -TIER_RANK[q]))
+
+
+def phase_boundary_cells(grid_rows: Sequence[dict]) -> set[tuple[float, float]]:
+    by_cell = {
+        (float(row["bw_gbps"]), float(row["epsilon_norm"])): row
+        for row in grid_rows
+    }
+    bws = sorted({cell[0] for cell in by_cell})
+    eps = sorted({cell[1] for cell in by_cell})
+    boundaries = set()
+    for b_idx, bw in enumerate(bws):
+        for e_idx, eps_value in enumerate(eps):
+            row = by_cell[(bw, eps_value)]
+            tier = row["dominant_q_offline"]
+            neighbors = []
+            if b_idx > 0:
+                neighbors.append((bws[b_idx - 1], eps_value))
+            if b_idx + 1 < len(bws):
+                neighbors.append((bws[b_idx + 1], eps_value))
+            if e_idx > 0:
+                neighbors.append((bw, eps[e_idx - 1]))
+            if e_idx + 1 < len(eps):
+                neighbors.append((bw, eps[e_idx + 1]))
+            if any(by_cell[cell]["dominant_q_offline"] != tier for cell in neighbors):
+                boundaries.add((bw, eps_value))
+    return boundaries
+
+
+def agreement_note(tau: float, agreement: float) -> str:
+    if tau >= 0.8 and agreement < 0.8:
+        return "rank_order_stable_but_exact_tier_boundary_shifted"
+    if tau < 0.8 and agreement >= 0.8:
+        return "many_exact_matches_but_nonmatching_objects_change_rank_order"
+    if tau >= 0.8:
+        return "prediction_aligned"
+    return "prediction_mismatch"
+
+
+def load_csv(path: Path) -> List[dict]:
+    import csv
+
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def extract_failure_cases(out_root: Path) -> List[dict]:
+    cases: List[dict] = []
+    h4_rows = load_csv(out_root / "h4" / "h4_summary.csv")
+    for idx, row in enumerate(h4_rows):
+        if str(row.get("passes_25pct_gate", "")).lower() != "true":
+            cases.append(
+                {
+                    "case_id": f"H4-GATE-{idx + 1:02d}",
+                    "phenomenon": "quality benefit below P1 gate",
+                    "root_cause": "TMS mean p95 does not beat best valid baseline by 25% in this analytical cell",
+                    "impact_metric": f"tms_improvement_vs_best_pct={row.get('tms_improvement_vs_best_pct', '')}",
+                    "fix_suggestion": "recheck calibrated tier triples and pressure policy before claiming H4",
+                    "fixed": False,
+                }
+            )
+        if len(cases) >= 2:
+            break
+
+    h5_grid = load_csv(out_root / "h5" / "h5_grid.csv")
+    for idx, row in enumerate(h5_grid):
+        if str(row.get("phase_boundary_cell", "")).lower() == "true":
+            cases.append(
+                {
+                    "case_id": f"H5-BOUNDARY-{idx + 1:02d}",
+                    "phenomenon": "q_star boundary jitter",
+                    "root_cause": "neighboring BW/epsilon cells switch dominant offline tier",
+                    "impact_metric": f"bw={row.get('bw_gbps')} epsilon_norm={row.get('epsilon_norm')}",
+                    "fix_suggestion": "inspect object-level q_star margins near this cell",
+                    "fixed": False,
+                }
+            )
+        if len(cases) >= 4:
+            break
+
+    h2_rows = load_csv(out_root / "h2" / "h2_summary.csv")
+    for idx, row in enumerate(h2_rows):
+        if str(row.get("rrs_not_worse_than_best_fixed", "")).lower() != "true":
+            cases.append(
+                {
+                    "case_id": f"H2-IO-{idx + 1:02d}",
+                    "phenomenon": "RRS worse than fixed envelope",
+                    "root_cause": "restore/recompute threshold is not selecting the p95-optimal action mix",
+                    "impact_metric": f"rrs_gap_vs_best_fixed_pct={row.get('rrs_gap_vs_best_fixed_pct', '')}",
+                    "fix_suggestion": "use calibrated restore/recompute latency and inspect offload-hit composition",
+                    "fixed": False,
+                }
+            )
+        if len(cases) >= 5:
+            break
+
+    run_h0.write_csv(out_root / "failure_cases.csv", cases)
+    return cases
+
+
+def write_go_nogo_report(out_root: Path, summaries: Sequence[dict], failure_cases: Sequence[dict]) -> dict:
+    h1 = load_csv(out_root / "h1" / "h1_summary.csv")
+    h2 = load_csv(out_root / "h2" / "h2_summary.csv")
+    h4 = load_csv(out_root / "h4" / "h4_summary.csv")
+    h5 = load_csv(out_root / "h5" / "h5_tau.csv")
+    report = {
+        "status": "NO-GO",
+        "basis": "analytical_simulation_only_real_calibration_pending",
+        "available_experiments": [row.get("experiment") for row in summaries],
+        "gates": {
+            "h1_any_20pct_lru": any(str(row.get("passes_20pct_lru_gate", "")).lower() == "true" for row in h1),
+            "h2_all_rrs_envelope": bool(h2) and all(str(row.get("rrs_not_worse_than_best_fixed", "")).lower() == "true" for row in h2),
+            "h4_any_25pct": any(str(row.get("passes_25pct_gate", "")).lower() == "true" for row in h4),
+            "h5_all_tau_08": bool(h5) and all(str(row.get("passes_08_tau_gate", "")).lower() == "true" for row in h5),
+            "real_calibration_present": False,
+        },
+        "failure_cases": len(failure_cases),
+        "next_steps": [
+            "feed real c_re/mu_kv/d_deser into configs",
+            "replace analytical tier triples with KIVI/H2O measurements",
+            "rerun H4/H5 before changing status to GO",
+        ],
+    }
+    report["status"] = "GO" if all(report["gates"].values()) else "NO-GO"
+    run_h0.write_json(out_root / "go_nogo_report.json", report)
+    lines = [
+        "# H01245 Go/No-Go Report",
+        "",
+        f"Status: {report['status']}",
+        f"Basis: {report['basis']}",
+        "",
+        "## Gates",
+    ]
+    for key, value in report["gates"].items():
+        lines.append(f"- {key}: {value}")
+    lines.extend(["", "## Failure Cases", f"- extracted: {len(failure_cases)}", "", "## Next Steps"] )
+    for item in report["next_steps"]:
+        lines.append(f"- {item}")
+    (out_root / "go_nogo_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
 
 
 def run_h5(objects: Sequence[object], requests: Sequence[object], trace_source: str, out_dir: Path) -> dict:
@@ -429,6 +611,12 @@ def run_h5(objects: Sequence[object], requests: Sequence[object], trace_source: 
                 }
             )
 
+    boundaries = phase_boundary_cells(grid_rows)
+    for row in grid_rows:
+        cell = (float(row["bw_gbps"]), float(row["epsilon_norm"]))
+        row["phase_boundary_cell"] = cell in boundaries
+        row["agreement_note"] = agreement_note(float(row["kendall_tau"]), float(row["agreement_ratio"]))
+
     run_h0.write_csv(out_dir / "h5_grid.csv", grid_rows)
     run_h0.write_csv(out_dir / "h5_objects.csv", object_rows)
     run_h0.write_csv(out_dir / "h5_tau.csv", tau_rows)
@@ -445,6 +633,8 @@ def run_h5(objects: Sequence[object], requests: Sequence[object], trace_source: 
             "epsilon_norm_grid": H5_EPSILON_NORM_GRID,
             "epsilon_abs_grid": [round(sim.denormalize_epsilon(value, token_ref), 6) for value in H5_EPSILON_NORM_GRID],
             "base_config": asdict(base_cfg),
+            "calibration": calibration_metadata(),
+            "prediction_note": "q_star_pred uses an analytical threshold-style cost; q_star_offline uses independent exhaustive cost over feasible tiers.",
         },
     )
     return {"experiment": "H5", "rows": len(grid_rows), "object_rows": len(object_rows), "elapsed_s": round(time.perf_counter() - started, 6)}
@@ -491,8 +681,10 @@ def main() -> None:
         result["out_dir"] = str(experiment_out)
         summaries.append(result)
 
-    run_h0.write_json(out_root / "summary.json", {"experiments": summaries})
-    print(json.dumps({"out_dir": str(out_root), "experiments": summaries}, indent=2))
+    failure_cases = extract_failure_cases(out_root)
+    report = write_go_nogo_report(out_root, summaries, failure_cases)
+    run_h0.write_json(out_root / "summary.json", {"experiments": summaries, "go_nogo": report})
+    print(json.dumps({"out_dir": str(out_root), "experiments": summaries, "go_nogo": report}, indent=2))
 
 
 if __name__ == "__main__":

@@ -179,6 +179,37 @@ def cache_event_for(event: dict) -> str:
     return "hit"
 
 
+def event_tier(event: dict) -> str:
+    q_before = str(event.get("q_before", "full"))
+    if q_before in sim.TIER_ORDER:
+        return q_before
+    q_after = str(event.get("q_after", "full"))
+    return q_after if q_after in sim.TIER_ORDER else "full"
+
+
+def hook_name_for(event: dict) -> str:
+    if tms_action_for(event) != "none":
+        return "on_pressure"
+    if lpe_action_for(event) in {"offload", "drop"}:
+        return "on_evict"
+    if bool(event.get("hit", False)):
+        return "on_reuse"
+    return "on_admit"
+
+
+def module_decision_for(event: dict) -> str:
+    tms_action = tms_action_for(event)
+    if tms_action != "none":
+        return f"TMS:{tms_action}"
+    lpe_action = lpe_action_for(event)
+    if lpe_action in {"offload", "drop"}:
+        return f"LPE:{lpe_action}"
+    rrs_action = str(event.get("rrs_action", "none"))
+    if rrs_action in {"restore", "recompute"} and bool(event.get("hit", False)):
+        return f"RRS:{rrs_action}"
+    return "COP:admit" if not bool(event.get("hit", False)) else "cache:resident_hit"
+
+
 def enrich_events(
     raw_events: Sequence[dict],
     objects: Sequence[object],
@@ -194,6 +225,10 @@ def enrich_events(
         memory_current = float(event.get("memory_current_mb", 0.0))
         memory_peak_so_far = max(memory_peak_so_far, memory_current)
         row = dict(event)
+        q_for_cost = event_tier(event)
+        restore_latency_ms = sim.c_restore_ms(obj, q_for_cost, cfg)
+        recompute_latency_ms = sim.c_recomp_ms(obj, q_for_cost, cfg)
+        rrs_action = str(event.get("rrs_action", "none"))
         row.update(
             {
                 "event_index": idx,
@@ -210,9 +245,18 @@ def enrich_events(
                 "d_deser": round(cfg.d_deser_ms, 6),
                 "lpe_action": lpe_action_for(event),
                 "tms_action": tms_action_for(event),
+                "rrs_action": rrs_action,
+                "c_restore_ms": round(restore_latency_ms, 6),
+                "c_recomp_ms": round(recompute_latency_ms, 6),
+                "restore_latency_ms": round(restore_latency_ms if rrs_action == "restore" else 0.0, 6),
+                "recompute_latency_ms": round(recompute_latency_ms if rrs_action == "recompute" else 0.0, 6),
                 "qloss_total_abs": row.get("qloss_current_abs", row.get("qloss_current", 0.0)),
                 "qloss_total_norm": row.get("qloss_current_norm", 0.0),
                 "t_policy_ms": 0.0,
+                "T_policy_ms": 0.0,
+                "c_mig_ms": 0.0,
+                "hook_name": hook_name_for(event),
+                "module_decision": module_decision_for(event),
                 "M_peak": round(memory_peak_so_far, 6),
             }
         )
