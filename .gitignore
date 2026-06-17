@@ -27,6 +27,7 @@ env/
 !*.py
 !*.md
 !h0/configs/*.json
+!env_locks/*.txt
 !.gitignore
 # Keep relocated experiment artifacts visible to Git when they already belong
 # to this repo-level experiment record.

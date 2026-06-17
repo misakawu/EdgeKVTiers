@@ -91,11 +91,12 @@ conda create -y -n h3-lmcache-blog python=3.12
 conda activate h3-lmcache-blog
 python -m pip install --upgrade pip setuptools wheel
 
-python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-  --index-url https://download.pytorch.org/whl/cu124
-
-python -m pip install vllm==0.6.6.post1 lmcache==0.3.15 transformers==5.11.0 \
+python -m pip install vllm==0.8.5.post1 lmcache==0.3.15 transformers==5.11.0 \
   modelscope==1.37.1 openai==2.41.1 numpy==1.26.4
+
+# vLLM 0.8.5.post1 会安装匹配的 torch==2.6.0、torchvision==0.21.0、torchaudio==2.6.0。
+# 若从旧环境升级后 pip check 报旧观测包冲突，可移除非 H1 必需包：
+python -m pip uninstall -y opentelemetry-exporter-prometheus google-api-core opencensus
 ```
 
 验证：
@@ -115,8 +116,8 @@ PY
 
 已验证关键版本：
 
-- `torch == 2.5.1+cu124`
-- `vllm == 0.6.6.post1`
+- `torch == 2.6.0+cu124`
+- `vllm == 0.8.5.post1`
 - `lmcache == 0.3.15`
 - `transformers == 5.11.0`
 - `numpy == 1.26.4`
@@ -405,7 +406,7 @@ conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
   --out h0/out/h1_env_check
 ```
 
-当前已验证的 `vllm==0.6.6.post1` 不包含 `vllm.distributed.kv_transfer.kv_connector.v1`，因此 `real-v1` 会被门禁阻止；升级到支持 `KVConnectorBase_V1` 的 vLLM/LMCache 组合后，再运行真实接入：
+当前已验证的 `vllm==0.8.5.post1` 已包含 `vllm.distributed.kv_transfer.kv_connector.v1`，`h0/out/h1_env_check/v1_env_status.json` 中 `ok=true`。真实接入命令：
 
 ```bash
 conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
@@ -414,7 +415,7 @@ conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
   --policy lpe-score
 ```
 
-在当前旧 vLLM 环境中，可以用 `--mode shadow` 复用 H0 OpenAI replay 链路，生成 `policy_decisions.jsonl`，但它只代表策略旁路决策，不声明真实 KV offload 已生效。H1 输出目录为 `h0/out/h1_vllm_offload_qwen25_7b`，包含 `events.jsonl`、`policy_decisions.jsonl`、`summary.csv`、`config.resolved.json` 和 `gpu_memory_samples.jsonl`。
+如果切回旧 vLLM 环境，可以用 `--mode shadow` 复用 H0 OpenAI replay 链路，生成 `policy_decisions.jsonl`；shadow 只代表策略旁路决策，不声明真实 KV offload 已生效。H1 输出目录为 `h0/out/h1_vllm_offload_qwen25_7b`，包含 `events.jsonl`、`policy_decisions.jsonl`、`summary.csv`、`config.resolved.json` 和 `gpu_memory_samples.jsonl`。
 
 ### 8.4 小模型或低资源 smoke
 
@@ -422,7 +423,7 @@ conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
 
 ## 9. 常见问题
 
-- `h3-lmcache-blog` 中 `vllm 0.6.6.post1` 与 `lmcache 0.3.15` 均可安装和导入，但该组合处在旧 vLLM 与 LMCache connector API 的版本夹缝中；真实 `LMCacheConnectorV1` 联调仍不稳定。
+- `h3-lmcache-blog` 已升级到 `vllm 0.8.5.post1`，可以导入 `KVConnectorBase_V1`，H1 `env-check` 已通过。升级前环境锁在 `env_locks/h3-lmcache-blog.pre-vllm-upgrade.explicit.txt`，升级后环境锁在 `env_locks/h3-lmcache-blog.post-vllm-085.explicit.txt`。
 - `Qwen2.5-7B-Instruct` fp16 在 11 GiB 单卡上不适合单卡运行，应使用 tensor parallel、更大显存 GPU 或更小模型。
 - ShareGPT 数据文件不在项目目录内。迁移服务器时需要同步数据，或通过 `--trace-path` 指向新路径。
 - 使用 Hugging Face 下载模型和数据前，可能需要先执行 `huggingface-cli login`。

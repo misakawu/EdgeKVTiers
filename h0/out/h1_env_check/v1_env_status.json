@@ -1,8 +1,8 @@
 {
   "has_lmcache_v1_connector": true,
-  "has_v1_connector_base": false,
+  "has_v1_connector_base": true,
   "lmcache_version": "unknown",
-  "message": "vLLM V1 KV connector is not available in this environment. Upgrade h3-lmcache-blog to a vLLM/LMCache pair that exposes vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1.",
-  "ok": false,
-  "vllm_version": "0.6.6.post1"
+  "message": "vLLM V1 KV connector and LMCache V1 adapter are importable.",
+  "ok": true,
+  "vllm_version": "0.8.5.post1"
 }
