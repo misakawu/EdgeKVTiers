@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
+from .cache_policy import POLICY_CLASSES, CachePolicy, build_cache_policy
+
 
 @dataclass
 class KVObjectState:
@@ -26,6 +28,9 @@ class KVObjectState:
     c_recomp_ms: float = 0.0
     score: float = 0.0
     offloaded: bool = False
+    dropped: bool = False
+    pinned: bool = False
+    tier: str = "full"
 
 
 @dataclass
@@ -69,7 +74,7 @@ class H1Policy:
     the runner also uses them for shadow decisions beside OpenAI replay logs.
     """
 
-    SUPPORTED = {"vllm-default", "lru", "lfu", "lpe-score"}
+    SUPPORTED = set(POLICY_CLASSES)
 
     def __init__(
         self,
@@ -78,14 +83,29 @@ class H1Policy:
         gpu_budget_mb: float,
         c_re_ms_per_token: float,
         freq_decay: float = 0.85,
+        theta_keep: float = 0.5,
+        reserve_mb: float = 0.0,
+        pinned_object_ids: Optional[Iterable[str]] = None,
+        feasible_offload: bool = True,
         logger: Optional[JsonlDecisionLogger] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> None:
         if policy not in self.SUPPORTED:
             raise ValueError(f"unsupported H1 policy {policy!r}; expected one of {sorted(self.SUPPORTED)}")
-        self.policy = policy
+        self.cache_policy = cache_policy or build_cache_policy(
+            policy,
+            theta_keep=theta_keep,
+            reserve_mb=reserve_mb,
+            pinned_object_ids=pinned_object_ids,
+            feasible_offload=feasible_offload,
+        )
+        self.policy = self.cache_policy.name
         self.gpu_budget_mb = float(gpu_budget_mb)
         self.c_re_ms_per_token = float(c_re_ms_per_token)
         self.freq_decay = float(freq_decay)
+        self.theta_keep = float(theta_keep)
+        self.reserve_mb = float(reserve_mb)
+        self.pinned_object_ids = set(pinned_object_ids or [])
         self.logger = logger
         self.step = 0
         self.resident: Dict[str, KVObjectState] = {}
@@ -129,6 +149,7 @@ class H1Policy:
             c_recomp_ms=c_recomp_ms,
             score=score,
             offloaded=False,
+            pinned=object_id in self.pinned_object_ids,
         )
         before = self.resident_mb
         self.history[object_id] = obj
@@ -164,18 +185,22 @@ class H1Policy:
         )
         decisions.append(admit)
 
-        while self.resident_mb > self.gpu_budget_mb and self.resident:
-            victim = self._choose_victim(exclude_object_id=object_id if len(self.resident) > 1 else None)
-            if victim is None:
+        while self.cache_policy.should_evict(resident_mb=self.resident_mb, gpu_budget_mb=self.gpu_budget_mb) and self.resident:
+            plan = self.cache_policy.choose_victim(
+                self.resident.values(),
+                exclude_object_id=object_id if len(self.resident) > 1 else None,
+            )
+            if plan is None:
                 break
             victim_before = self.resident_mb
-            removed = self.resident.pop(victim.object_id)
-            removed.offloaded = True
+            removed = self.resident.pop(plan.object_id)
+            removed.offloaded = plan.action == "offload"
+            removed.dropped = plan.action == "drop"
             self.history[removed.object_id] = removed
             evict = self._decision(
                 removed,
-                action="offload",
-                reason=f"{self.policy}-budget-pressure",
+                action=plan.action,
+                reason=plan.reason,
                 hit=False,
                 resident_mb_before=victim_before,
                 resident_mb_after=self.resident_mb,
@@ -199,20 +224,6 @@ class H1Policy:
 
     def _score(self, p_reuse: float, c_recomp_ms: float, size_mb: float) -> float:
         return (p_reuse * c_recomp_ms) / max(size_mb, 1e-9)
-
-    def _choose_victim(self, *, exclude_object_id: Optional[str]) -> Optional[KVObjectState]:
-        candidates = [obj for obj in self.resident.values() if obj.object_id != exclude_object_id]
-        if not candidates:
-            candidates = list(self.resident.values())
-        if not candidates:
-            return None
-        if self.policy == "lru":
-            return min(candidates, key=lambda obj: (obj.last_access_step, obj.first_seen_step, obj.object_id))
-        if self.policy == "lfu":
-            return min(candidates, key=lambda obj: (obj.access_count, obj.last_access_step, obj.object_id))
-        if self.policy == "lpe-score":
-            return min(candidates, key=lambda obj: (obj.score, obj.last_access_step, obj.object_id))
-        return None
 
     def _decision(
         self,
@@ -258,6 +269,8 @@ class H1Policy:
             "gpu_budget_mb": self.gpu_budget_mb,
             "resident_mb": round(self.resident_mb, 6),
             "resident_objects": len(self.resident),
+            "reserve_mb": round(self.reserve_mb, 6),
+            "theta_keep": round(self.theta_keep, 6),
             "history_objects": len(self.history),
             "step": self.step,
         }

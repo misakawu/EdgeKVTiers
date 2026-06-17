@@ -55,12 +55,16 @@ def build_edgekv_connector_class():
             policy_name = os.environ.get("EDGEKV_H1_POLICY", "lpe-score")
             budget_mb = float(os.environ.get("EDGEKV_H1_GPU_BUDGET_MB", "2048"))
             c_re = float(os.environ.get("EDGEKV_H1_C_RE_MS_PER_TOKEN", "0.08"))
+            theta_keep = float(os.environ.get("EDGEKV_H1_THETA_KEEP", "0.5"))
+            reserve_mb = float(os.environ.get("EDGEKV_H1_RESERVE_MB", "0"))
             log_path = os.environ.get("EDGEKV_H1_POLICY_LOG", "")
             logger = JsonlDecisionLogger(Path(log_path)) if log_path else None
             self.edgekv_policy = H1Policy(
                 policy=policy_name,
                 gpu_budget_mb=budget_mb,
                 c_re_ms_per_token=c_re,
+                theta_keep=theta_keep,
+                reserve_mb=reserve_mb,
                 logger=logger,
             )
             self.edgekv_kv_mib_per_token = float(os.environ.get("EDGEKV_H1_KV_MIB_PER_TOKEN", "0.02734375"))

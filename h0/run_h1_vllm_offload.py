@@ -72,6 +72,8 @@ def resolve_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=None)
     parser.add_argument("--warmup-requests", type=int, default=None)
     parser.add_argument("--c-re-ms-per-token", type=float, default=None)
+    parser.add_argument("--theta-keep", type=float, default=None)
+    parser.add_argument("--reserve-mb", type=float, default=None)
     parser.add_argument("--mode", choices=["shadow", "real-v1", "env-check"], default=None)
     return parser.parse_args()
 
@@ -119,6 +121,8 @@ def run_once(args: argparse.Namespace, cfg: dict) -> dict:
     timeout_s = float(config_value(args, cfg, "timeout-s", cfg.get("timeout_s", 120.0)))
     warmup_requests = int(config_value(args, cfg, "warmup-requests", cfg.get("warmup_requests", 2)))
     c_re_ms_per_token = float(config_value(args, cfg, "c-re-ms-per-token", cfg.get("c_re_ms_per_token", 0.08)))
+    theta_keep = float(config_value(args, cfg, "theta-keep", cfg.get("theta_keep", 0.5)))
+    reserve_mb = float(config_value(args, cfg, "reserve-mb", cfg.get("reserve_mb", 0.0)))
 
     model = args.model or cfg.get("model") or h0.get_default_model(endpoint, timeout_s)
     tokenizer = h0.load_tokenizer(model)
@@ -133,6 +137,8 @@ def run_once(args: argparse.Namespace, cfg: dict) -> dict:
         policy=policy_name,
         gpu_budget_mb=gpu_budget_mb,
         c_re_ms_per_token=c_re_ms_per_token,
+        theta_keep=theta_keep,
+        reserve_mb=reserve_mb,
         logger=decision_logger,
     )
     monitor = h0.GpuMemoryMonitor()
@@ -169,6 +175,8 @@ def run_once(args: argparse.Namespace, cfg: dict) -> dict:
                     "temperature": temperature,
                     "gpu_budget_mb": gpu_budget_mb,
                     "c_re_ms_per_token": c_re_ms_per_token,
+                    "theta_keep": theta_keep,
+                    "reserve_mb": reserve_mb,
                 }
             )
             if overlength:
@@ -280,10 +288,15 @@ def _decision_summary(decisions: list[dict]) -> dict:
         return {"p_reuse": 0.0, "score": 0.0, "lpe_action": "none", "policy_actions": ""}
     main = decisions[0]
     actions = [row["action"] for row in decisions]
+    lpe_action = "none"
+    if "offload" in actions:
+        lpe_action = "offload"
+    elif "drop" in actions:
+        lpe_action = "drop"
     return {
         "p_reuse": main.get("p_reuse", 0.0),
         "score": main.get("score", 0.0),
-        "lpe_action": "offload" if "offload" in actions else "none",
+        "lpe_action": lpe_action,
         "policy_actions": ",".join(actions),
         "resident_mb_after": decisions[-1].get("resident_mb_after", 0.0),
     }

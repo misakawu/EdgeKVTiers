@@ -398,7 +398,7 @@ python h0/run_h0_vllm.py \
 
 ### 8.3 H1 vLLM V1 KV Offload
 
-当前仓库已在 `h0` 下实现 H1 自定义驱逐策略入口：`lru`、`lfu`、`lpe-score` 和 `vllm-default`。先运行环境门禁：
+当前仓库已在 `h0` 下实现 H1 自定义驱逐策略入口：`lru`、`lfu`、`lpe-score` 和 `vllm-default`。LRU、LFU、LPE 分别实现为 `h0/edgekv_v1_offload/cache_policy.py` 中的 `LRUCachePolicy`、`LFUCachePolicy`、`LPECachePolicy`，共同继承 `CachePolicy`；`LPECachePolicy` 按 §6.4 的 `score=p_reuse*c_recomp/size` 选择最低单位显存收益对象，并按 `theta_keep` 决定 `offload` 或 `drop`。先运行环境门禁：
 
 ```bash
 conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \

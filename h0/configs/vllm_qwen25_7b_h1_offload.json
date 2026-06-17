@@ -16,6 +16,8 @@
   "warmup_requests": 2,
   "gpu_budget_mb": 2048.0,
   "c_re_ms_per_token": 0.08,
+  "theta_keep": 0.5,
+  "reserve_mb": 0.0,
   "vllm_v1_connector": {
     "required_for_mode": "real-v1",
     "python_class": "h0.edgekv_v1_offload.connector.EdgeKVH1Connector",
@@ -23,6 +25,8 @@
       "EDGEKV_H1_POLICY": "lpe-score",
       "EDGEKV_H1_GPU_BUDGET_MB": "2048",
       "EDGEKV_H1_C_RE_MS_PER_TOKEN": "0.08",
+      "EDGEKV_H1_THETA_KEEP": "0.5",
+      "EDGEKV_H1_RESERVE_MB": "0",
       "EDGEKV_H1_POLICY_LOG": "h0/out/h1_vllm_offload_qwen25_7b/policy_decisions.jsonl"
     }
   }
