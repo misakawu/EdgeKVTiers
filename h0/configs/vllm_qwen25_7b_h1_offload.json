@@ -1,0 +1,29 @@
+{
+  "experiment": "H1_vLLM_V1_KV_offload",
+  "mode": "shadow",
+  "policy": "lpe-score",
+  "model": "/DATACENTER3/zhenxiang.wang/work/EdgeKVTiers/models/Qwen2.5-7B-Instruct",
+  "endpoint": "http://127.0.0.1:8000",
+  "trace_path": "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+  "out": "h0/out/h1_vllm_offload_qwen25_7b",
+  "max_sessions": 20,
+  "max_requests": 40,
+  "max_model_len": 1024,
+  "max_tokens": 16,
+  "tensor_parallel_size": 3,
+  "temperature": 0.0,
+  "timeout_s": 120.0,
+  "warmup_requests": 2,
+  "gpu_budget_mb": 2048.0,
+  "c_re_ms_per_token": 0.08,
+  "vllm_v1_connector": {
+    "required_for_mode": "real-v1",
+    "python_class": "h0.edgekv_v1_offload.connector.EdgeKVH1Connector",
+    "env": {
+      "EDGEKV_H1_POLICY": "lpe-score",
+      "EDGEKV_H1_GPU_BUDGET_MB": "2048",
+      "EDGEKV_H1_C_RE_MS_PER_TOKEN": "0.08",
+      "EDGEKV_H1_POLICY_LOG": "h0/out/h1_vllm_offload_qwen25_7b/policy_decisions.jsonl"
+    }
+  }
+}

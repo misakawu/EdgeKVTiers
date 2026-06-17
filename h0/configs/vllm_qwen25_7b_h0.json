@@ -1,0 +1,37 @@
+{
+  "experiment": "H0_vLLM_prefix_cache",
+  "status": "code_ready_not_executed",
+  "environment": {
+    "conda_env": "h3-lmcache-blog",
+    "vllm_version_observed": "0.6.6.post1",
+    "torch_version_observed": "2.5.1+cu124",
+    "gpu_observed": "RTX 2080 Ti 11GB x3",
+    "note": "Qwen2.5-7B-Instruct fp16 may not fit on one 11GB GPU; try tensor_parallel_size=2/3 or quantized model if OOM."
+  },
+  "server": {
+    "model_path": "models/Qwen2.5-7B-Instruct",
+    "endpoint": "http://127.0.0.1:8000",
+    "port": 8000,
+    "cuda_visible_devices": "0,1,2",
+    "tensor_parallel_size": 3,
+    "dtype": "half",
+    "max_model_len": 1024,
+    "gpu_memory_utilization": 0.9,
+    "enable_prefix_caching": true
+  },
+  "replay": {
+    "trace_path": "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+    "max_sessions": 20,
+    "max_requests": 40,
+    "max_tokens": 16,
+    "temperature": 0.0,
+    "warmup_requests": 2,
+    "out": "h0/out/h0_vllm_prefix_cache_qwen25_7b"
+  },
+  "outputs": {
+    "events_jsonl": "events.jsonl",
+    "summary_csv": "summary.csv",
+    "config_resolved_json": "config.resolved.json",
+    "gpu_memory_samples_jsonl": "gpu_memory_samples.jsonl"
+  }
+}

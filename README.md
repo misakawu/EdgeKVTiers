@@ -395,7 +395,28 @@ python h0/run_h0_vllm.py \
 
 说明：当前 vLLM `0.6.6.post1` OpenAI responses 未暴露逐请求真实 prefix-cache hit flag，输出中的 `hit` 是 trace-side session prefix reuse 推断。
 
-### 8.3 小模型或低资源 smoke
+### 8.3 H1 vLLM V1 KV Offload
+
+当前仓库已在 `h0` 下实现 H1 自定义驱逐策略入口：`lru`、`lfu`、`lpe-score` 和 `vllm-default`。先运行环境门禁：
+
+```bash
+conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
+  --mode env-check \
+  --out h0/out/h1_env_check
+```
+
+当前已验证的 `vllm==0.6.6.post1` 不包含 `vllm.distributed.kv_transfer.kv_connector.v1`，因此 `real-v1` 会被门禁阻止；升级到支持 `KVConnectorBase_V1` 的 vLLM/LMCache 组合后，再运行真实接入：
+
+```bash
+conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
+  --config h0/configs/vllm_qwen25_7b_h1_offload.json \
+  --mode real-v1 \
+  --policy lpe-score
+```
+
+在当前旧 vLLM 环境中，可以用 `--mode shadow` 复用 H0 OpenAI replay 链路，生成 `policy_decisions.jsonl`，但它只代表策略旁路决策，不声明真实 KV offload 已生效。H1 输出目录为 `h0/out/h1_vllm_offload_qwen25_7b`，包含 `events.jsonl`、`policy_decisions.jsonl`、`summary.csv`、`config.resolved.json` 和 `gpu_memory_samples.jsonl`。
+
+### 8.4 小模型或低资源 smoke
 
 如果 7B 模型在目标服务器上 OOM，可先用 `models/facebook_opt_125m` 验证 vLLM server 和回放脚本链路，再切回 Qwen。
 

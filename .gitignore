@@ -26,6 +26,7 @@ env/
 !*/
 !*.py
 !*.md
+!h0/configs/*.json
 !.gitignore
 # Keep relocated experiment artifacts visible to Git when they already belong
 # to this repo-level experiment record.
@@ -38,6 +39,8 @@ env/
 !h0/out/h1245_todo_smoke_updated/**
 !h0/out/h01245_visuals_updated/**
 !h0/out/h0_vllm_prefix_cache_qwen25_7b_tp2_1024_200/**
+!h0/out/h1_env_check/**
+!h0/out/h1_vllm_offload_qwen25_7b/**
 
 # Keep large downloaded assets ignored even though directories are generally visible.
 models/**
