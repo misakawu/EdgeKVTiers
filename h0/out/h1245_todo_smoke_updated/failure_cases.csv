@@ -1,0 +1,5 @@
+case_id,phenomenon,root_cause,impact_metric,fix_suggestion,fixed
+H4-GATE-01,quality benefit below P1 gate,TMS mean p95 does not beat best valid baseline by 25% in this analytical cell,tms_improvement_vs_best_pct=0.0,recheck calibrated tier triples and pressure policy before claiming H4,False
+H4-GATE-02,quality benefit below P1 gate,TMS mean p95 does not beat best valid baseline by 25% in this analytical cell,tms_improvement_vs_best_pct=0.0,recheck calibrated tier triples and pressure policy before claiming H4,False
+H5-BOUNDARY-02,q_star boundary jitter,neighboring BW/epsilon cells switch dominant offline tier,bw=0.5 epsilon_norm=0.001,inspect object-level q_star margins near this cell,False
+H5-BOUNDARY-03,q_star boundary jitter,neighboring BW/epsilon cells switch dominant offline tier,bw=0.5 epsilon_norm=0.002,inspect object-level q_star margins near this cell,False

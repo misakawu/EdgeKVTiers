@@ -1,0 +1,10 @@
+experiment,m_budget_mb,epsilon_abs,epsilon_norm,score_only_mean_p95_ms,tms_mean_p95_ms,tms_improvement_vs_score_pct,best_baseline_mean_p95_ms,tms_improvement_vs_best_pct,tms_qloss_ok_all_repeats,passes_tiered_below_score,passes_25pct_gate,gate_basis
+H4,1600.0,12.972,0.002,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,1600.0,25.944,0.004,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,1600.0,51.888,0.008,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,2200.0,12.972,0.002,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,2200.0,25.944,0.004,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,2200.0,51.888,0.008,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,3000.0,12.972,0.002,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,3000.0,25.944,0.004,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending
+H4,3000.0,51.888,0.008,21.744,21.744,0.0,21.744,0.0,True,False,False,analytical_simulation_calibrated_inputs_pending

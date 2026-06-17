@@ -30,3 +30,6 @@ env/
 !h0/out/h1245_h3_synthetic_smoke/**
 !h0/out/h1245_sharegpt/**
 !h3/out/h1245_h3_synthetic_smoke/**
+!h0/out/h0_todo_smoke_updated/**
+!h0/out/h1245_todo_smoke_updated/**
+!h0/out/h01245_visuals_updated/**

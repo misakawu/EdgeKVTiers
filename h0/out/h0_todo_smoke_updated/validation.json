@@ -1,0 +1,16 @@
+{
+  "experiment": "H0",
+  "passed": true,
+  "checks": {
+    "complete_replay": true,
+    "same_trace_across_devices": true,
+    "same_token_ref_across_devices": true,
+    "memory_peak_within_budget": true,
+    "epsilon_budget_respected": true,
+    "required_summary_fields_present": true
+  },
+  "token_ref": 10525,
+  "devices": [
+    "edge_smoke"
+  ]
+}
