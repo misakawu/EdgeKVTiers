@@ -1,8 +1,0 @@
-{
-  "trace_source": "synthetic",
-  "objects": 38,
-  "requests": 60,
-  "token_ref": 4293,
-  "max_sessions": 200,
-  "max_requests": 60
-}

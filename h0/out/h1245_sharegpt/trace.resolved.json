@@ -1,8 +1,0 @@
-{
-  "trace_source": "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
-  "objects": 88,
-  "requests": 500,
-  "token_ref": 72733,
-  "max_sessions": 200,
-  "max_requests": 500
-}

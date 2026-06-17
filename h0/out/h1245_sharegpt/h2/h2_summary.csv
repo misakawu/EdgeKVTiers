@@ -1,7 +1,0 @@
-experiment,bw_gbps,rrs_p95_ms,best_fixed_p95_ms,rrs_not_worse_than_best_fixed,rrs_gap_vs_best_fixed_pct,rrs_recompute_ratio,rrs_restore_ratio
-H2,0.5,227.574,227.574,True,0.0,0.804444,0.0
-H2,1.0,227.574,227.574,True,0.0,0.804444,0.0
-H2,2.0,131.433,131.433,True,0.0,0.217778,0.586667
-H2,4.0,105.702,105.702,True,0.0,0.104444,0.7
-H2,8.0,104.90925,104.90925,True,0.0,0.104444,0.7
-H2,16.0,104.646,104.646,True,0.0,0.104444,0.7

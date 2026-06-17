@@ -1,6 +1,10 @@
 # Runtime outputs and experiment artifacts
 out/
 
+# Large local assets that must not be uploaded
+models/
+third_party/
+
 # Python caches
 __pycache__/
 *.py[cod]
@@ -33,3 +37,8 @@ env/
 !h0/out/h0_todo_smoke_updated/**
 !h0/out/h1245_todo_smoke_updated/**
 !h0/out/h01245_visuals_updated/**
+!h0/out/h0_vllm_prefix_cache_qwen25_7b_tp2_1024_200/**
+
+# Keep large downloaded assets ignored even though directories are generally visible.
+models/**
+third_party/**

@@ -1,4 +1,0 @@
-experiment,m_budget_mb,score_p95_ms,lru_p95_ms,lfu_p95_ms,improvement_vs_lru_pct,improvement_vs_best_lru_lfu_pct,passes_20pct_lru_gate
-H1,3000.0,21.744,21.744,21.744,0.0,0.0,False
-H1,3400.0,21.744,21.744,21.744,0.0,0.0,False
-H1,3800.0,21.744,21.744,21.744,0.0,0.0,False
