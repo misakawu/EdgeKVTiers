@@ -362,9 +362,37 @@ CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
   --port 8000 \
   --tensor-parallel-size 2 \
   --dtype half \
-  --max-model-len 1024 \
+  --max-model-len 2048 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 4096 \
   --gpu-memory-utilization 0.95 \
   --enable-prefix-caching
+```
+
+另开终端运行回放：
+
+HotpotQA 使用 Hugging Face `hotpotqa/hotpot_qa` 的 `distractor` parquet，三个文件直接放在 `/DATACENTER3/zhenxiang.wang/data/hotpotqa/`：
+
+- `validation-00000-of-00001.parquet`
+- `train-00000-of-00002.parquet`
+- `train-00001-of-00002.parquet`
+
+读取 parquet 需要当前运行环境安装 `pyarrow`。
+
+```bash
+conda activate h3-lmcache-blog
+cd /DATACENTER3/zhenxiang.wang/work/EdgeKVTiers
+
+PYTHONPATH=h0 python h0/build_h0_replay_trace.py \
+  --trace-path /DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json \
+  --hotpotqa-path /DATACENTER3/zhenxiang.wang/data/hotpotqa \
+  --out /DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl \
+  --workload mixed \
+  --max-sessions 200 \
+  --max-requests 1024 \
+  --rag-requests 100 \
+  --hotpotqa-max-examples 5 \
+  --sharegpt-order longest
 ```
 
 另开终端运行回放：
@@ -376,10 +404,15 @@ cd /DATACENTER3/zhenxiang.wang/work/EdgeKVTiers
 python h0/run_h0_vllm.py \
   --endpoint http://127.0.0.1:8000 \
   --trace-path /DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json \
+  --replay-trace /DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl \
+  --workload mixed \
+  --hotpotqa-path /DATACENTER3/zhenxiang.wang/data/hotpotqa \
   --max-sessions 200 \
   --max-requests 1024 \
-  --max-model-len 1024 \
-  --max-tokens 8 \
+  --rag-requests 100 \
+  --max-model-len 2048 \
+  --max-tokens 16 \
+  --concurrency 4 \
   --tensor-parallel-size 2 \
   --out h0/out/h0_vllm_prefix_cache_qwen25_7b_tp2_1024_200
 ```
@@ -394,28 +427,54 @@ python h0/run_h0_vllm.py \
 - `max_tokens == 8`
 - `tensor_parallel_size == 2`
 
-说明：当前 vLLM `0.6.6.post1` OpenAI responses 未暴露逐请求真实 prefix-cache hit flag，输出中的 `hit` 是 trace-side session prefix reuse 推断。
+说明：当前 vLLM `0.6.6.post1` OpenAI responses 未暴露逐请求真实 prefix-cache hit flag，输出中的 `hit` 是 trace-side `reuse_key` 推断；ShareGPT 使用 session prefix reuse，RAG 使用 HotpotQA chunk-set reuse。HotpotQA 默认读取 `/DATACENTER3/zhenxiang.wang/data/hotpotqa/` 下的 Hugging Face distractor parquet，顺序为 `validation-*.parquet` 后接 `train-*.parquet`。
 
 ### 8.3 H1 vLLM V1 KV Offload
 
-当前仓库已在 `h0` 下实现 H1 自定义驱逐策略入口：`lru`、`lfu`、`lpe-score` 和 `vllm-default`。旧 H1 shadow 路径保留在 `h0/edgekv_v1_offload/cache_policy.py`；新的 vLLM V1 CPU KV offload 路径按官方 `vllm.v1.kv_offload.cpu.policies.base.CachePolicy` 接口实现于 `h0/edgekv_v1_offload/vllm_offload_policies.py`，提供 `H1LRUCachePolicy`、`H1LFUCachePolicy`、`H1LPECachePolicy` 并注册为 `h1_lru`、`h1_lfu`、`h1_lpe`。`H1LPECachePolicy` 按 §6.4 的 `score=p_reuse*c_recomp/size` 淘汰最低单位显存收益块。注意：当前已安装的 `vllm==0.8.5.post1` 没有 `vllm.v1.kv_offload`，真实 CPU KV offload 运行需要升级到包含该接口的 vLLM 版本；已检查 `vllm==0.23.0` wheel 包含该接口，但它依赖 `torch==2.11.0` 和 CUDA 13 相关包，当前 driver `525.105.17` 风险较高，不建议直接在本机升级占卡试跑。先运行环境门禁：
+当前仓库已在 `h0` 下实现 H1 自定义驱逐策略入口：`lru`、`lfu`、`lpe-score` 和 `vllm-default`。旧 H1 shadow 路径保留在 `h0/edgekv_v1_offload/cache_policy.py`。针对已安装的 `vllm==0.11.0`，真实接入路径是 `OffloadingConnector` + `OffloadingSpecFactory`，而不是较新版本里的 `vllm.v1.kv_offload.cpu.manager` / `cpu.policies.base`。v0.11.0 适配实现位于 `h0/edgekv_v1_offload/vllm0110_offload.py`，提供 `H1CPUOffloadingSpec`、`PolicyOffloadingManager`、`H1LRUCachePolicy`、`H1LFUCachePolicy`、`H1LPECachePolicy`，策略名为 `h1_lru`、`h1_lfu`、`h1_lpe`。`H1LPECachePolicy` 按 §6.4 的 `score=p_reuse*c_recomp/size` 淘汰最低单位内存收益块。
+
+本机 `edgekv-vllm0110` 环境已验证：
+
+- `vllm==0.11.0`
+- `torch==2.8.0+cu128`
+- `torchvision==0.23.0`
+- `torchaudio==2.8.0`
+- `torch.cuda.is_available()==True`
+
+注意：PyTorch 官方 cu118 索引没有 `torch==2.8.0+cu118`，因此 `vllm==0.11.0` 与 CUDA 11.8 torch wheel 不能同时严格满足。先运行 v0.11.0 插件测试：
 
 ```bash
-conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
-  --mode env-check \
-  --out h0/out/h1_env_check
+conda run -n edgekv-vllm0110 python h0/test_vllm0110_offload.py
 ```
 
-当前已验证的 `vllm==0.8.5.post1` 已包含 `vllm.distributed.kv_transfer.kv_connector.v1`，`h0/out/h1_env_check/v1_env_status.json` 中 `ok=true`。真实接入命令：
+旧的 `run_h1_vllm_offload.py` 保留给 `h3-lmcache-blog` / vLLM 0.8.5 环境做 env-check、shadow 和历史输出复现；shadow 只代表策略旁路决策，不声明真实 KV offload 已生效。H1 输出目录为 `h0/out/h1_vllm_offload_qwen25_7b`，包含 `events.jsonl`、`policy_decisions.jsonl`、`summary.csv`、`config.resolved.json` 和 `gpu_memory_samples.jsonl`。
 
-```bash
-conda run -n h3-lmcache-blog python h0/run_h1_vllm_offload.py \
-  --config h0/configs/vllm_qwen25_7b_h1_offload.json \
-  --mode real-v1 \
-  --policy lpe-score
+
+vLLM 0.11.0 的 Python API 接入示例：
+
+```python
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
+
+kv_transfer_config = KVTransferConfig(
+    kv_connector="OffloadingConnector",
+    kv_role="kv_both",
+    kv_connector_extra_config={
+        "spec_name": "H1CPUOffloadingSpec",
+        "spec_module_path": "edgekv_v1_offload.vllm0110_offload",
+        "cache_policy": "h1_lru",  # h1_lru / h1_lfu / h1_lpe
+        "num_cpu_blocks": 1000,
+        "block_size": 128,
+    },
+)
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    gpu_memory_utilization=0.5,
+    kv_transfer_config=kv_transfer_config,
+)
+outputs = llm.generate(["hello"], SamplingParams(max_tokens=8))
 ```
-
-如果切回旧 vLLM 环境，可以用 `--mode shadow` 复用 H0 OpenAI replay 链路，生成 `policy_decisions.jsonl`；shadow 只代表策略旁路决策，不声明真实 KV offload 已生效。H1 输出目录为 `h0/out/h1_vllm_offload_qwen25_7b`，包含 `events.jsonl`、`policy_decisions.jsonl`、`summary.csv`、`config.resolved.json` 和 `gpu_memory_samples.jsonl`。
 
 ### 8.4 小模型或低资源 smoke
 

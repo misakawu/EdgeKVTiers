@@ -1,8 +1,0 @@
-{
-  "has_lmcache_v1_connector": true,
-  "has_v1_connector_base": true,
-  "lmcache_version": "unknown",
-  "message": "vLLM V1 KV connector and LMCache V1 adapter are importable.",
-  "ok": true,
-  "vllm_version": "0.8.5.post1"
-}
