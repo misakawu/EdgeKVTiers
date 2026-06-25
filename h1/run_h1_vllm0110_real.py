@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Run H1 0.5.1 on real vLLM 0.11.0 OffloadingConnector.
+"""Run H1 0.5.1 on real vLLM 0.11.0 GPU prefix cache.
 
 Experiment shape from 00_预实验提取 0.5.1:
 - four policies: LRU, LFU, vLLM default, LPE-score
 - three memory budgets
-- the same ShareGPT multi-turn trace, first 200 sessions by default
+- the same H0 ShareGPT + HotpotQA RAG mixed replay trace by default
 - record p95 TTFT proxy, hit rate, and GPU memory peak
 
 Notes:
+- H1 policies are applied to vLLM v1 GPU prefix-cache block eviction through
+  the repo-local ``h1/sitecustomize.py`` runtime patch. The experiment uses GPU
+  KV cache only and does not configure vLLM CPU KV offload.
 - vLLM offline ``LLM.generate`` does not expose first-token streaming timing, so
   this runner records per-request end-to-end latency as ``ttft_proxy_ms``. For a
   true TTFT value, run through OpenAI streaming server mode.
-- hit rate is the same trace-side session-prefix reuse proxy used by H0.
+- hit rate in the summary is measured from real GPU prefix-cache block lookup
+  statistics. Per-request rows still carry the H0 trace-side reuse proxy.
 """
 
 from __future__ import annotations
@@ -20,16 +24,34 @@ import argparse
 import csv
 import gc
 import json
+import os
+import shutil
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from edgekv_cop import COPProfiler, DEFAULT_BW_GBPS, DEFAULT_C_RE_MS_PER_TOKEN, DEFAULT_D_DESER_MS
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+H0_DIR = REPO_ROOT / 'h0'
+if str(H0_DIR) not in sys.path:
+    sys.path.insert(0, str(H0_DIR))
 DEFAULT_SHAREGPT_TRACE_PATH = Path(
     '/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json'
+)
+DEFAULT_HOTPOTQA_PATH = Path('/DATACENTER3/zhenxiang.wang/data/hotpotqa')
+DEFAULT_REPLAY_TRACE_PATH = Path(
+    '/DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions.jsonl'
+)
+
+from run_h0_vllm import (
+    kv_size_mib_per_token,
+    load_model_config,
+    load_replay_prompts,
 )
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -40,11 +62,11 @@ if not hasattr(PreTrainedTokenizerBase, 'all_special_tokens_extended'):
     )
 
 from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
 
 
 POLICIES = ('vllm_default', 'h1_lru', 'h1_lfu', 'h1_lpe')
 BUDGET_GPU_MEMORY_UTILIZATION = {
+    'super_tight': 0.710,  # extreme/saturation budget (== old tight value)
     'tight': 0.710,
     'mid': 0.735,
     'loose': 0.774,
@@ -300,10 +322,9 @@ class GpuMemoryMonitor:
 
 def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prompts = load_sharegpt_prompts(
+    prompts = load_replay_prompts(
+        args,
         Path(args.trace_path),
-        max_sessions=args.max_sessions,
-        max_requests=args.max_requests,
         tokenizer=tokenizer,
     )
     filtered: list[dict[str, Any]] = []
@@ -315,37 +336,70 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     return filtered
 
 
-def build_llm(args: argparse.Namespace, policy: str, gpu_memory_utilization: float) -> LLM:
-    if policy == 'vllm_default':
-        # vLLM 0.11.0 built-in CPUOffloadingSpec uses its own LRUOffloadingManager.
-        extra = {
-            'spec_name': 'CPUOffloadingSpec',
-            'num_cpu_blocks': args.num_cpu_blocks,
-            'block_size': args.offload_block_size,
-        }
-    else:
-        extra = {
-            'spec_name': 'H1CPUOffloadingSpec',
-            'spec_module_path': 'edgekv_v1_offload.vllm0110_offload',
-            'cache_policy': policy,
-            'num_cpu_blocks': args.num_cpu_blocks,
-            'block_size': args.offload_block_size,
-        }
-    kv_transfer_config = KVTransferConfig(
-        kv_connector='OffloadingConnector',
-        kv_role='kv_both',
-        kv_connector_extra_config=extra,
+def trace_side_reuse(
+    item: dict[str, Any], reuse_seen: set[str]
+) -> tuple[str, bool, str, bool]:
+    reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+    hit = reuse_key in reuse_seen
+    rag_reuse_key = str(item.get('rag_reuse_key', ''))
+    rag_hit = bool(rag_reuse_key and rag_reuse_key in reuse_seen)
+    return reuse_key, hit, rag_reuse_key, rag_hit
+
+
+def request_trace_fields(
+    item: dict[str, Any],
+    trace_hit: bool,
+    rag_hit: bool,
+    policy: str,
+    kv_mib_per_token: float,
+    cop: COPProfiler,
+    event_index: int,
+) -> dict[str, Any]:
+    workload = str(item.get('workload', 'sharegpt_session_prefix'))
+    reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+    profile = cop.update_from_item(
+        item,
+        hit=bool(trace_hit or rag_hit),
+        access_index=event_index,
     )
+    fields = {k: v for k, v in item.items() if k != 'prompt'}
+    fields.update(
+        {
+            'workload': workload,
+            'object_type': profile.object_type,
+            'object_id': profile.object_id,
+            'reuse_key': reuse_key,
+            'hit': trace_hit,
+            'hit_source': 'trace_side_rag_reuse_key' if rag_hit and not trace_hit else 'trace_side_reuse_key',
+            'rag_hit': rag_hit if item.get('rag_reuse_key') else '',
+            'rag_hit_source': 'trace_side_rag_reuse_key' if item.get('rag_reuse_key') else '',
+            'p_reuse': round(profile.p_reuse, 6),
+            'c_recomp_ms': round(profile.c_recomp_ms, 6),
+            'c_restore_ms': round(profile.c_restore_ms, 6),
+            'risk_exp': round(profile.risk_exp, 6),
+            'score': round(profile.score, 9),
+            'score_source': 'object_level_cop',
+            'lpe_action': 'score_evaluated' if policy == 'h1_lpe' else '',
+            'size_mb': round(profile.size_mb, 6),
+            'size_scope': 'per_gpu_logical_full_kv_estimate',
+            'kv_mib_per_token': round(kv_mib_per_token, 9),
+        }
+    )
+    return fields
+
+
+def build_llm(args: argparse.Namespace, policy: str, gpu_memory_utilization: float) -> LLM:
+    os.environ['EDGEKV_H1_GPU_POLICY'] = policy
     return LLM(
         model=args.model,
         dtype=args.dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=args.max_model_len,
-        kv_transfer_config=kv_transfer_config,
         enforce_eager=True,
         max_num_seqs=args.replay_batch_size,
         max_num_batched_tokens=args.max_model_len * args.replay_batch_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_prefix_caching=True,
         disable_log_stats=False,
     )
 
@@ -379,26 +433,83 @@ def run_cell(
     started = time.time()
     ok = False
     error = ''
-    session_seen: set[str] = set()
+    reuse_seen: set[str] = set()
     gpu_memory_utilization = float(budget['gpu_memory_utilization'])
+    model_config = load_model_config(args.model)
+    kv_mib_per_token = kv_size_mib_per_token(model_config, args.tensor_parallel_size)
+    cop = COPProfiler(
+        mu_kv_mb_per_token=kv_mib_per_token,
+        c_re_ms_per_token=args.c_re_ms_per_token,
+        bw_gbps=args.bw_gbps,
+        d_deser_ms=args.d_deser_ms,
+    )
+    stats_dir = Path(args.stats_dir) / f'{budget_name}_{policy}'
+    if stats_dir.exists():
+        shutil.rmtree(stats_dir)
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    os.environ['EDGEKV_H1_STATS_DIR'] = str(stats_dir)
+    try:
+        import sitecustomize
+
+        reset_stats = getattr(sitecustomize, 'reset_edgekv_gpu_cache_stats', None)
+        if callable(reset_stats):
+            reset_stats()
+    except Exception:
+        pass
     try:
         monitor.start()
         llm = build_llm(args, policy, gpu_memory_utilization)
-        sampling = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
         for batch_start in range(0, len(trace), args.replay_batch_size):
             batch = trace[batch_start:batch_start + args.replay_batch_size]
             prompts = [str(item['prompt']) for item in batch]
-            trace_hits = [
-                item['session_id'] in session_seen and int(item['turn_index']) > 0
-                for item in batch
+            trace_reuse = [trace_side_reuse(item, reuse_seen) for item in batch]
+            trace_fields_batch = [
+                request_trace_fields(
+                    item,
+                    reuse_info[1],
+                    reuse_info[3],
+                    policy,
+                    kv_mib_per_token,
+                    cop,
+                    batch_start + offset,
+                )
+                for offset, (item, reuse_info) in enumerate(zip(batch, trace_reuse))
+            ]
+            sampling = [
+                SamplingParams(
+                    max_tokens=args.max_tokens,
+                    temperature=0.0,
+                    extra_args={
+                        'edgekv_h1': {
+                            'policy': policy,
+                            'request_id': trace_fields.get('request_id', ''),
+                            'object_id': trace_fields.get('object_id', ''),
+                            'reuse_key': trace_fields.get('reuse_key', ''),
+                            'object_type': trace_fields.get('object_type', ''),
+                            'workload': trace_fields.get('workload', ''),
+                            'n_tokens': trace_fields.get('n_tokens', 0),
+                            'p_reuse': trace_fields.get('p_reuse', 0.0),
+                            'c_recomp_ms': trace_fields.get('c_recomp_ms', 0.0),
+                            'c_restore_ms': trace_fields.get('c_restore_ms', 0.0),
+                            'risk_exp': trace_fields.get('risk_exp', 0.0),
+                            'score': trace_fields.get('score', 0.0),
+                            'size_mb': trace_fields.get('size_mb', 0.0),
+                        }
+                    },
+                )
+                for trace_fields in trace_fields_batch
             ]
             t0 = time.perf_counter()
             outputs = llm.generate(prompts, sampling)
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            for offset, (item, output, trace_hit) in enumerate(zip(batch, outputs, trace_hits)):
+            for offset, (item, output, reuse_info, trace_fields) in enumerate(
+                zip(batch, outputs, trace_reuse, trace_fields_batch)
+            ):
                 text = output.outputs[0].text
                 idx = batch_start + offset
+                reuse_key, trace_hit, rag_reuse_key, rag_hit = reuse_info
                 row = {
+                    **trace_fields,
                     'experiment': 'H1_vLLM_real_0_5_1',
                     'policy': policy,
                     'budget': budget_name,
@@ -409,25 +520,24 @@ def run_cell(
                     'event_index': idx,
                     'batch_start_index': batch_start,
                     'replay_batch_size': args.replay_batch_size,
-                    'request_id': item['request_id'],
-                    'session_id': item['session_id'],
-                    'turn_index': item['turn_index'],
-                    'hit': trace_hit,
-                    'hit_source': 'trace_side_session_prefix_reuse',
-                    'n_tokens': item['n_tokens'],
-                    'prompt_chars': item['prompt_chars'],
                     'max_tokens': args.max_tokens,
                     'latency_ms': round(latency_ms, 6),
                     'ttft_proxy_ms': round(latency_ms, 6),
                     'output_chars': len(text),
                     'model': args.model,
                     'tensor_parallel_size': args.tensor_parallel_size,
-                    'num_cpu_blocks': args.num_cpu_blocks,
-                    'offload_block_size': args.offload_block_size,
+                    'kv_cache_location': 'gpu',
                 }
+                if rag_reuse_key:
+                    row['rag_reuse_key'] = rag_reuse_key
                 rows.append(row)
             for item in batch:
-                session_seen.add(str(item['session_id']))
+                reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+                if reuse_key:
+                    reuse_seen.add(reuse_key)
+                rag_reuse_key = str(item.get('rag_reuse_key', ''))
+                if rag_reuse_key:
+                    reuse_seen.add(rag_reuse_key)
         ok = True
     except Exception as exc:
         error = f'{type(exc).__name__}: {exc}'
@@ -446,7 +556,31 @@ def run_cell(
 
     valid = [row for row in rows if 'ttft_proxy_ms' in row]
     ttft_values = [float(row['ttft_proxy_ms']) for row in valid]
-    hit_count = sum(1 for row in valid if row.get('hit'))
+    trace_hit_count = sum(1 for row in valid if row.get('hit'))
+    gpu_cache_stats: dict[str, Any] = {}
+    try:
+        import sitecustomize
+
+        get_stats = getattr(sitecustomize, 'get_edgekv_gpu_cache_stats', None)
+        if callable(get_stats):
+            gpu_cache_stats = dict(get_stats())
+    except Exception:
+        gpu_cache_stats = {}
+    gpu_cache_stats = merge_gpu_cache_stats(gpu_cache_stats, stats_dir)
+    gpu_lookup_total = int(gpu_cache_stats.get('lookup_total', 0) or 0)
+    gpu_lookup_hits = int(gpu_cache_stats.get('lookup_hits', 0) or 0)
+    gpu_hit_rate = float(gpu_cache_stats.get('hit_rate', 0.0) or 0.0)
+    workload_counts: dict[str, int] = {}
+    workload_hit_counts: dict[str, int] = {}
+    for row in valid:
+        workload = str(row.get('workload', 'unknown'))
+        workload_counts[workload] = workload_counts.get(workload, 0) + 1
+        if row.get('hit'):
+            workload_hit_counts[workload] = workload_hit_counts.get(workload, 0) + 1
+    workload_hit_rates = {
+        workload: round(workload_hit_counts.get(workload, 0) / max(count, 1), 6)
+        for workload, count in workload_counts.items()
+    }
     summary = {
         'experiment': 'H1_vLLM_real_0_5_1',
         'policy': policy,
@@ -463,18 +597,64 @@ def run_cell(
         'error': error,
         'requests': len(valid),
         'sessions_requested': args.max_sessions,
+        'rag_requests_requested': args.rag_requests,
         'trace_requests_available': len(trace),
+        'replay_trace': args.replay_trace,
+        'workload': args.workload,
+        'hotpotqa_source': str(args.hotpotqa_path),
+        'rag_chunk_words': args.rag_chunk_words,
+        'rag_chunks_per_query': args.rag_chunks_per_query,
+        'rag_query_repeats': args.rag_query_repeats,
+        'sharegpt_order': args.sharegpt_order,
+        'hotpotqa_max_examples': args.hotpotqa_max_examples,
         'ttft_proxy_p50_ms': round(percentile(ttft_values, 50), 6),
         'ttft_proxy_p95_ms': round(percentile(ttft_values, 95), 6),
         'latency_p95_ms': round(percentile(ttft_values, 95), 6),
         'latency_mean_ms': round(statistics.mean(ttft_values), 6) if ttft_values else 0.0,
-        'hit_rate': round(hit_count / max(len(valid), 1), 6),
+        'hit_rate': round(gpu_hit_rate, 6),
+        'hit_source': 'gpu_prefix_cache_block_lookup',
+        'gpu_prefix_cache_lookup_total': gpu_lookup_total,
+        'gpu_prefix_cache_lookup_hits': gpu_lookup_hits,
+        'gpu_prefix_cache_lookup_misses': int(gpu_cache_stats.get('lookup_misses', 0) or 0),
+        'gpu_prefix_cache_evictions': int(gpu_cache_stats.get('evictions', 0) or 0),
+        'gpu_prefix_cache_cached_blocks': int(gpu_cache_stats.get('cached_blocks', 0) or 0),
+        'gpu_prefix_cache_touches': int(gpu_cache_stats.get('touches', 0) or 0),
+        'gpu_prefix_cache_queue_reorders': int(gpu_cache_stats.get('queue_reorders', 0) or 0),
+        'free_queue_reorder_calls': int(gpu_cache_stats.get('free_queue_reorder_calls', 0) or 0),
+        'free_queue_reorder_blocks': int(gpu_cache_stats.get('free_queue_reorder_blocks', 0) or 0),
+        'free_queue_reorder_skipped': int(gpu_cache_stats.get('free_queue_reorder_skipped', 0) or 0),
+        'free_queue_reorder_time_ms': round(float(gpu_cache_stats.get('free_queue_reorder_time_ms', 0.0) or 0.0), 6),
+        'policy_time_us_avg': round(float(gpu_cache_stats.get('policy_time_us_avg', 0.0) or 0.0), 6),
+        'avg_p_reuse': round(float(gpu_cache_stats.get('avg_p_reuse', 0.0) or 0.0), 6),
+        'avg_score': round(float(gpu_cache_stats.get('avg_score', 0.0) or 0.0), 9),
+        'score_p50': round(float(gpu_cache_stats.get('score_p50', 0.0) or 0.0), 9),
+        'score_p95': round(float(gpu_cache_stats.get('score_p95', 0.0) or 0.0), 9),
+        'lpe_profile_count': int(gpu_cache_stats.get('lpe_profile_count', 0) or 0),
+        'admission_count': int(gpu_cache_stats.get('admissions', 0) or 0),
+        'admission_rejection_count': int(gpu_cache_stats.get('admission_rejections', 0) or 0),
+        'eviction_count': int(gpu_cache_stats.get('evictions', 0) or 0),
+        'high_reuse_eviction_count': int(gpu_cache_stats.get('evict_high_reuse', 0) or 0)
+        + int(gpu_cache_stats.get('evict_offload', 0) or 0),
+        'drop_count': int(gpu_cache_stats.get('evict_drop', 0) or 0),
+        'evicted_score_avg': round(float(gpu_cache_stats.get('evicted_score_avg', 0.0) or 0.0), 9),
+        'evicted_p_reuse_avg': round(float(gpu_cache_stats.get('evicted_p_reuse_avg', 0.0) or 0.0), 6),
+        'low_score_evictions': int(gpu_cache_stats.get('low_score_evictions', 0) or 0),
+        'hot_prefix_evictions': int(gpu_cache_stats.get('hot_prefix_evictions', 0) or 0),
+        'gpu_prefix_cache_policy_impl': 'sitecustomize.BlockPool.free_block_queue',
+        'trace_side_hit_rate': round(trace_hit_count / max(len(valid), 1), 6),
+        'trace_side_hit_source': 'trace_side_reuse_key',
+        'workload_counts': workload_counts,
+        'workload_hit_rates': workload_hit_rates,
         'gpu_memory_peak_mib': round(monitor.peak_mib(args.visible_devices), 6),
         'elapsed_s': round(time.time() - started, 3),
         'model': args.model,
         'tensor_parallel_size': args.tensor_parallel_size,
-        'num_cpu_blocks': args.num_cpu_blocks,
-        'offload_block_size': args.offload_block_size,
+        'kv_cache_location': 'gpu',
+        'kv_mib_per_token': round(kv_mib_per_token, 9),
+        'c_re_ms_per_token': round(args.c_re_ms_per_token, 9),
+        'bw_gbps': round(args.bw_gbps, 9),
+        'd_deser_ms': round(args.d_deser_ms, 9),
+        **cop.summary(),
         'replay_batch_size': args.replay_batch_size,
         'ttft_note': 'offline LLM.generate latency is used as TTFT proxy; with replay_batch_size>1 each request receives its concurrent batch latency',
     }
@@ -509,23 +689,115 @@ def plot_summary(path: Path, summaries: list[dict[str, Any]]) -> None:
     plt.close()
 
 
+def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict[str, Any]:
+    int_keys = {
+        'lookup_hits',
+        'lookup_misses',
+        'touches',
+        'cached_blocks',
+        'evictions',
+        'queue_reorders',
+        'admissions',
+        'admission_rejections',
+        'evict_high_reuse',
+        'evict_offload',
+        'evict_drop',
+        'free_queue_reorder_calls',
+        'free_queue_reorder_blocks',
+        'free_queue_reorder_skipped',
+        'low_score_evictions',
+        'hot_prefix_evictions',
+        'policy_timing_samples',
+        'lpe_profile_count',
+    }
+    sums = {key: int(parent_stats.get(key, 0) or 0) for key in int_keys}
+    float_keys = {
+        'policy_time_ms_total',
+        'free_queue_reorder_time_ms',
+    }
+    float_sums = {key: float(parent_stats.get(key, 0.0) or 0.0) for key in float_keys}
+    profile_count = max(int(parent_stats.get('lpe_profile_count', 0) or 0), 0)
+    weighted_p_reuse = float(parent_stats.get('avg_p_reuse', 0.0) or 0.0) * profile_count
+    weighted_score = float(parent_stats.get('avg_score', 0.0) or 0.0) * profile_count
+    evicted_score_count = int(parent_stats.get('evicted_score_count', 0) or 0)
+    evicted_p_reuse_count = int(parent_stats.get('evicted_p_reuse_count', 0) or 0)
+    weighted_evicted_score = float(parent_stats.get('evicted_score_avg', 0.0) or 0.0) * evicted_score_count
+    weighted_evicted_p_reuse = float(parent_stats.get('evicted_p_reuse_avg', 0.0) or 0.0) * evicted_p_reuse_count
+    stat_files = 0
+    if stats_dir.exists():
+        for path in stats_dir.glob('edgekv_gpu_stats_*.json'):
+            try:
+                row = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            stat_files += 1
+            for key in int_keys:
+                sums[key] += int(row.get(key, 0) or 0)
+            for key in float_keys:
+                float_sums[key] += float(row.get(key, 0.0) or 0.0)
+            count = int(row.get('lpe_profile_count', 0) or 0)
+            weighted_p_reuse += float(row.get('avg_p_reuse', 0.0) or 0.0) * count
+            weighted_score += float(row.get('avg_score', 0.0) or 0.0) * count
+            row_evicted_score_count = int(row.get('evicted_score_count', 0) or 0)
+            row_evicted_p_reuse_count = int(row.get('evicted_p_reuse_count', 0) or 0)
+            weighted_evicted_score += float(row.get('evicted_score_avg', 0.0) or 0.0) * row_evicted_score_count
+            weighted_evicted_p_reuse += float(row.get('evicted_p_reuse_avg', 0.0) or 0.0) * row_evicted_p_reuse_count
+
+    lookups = sums['lookup_hits'] + sums['lookup_misses']
+    result: dict[str, Any] = dict(parent_stats)
+    result.update(sums)
+    result.update(float_sums)
+    result['lookup_total'] = lookups
+    result['hit_rate'] = (sums['lookup_hits'] / lookups) if lookups else 0.0
+    result['avg_p_reuse'] = weighted_p_reuse / sums['lpe_profile_count'] if sums['lpe_profile_count'] else 0.0
+    result['avg_score'] = weighted_score / sums['lpe_profile_count'] if sums['lpe_profile_count'] else 0.0
+    result['policy_time_us_avg'] = (
+        (float_sums['policy_time_ms_total'] * 1000.0) / sums['policy_timing_samples']
+        if sums.get('policy_timing_samples') else 0.0
+    )
+    result['evicted_score_avg'] = (
+        weighted_evicted_score / sums['evicted_score_count']
+        if sums.get('evicted_score_count') else 0.0
+    )
+    result['evicted_p_reuse_avg'] = (
+        weighted_evicted_p_reuse / sums['evicted_p_reuse_count']
+        if sums.get('evicted_p_reuse_count') else 0.0
+    )
+    result['stats_files'] = stat_files
+    result['stats_dir'] = str(stats_dir)
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--out', default='out/h1_vllm_real')
+    parser.add_argument('--out', default='h1/out/h1_vllm_real')
     parser.add_argument('--model', default='models/Qwen2.5-7B-Instruct')
     parser.add_argument('--dtype', default='float16')
     parser.add_argument('--trace-path', default=str(DEFAULT_SHAREGPT_TRACE_PATH))
+    parser.add_argument('--replay-trace', default=str(DEFAULT_REPLAY_TRACE_PATH))
+    parser.add_argument('--workload', choices=('sharegpt', 'rag', 'mixed'), default='mixed')
+    parser.add_argument('--hotpotqa-path', type=Path, default=DEFAULT_HOTPOTQA_PATH)
+    parser.add_argument('--download-hotpotqa', action='store_true')
+    parser.add_argument('--hotpotqa-max-examples', type=int, default=5)
+    parser.add_argument('--rag-requests', type=int, default=100)
+    parser.add_argument('--rag-chunk-words', type=int, default=56)
+    parser.add_argument('--rag-chunks-per-query', type=int, default=2)
+    parser.add_argument('--rag-query-repeats', type=int, default=4)
+    parser.add_argument('--sharegpt-order', choices=('file', 'longest'), default='longest')
+    parser.add_argument('--timeout-s', type=float, default=120.0)
     parser.add_argument('--policies', nargs='+', default=list(POLICIES), choices=POLICIES)
     parser.add_argument('--budgets', nargs='+', default=list(BUDGET_GPU_MEMORY_UTILIZATION), choices=list(BUDGET_GPU_MEMORY_UTILIZATION))
     parser.add_argument('--max-sessions', type=int, default=200)
-    parser.add_argument('--max-requests', type=int, default=200)
+    parser.add_argument('--max-requests', type=int, default=1024)
     parser.add_argument('--tensor-parallel-size', type=int, default=2)
-    parser.add_argument('--max-model-len', type=int, default=1024)
-    parser.add_argument('--max-tokens', type=int, default=8)
+    parser.add_argument('--max-model-len', type=int, default=2048)
+    parser.add_argument('--max-tokens', type=int, default=16)
     parser.add_argument('--replay-batch-size', type=int, default=1)
-    parser.add_argument('--num-cpu-blocks', type=int, default=256)
-    parser.add_argument('--offload-block-size', type=int, default=16)
+    parser.add_argument('--c-re-ms-per-token', type=float, default=float(os.environ.get('EDGEKV_C_RE_MS_PER_TOKEN', DEFAULT_C_RE_MS_PER_TOKEN)))
+    parser.add_argument('--bw-gbps', type=float, default=float(os.environ.get('EDGEKV_BW_GBPS', DEFAULT_BW_GBPS)))
+    parser.add_argument('--d-deser-ms', type=float, default=float(os.environ.get('EDGEKV_D_DESER_MS', DEFAULT_D_DESER_MS)))
     parser.add_argument('--visible-devices', default='0,1')
+    parser.add_argument('--stats-dir', default='')
     return parser.parse_args()
 
 
@@ -535,6 +807,8 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not args.stats_dir:
+        args.stats_dir = str(out_dir / 'edgekv_gpu_stats')
 
     trace = load_trace(args)
     if not trace:
@@ -574,9 +848,11 @@ def main() -> None:
                 'resolved_budgets': budgets,
                 'trace_size': len(trace),
                 'policies': args.policies,
+                'trace_builder': 'h0.load_replay_prompts',
             },
             ensure_ascii=False,
             indent=2,
+            default=str,
         ),
         encoding='utf-8',
     )

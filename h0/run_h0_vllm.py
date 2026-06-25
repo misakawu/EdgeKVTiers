@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures
 import csv
 import json
+import os
 import statistics
 import subprocess
 import threading
@@ -20,6 +21,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Iterable, List, Sequence
+
+from edgekv_cop import COPProfiler, DEFAULT_BW_GBPS, DEFAULT_C_RE_MS_PER_TOKEN, DEFAULT_D_DESER_MS
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -912,6 +915,7 @@ def prepare_event_row(
     args: argparse.Namespace,
     model: str,
     kv_mib_per_token: float,
+    cop: COPProfiler,
 ) -> tuple[dict, str, bool]:
     policy_started = time.perf_counter()
     n_tokens = int(item["n_tokens"])
@@ -919,8 +923,11 @@ def prepare_event_row(
     reuse_key = str(item.get("reuse_key", item.get("session_id", "")))
     workload = str(item.get("workload", "sharegpt_session_prefix"))
     trace_hit = reuse_key in reuse_seen
-    event_name = "hit" if trace_hit else "miss"
-    size_mb = n_tokens * kv_mib_per_token
+    rag_reuse_key = str(item.get("rag_reuse_key", ""))
+    rag_hit = bool(rag_reuse_key and rag_reuse_key in reuse_seen)
+    event_name = "hit" if trace_hit or rag_hit else "miss"
+    profile = cop.update_from_item(item, hit=bool(trace_hit or rag_hit), access_index=idx)
+    size_mb = profile.size_mb
     t_policy_ms = (time.perf_counter() - policy_started) * 1000.0
     row = dict(item)
     row.pop("prompt", None)
@@ -928,14 +935,21 @@ def prepare_event_row(
         {
             "event_index": idx,
             "event": event_name,
-            "hit": trace_hit,
-            "hit_source": "trace_side_reuse_key",
+            "hit": bool(trace_hit or rag_hit),
+            "hit_source": "trace_side_rag_reuse_key" if rag_hit and not trace_hit else "trace_side_reuse_key",
             "workload": workload,
-            "object_type": item.get("object_type", workload),
+            "object_type": profile.object_type,
+            "object_id": profile.object_id,
             "reuse_key": reuse_key,
             "size_mb": round(size_mb, 6),
             "size_scope": "per_gpu_logical_full_kv_estimate",
             "kv_mib_per_token": round(kv_mib_per_token, 9),
+            "p_reuse": round(profile.p_reuse, 6),
+            "c_recomp_ms": round(profile.c_recomp_ms, 6),
+            "c_restore_ms": round(profile.c_restore_ms, 6),
+            "risk_exp": round(profile.risk_exp, 6),
+            "score": round(profile.score, 9),
+            "score_source": "object_level_cop",
             "t_policy_ms": round(t_policy_ms, 6),
             "model": model,
             "max_tokens": args.max_tokens,
@@ -944,10 +958,9 @@ def prepare_event_row(
             "concurrency": args.concurrency,
         }
     )
-    rag_reuse_key = str(item.get("rag_reuse_key", ""))
     if rag_reuse_key:
         row["rag_reuse_key"] = rag_reuse_key
-        row["rag_hit"] = rag_reuse_key in reuse_seen
+        row["rag_hit"] = rag_hit
         row["rag_hit_source"] = "trace_side_rag_reuse_key"
     if overlength:
         row.update(
@@ -987,6 +1000,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--warmup-requests", type=int, default=2)
+    parser.add_argument("--c-re-ms-per-token", type=float, default=float(os.environ.get("EDGEKV_C_RE_MS_PER_TOKEN", DEFAULT_C_RE_MS_PER_TOKEN)))
+    parser.add_argument("--bw-gbps", type=float, default=float(os.environ.get("EDGEKV_BW_GBPS", DEFAULT_BW_GBPS)))
+    parser.add_argument("--d-deser-ms", type=float, default=float(os.environ.get("EDGEKV_D_DESER_MS", DEFAULT_D_DESER_MS)))
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR))
     args = parser.parse_args()
 
@@ -998,6 +1014,12 @@ def main() -> None:
     tokenizer = load_tokenizer(model)
     model_config = load_model_config(model)
     kv_mib_per_token = kv_size_mib_per_token(model_config, args.tensor_parallel_size)
+    cop = COPProfiler(
+        mu_kv_mb_per_token=kv_mib_per_token,
+        c_re_ms_per_token=args.c_re_ms_per_token,
+        bw_gbps=args.bw_gbps,
+        d_deser_ms=args.d_deser_ms,
+    )
     prompts = load_replay_prompts(args, trace_path, tokenizer)
     if not prompts:
         raise RuntimeError("no replay prompts were built from trace")
@@ -1015,7 +1037,7 @@ def main() -> None:
             for offset, item in enumerate(batch):
                 idx = batch_start + offset
                 row, reuse_key, overlength = prepare_event_row(
-                    idx, item, reuse_seen, args, model, kv_mib_per_token
+                    idx, item, reuse_seen, args, model, kv_mib_per_token, cop
                 )
                 prepared.append((idx, item, row, reuse_key, overlength))
 
@@ -1117,6 +1139,10 @@ def main() -> None:
         "concurrency": args.concurrency,
         "tensor_parallel_size": args.tensor_parallel_size,
         "kv_mib_per_token": round(kv_mib_per_token, 9),
+        "c_re_ms_per_token": round(args.c_re_ms_per_token, 9),
+        "bw_gbps": round(args.bw_gbps, 9),
+        "d_deser_ms": round(args.d_deser_ms, 9),
+        **cop.summary(),
         "tokenizer_source": "transformers_auto" if tokenizer is not None else "whitespace_estimate",
     }
 

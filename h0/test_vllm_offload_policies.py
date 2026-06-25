@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Unit smoke tests for H1 vLLM CPU offload CachePolicy plugins."""
+"""Legacy CPU offload policy smoke tests.
+
+H0/H1 experiments are GPU-only. These tests are disabled by default so the
+normal validation path cannot accidentally import or exercise CPU KV offload
+code. Set ``EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS=1`` to run them explicitly.
+"""
 
 from __future__ import annotations
 
-from edgekv_v1_offload.vllm_offload_policies import (
-    BlockStatus,
-    CachePolicy,
-    H1LFUCachePolicy,
-    H1LPECachePolicy,
-    H1LRUCachePolicy,
-    _CACHE_POLICIES,
-    register_h1_cache_policies,
+import os
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS") != "1",
+    reason="legacy CPU KV offload tests are outside the GPU-only H0/H1 path",
 )
+
+if os.environ.get("EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS") == "1":
+    from edgekv_v1_offload.vllm_offload_policies import (
+        BlockStatus,
+        CachePolicy,
+        H1LFUCachePolicy,
+        H1LPECachePolicy,
+        H1LRUCachePolicy,
+        _CACHE_POLICIES,
+        register_h1_cache_policies,
+    )
 
 
 def _ready(block_id: int) -> BlockStatus:
@@ -64,6 +79,9 @@ def test_lpe_evicts_lowest_score_and_protects() -> None:
 
 
 if __name__ == "__main__":
+    if os.environ.get("EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS") != "1":
+        print("legacy CPU KV offload tests skipped; set EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS=1 to run")
+        raise SystemExit(0)
     test_registered()
     test_lru_atomic_failure_and_order()
     test_lfu_evicts_lowest_frequency()

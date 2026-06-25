@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Visualize the real Step3 (ShareGPT+HotpotQA) 4-policy x 3-budget comparison.
+
+Reads the cross-rep median summary produced by run_step3_real.py /
+summarize_step3_real.py and draws a 4-policy comparison (vLLM / LRU / LFU / LPE)
+across the three GPU memory budgets:
+
+    tight  gpu_memory_utilization=0.710
+    mid    gpu_memory_utilization=0.735
+    loose  gpu_memory_utilization=0.774
+
+Usage (no env vars required):
+    python h1/visualize_step3_real.py
+    python h1/visualize_step3_real.py --summary <path> --out <png_stem>
+
+Saves <out>.png and <out>.pdf next to the summary CSV by default. Only depends on
+matplotlib + numpy (stdlib csv for reading; no pandas). Adapted from
+visualize_lpe_scenarios.py.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+
+# fixed ordering: budgets tight,mid,loose and policies vLLM,LRU,LFU,LPE
+BUDGET_KEYS = ["tight", "mid", "loose"]
+BUDGET_LABELS = ["tight\n0.710", "mid\n0.735", "loose\n0.774"]
+POL_KEYS = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
+POL_LABELS = ["vLLM", "LRU", "LFU", "LPE"]
+POL_COLORS = ["#4c72b0", "#55a868", "#c4a000", "#d95319"]  # LPE = orange-red
+
+# metrics to plot: (column, panel title, y-label, value format)
+METRICS = [
+    ("p95_ttft_ms", "p95 TTFT proxy (batch-latency proxy, not real TTFT)", "p95 batch-latency proxy (ms)", "{:.0f}"),
+    ("hit_rate", "GPU prefix-cache hit rate", "hit rate", "{:.3f}"),
+    ("gpu_prefix_cache_evictions", "GPU prefix-cache evictions", "evictions", "{:.0f}"),
+    ("request_throughput", "Request throughput (requests/elapsed_s)", "req/s", "{:.2f}"),
+]
+
+
+def load(summary: Path) -> dict[tuple[str, str], dict[str, float]]:
+    """(budget, policy) -> {column: float}."""
+    table: dict[tuple[str, str], dict[str, float]] = {}
+    with summary.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            key = (row["budget"], row["policy"])
+            vals = {}
+            for col, *_ in METRICS:
+                try:
+                    vals[col] = float(row[col])
+                except (TypeError, ValueError, KeyError):
+                    vals[col] = float("nan")
+            table[key] = vals
+    return table
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--summary", default=str(HERE / "out/step3_real/step3_real_summary.csv"))
+    ap.add_argument("--out", default="", help="output image path stem (default: next to summary)")
+    args = ap.parse_args()
+
+    summary = Path(args.summary)
+    if not summary.is_file():
+        raise SystemExit(f"summary CSV not found: {summary}\nRun run_step3_real.py first.")
+    print(f"reading {summary}")
+    table = load(summary)
+
+    out_stem = Path(args.out) if args.out else summary.with_name("step3_real_scenarios")
+
+    n_b, n_p = len(BUDGET_KEYS), len(POL_KEYS)
+    x = np.arange(n_b)
+    width = 0.8 / n_p
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.2))
+    for ax, (col, title, ylabel, fmt) in zip(axes.flat, METRICS):
+        for j, (pol, label, color) in enumerate(zip(POL_KEYS, POL_LABELS, POL_COLORS)):
+            vals = [table.get((b, pol), {}).get(col, float("nan")) for b in BUDGET_KEYS]
+            offs = x + (j - (n_p - 1) / 2) * width
+            bars = ax.bar(offs, vals, width, label=label, color=color,
+                          edgecolor="black", linewidth=0.4)
+            ax.bar_label(bars, labels=[fmt.format(v) if v == v else "" for v in vals],
+                         fontsize=7, padding=2)
+        ax.set_xticks(x)
+        ax.set_xticklabels(BUDGET_LABELS, fontsize=9)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=11)
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
+        ax.margins(y=0.15)
+
+    axes.flat[0].legend(loc="upper left", fontsize=9, ncol=2)
+    fig.suptitle("LPE vs LRU/LFU/vLLM on real ShareGPT+HotpotQA mixed workload "
+                 "(4 policies x 3 budgets, cross-rep median)", fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+
+    png = out_stem.with_suffix(".png")
+    pdf = out_stem.with_suffix(".pdf")
+    out_stem.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=150)
+    fig.savefig(pdf)
+    print(f"wrote {png}")
+    print(f"wrote {pdf}")
+
+
+if __name__ == "__main__":
+    main()
