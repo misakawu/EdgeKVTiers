@@ -6,6 +6,7 @@ import logging
 import os
 import atexit
 import hashlib
+import heapq
 import json
 import math
 import time
@@ -85,6 +86,7 @@ _EDGEKV_GPU_STATS: dict[str, int] = {
     'hot_prefix_evictions': 0,
     'pinned_eviction_attempts': 0,
     'policy_timing_samples': 0,
+    'eviction_decision_timing_samples': 0,
 }
 _EDGEKV_GPU_LPE_PROFILES: dict[str, dict[str, Any]] = {}
 _EDGEKV_GPU_BLOCK_OBJECTS: dict[tuple[int, int], str] = {}
@@ -102,8 +104,15 @@ _EDGEKV_GPU_POLICY_IS_LRU = _EDGEKV_GPU_POLICY_VALUE == 'h1_lru'
 # reordering. Native vLLM free-queue order already equals LRU eviction order, so
 # h1_lru keeps only the diagnostic counters and skips the per-access bookkeeping.
 _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE = _EDGEKV_GPU_POLICY_VALUE in {'h1_lfu', 'h1_lpe'}
-_EDGEKV_GPU_PROFILE_POLICY_TIME = os.environ.get('EDGEKV_H1_PROFILE_POLICY_TIME', '').strip() == '1'
+_EDGEKV_GPU_PROFILE_POLICY_TIME = os.environ.get('EDGEKV_H1_PROFILE_POLICY_TIME', '1').strip().lower() not in {
+    '',
+    '0',
+    'false',
+    'no',
+    'off',
+}
 _EDGEKV_GPU_POLICY_TIME_NS = 0
+_EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
 _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
 _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
 _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
@@ -184,9 +193,20 @@ def _edgekv_note_gpu_stat(key: str, amount: int = 1) -> None:
 
 def _edgekv_note_policy_time(start_ns: int) -> None:
     global _EDGEKV_GPU_POLICY_TIME_NS
-    if not _EDGEKV_GPU_PROFILE_POLICY_TIME:
+    if not _EDGEKV_GPU_PROFILE_POLICY_TIME or start_ns <= 0:
         return
     _EDGEKV_GPU_POLICY_TIME_NS += time.perf_counter_ns() - start_ns
+    _EDGEKV_GPU_STATS['policy_timing_samples'] += 1
+
+
+def _edgekv_note_eviction_decision_time(start_ns: int) -> None:
+    global _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
+    if not _EDGEKV_GPU_PROFILE_POLICY_TIME or start_ns <= 0:
+        return
+    elapsed = time.perf_counter_ns() - start_ns
+    _EDGEKV_GPU_EVICTION_DECISION_TIME_NS += elapsed
+    _EDGEKV_GPU_POLICY_TIME_NS += elapsed
+    _EDGEKV_GPU_STATS['eviction_decision_timing_samples'] += 1
     _EDGEKV_GPU_STATS['policy_timing_samples'] += 1
 
 
@@ -196,7 +216,7 @@ def _edgekv_note_reorder_time(start_ns: int) -> None:
 
 
 def reset_edgekv_gpu_cache_stats() -> None:
-    global _EDGEKV_GPU_STATS_UPDATES, _EDGEKV_GPU_POLICY_TIME_NS
+    global _EDGEKV_GPU_STATS_UPDATES, _EDGEKV_GPU_POLICY_TIME_NS, _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
     global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS
     global _EDGEKV_GPU_EVICTED_SCORE_TOTAL, _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL
     for key in _EDGEKV_GPU_STATS:
@@ -208,6 +228,7 @@ def reset_edgekv_gpu_cache_stats() -> None:
     _EDGEKV_GPU_OBJECT_SIZE_BYTES.clear()
     _EDGEKV_GPU_STATS_UPDATES = 0
     _EDGEKV_GPU_POLICY_TIME_NS = 0
+    _EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
     _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
     _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
     _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
@@ -226,6 +247,44 @@ def _edgekv_percentile(values: list[float], percentile: float) -> float:
     return float(ordered[index])
 
 
+def _edgekv_stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+
+
+def _edgekv_histogram(values: list[float], buckets: int = 10) -> dict[str, Any]:
+    if not values:
+        return {'min': 0.0, 'max': 0.0, 'buckets': []}
+    low = min(values)
+    high = max(values)
+    if math.isclose(low, high):
+        return {
+            'min': float(low),
+            'max': float(high),
+            'buckets': [{'lo': float(low), 'hi': float(high), 'count': len(values)}],
+        }
+    bucket_count = max(int(buckets), 1)
+    width = (high - low) / bucket_count
+    counts = [0 for _ in range(bucket_count)]
+    for value in values:
+        index = min(int((value - low) / width), bucket_count - 1)
+        counts[index] += 1
+    return {
+        'min': float(low),
+        'max': float(high),
+        'buckets': [
+            {
+                'lo': float(low + (idx * width)),
+                'hi': float(low + ((idx + 1) * width)),
+                'count': count,
+            }
+            for idx, count in enumerate(counts)
+        ],
+    }
+
+
 def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
     stats: dict[str, Any] = dict(_EDGEKV_GPU_STATS)
     lookups = stats['lookup_hits'] + stats['lookup_misses']
@@ -236,6 +295,11 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
     stats['policy_time_us_avg'] = (
         (_EDGEKV_GPU_POLICY_TIME_NS / 1000.0) / stats['policy_timing_samples']
         if stats.get('policy_timing_samples') else 0.0
+    )
+    stats['eviction_decision_time_ms_total'] = _EDGEKV_GPU_EVICTION_DECISION_TIME_NS / 1_000_000.0
+    stats['eviction_decision_time_us_avg'] = (
+        (_EDGEKV_GPU_EVICTION_DECISION_TIME_NS / 1000.0) / stats['eviction_decision_timing_samples']
+        if stats.get('eviction_decision_timing_samples') else 0.0
     )
     stats['free_queue_reorder_time_ms'] = _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS / 1_000_000.0
     stats['evicted_score_avg'] = (
@@ -248,9 +312,29 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
     )
     profiles = list(_EDGEKV_GPU_LPE_PROFILES.values())
     scores = [float(profile.get('score', 0.0) or 0.0) for profile in profiles]
+    p_reuses = [float(profile.get('p_reuse', 0.0) or 0.0) for profile in profiles]
+    c_recomps = [float(profile.get('c_recomp_ms', 0.0) or 0.0) for profile in profiles]
+    n_tokens_values = [float(profile.get('n_tokens', 0) or 0) for profile in profiles]
     stats['score_min'] = min(scores) if scores else 0.0
     stats['score_p50'] = _edgekv_percentile(scores, 0.50)
     stats['score_p95'] = _edgekv_percentile(scores, 0.95)
+    stats['score_mean'] = sum(scores) / len(scores) if scores else 0.0
+    stats['score_std'] = _edgekv_stddev(scores)
+    stats['p_reuse_min'] = min(p_reuses) if p_reuses else 0.0
+    stats['p_reuse_p50'] = _edgekv_percentile(p_reuses, 0.50)
+    stats['p_reuse_p95'] = _edgekv_percentile(p_reuses, 0.95)
+    stats['p_reuse_std'] = _edgekv_stddev(p_reuses)
+    stats['c_recomp_ms_min'] = min(c_recomps) if c_recomps else 0.0
+    stats['c_recomp_ms_p50'] = _edgekv_percentile(c_recomps, 0.50)
+    stats['c_recomp_ms_p95'] = _edgekv_percentile(c_recomps, 0.95)
+    stats['c_recomp_ms_per_token'] = _edgekv_env_float('EDGEKV_C_RE_MS_PER_TOKEN', 0.12)
+    stats['c_recomp_model'] = 'linear_c_re_ms_per_token_times_n_tokens'
+    stats['n_tokens_min'] = min(n_tokens_values) if n_tokens_values else 0.0
+    stats['n_tokens_p50'] = _edgekv_percentile(n_tokens_values, 0.50)
+    stats['n_tokens_p95'] = _edgekv_percentile(n_tokens_values, 0.95)
+    stats['eviction_granularity'] = 'vllm_prefix_cache_block'
+    stats['score_histogram'] = _edgekv_histogram(scores)
+    stats['p_reuse_histogram'] = _edgekv_histogram(p_reuses)
     stats['lpe_profile_count'] = len(profiles)
     stats['avg_p_reuse'] = (
         sum(float(profile.get('p_reuse', 0.0)) for profile in profiles) / len(profiles)
@@ -305,6 +389,10 @@ def _edgekv_gpu_policy_is_lpe() -> bool:
     return _EDGEKV_GPU_POLICY_IS_LPE
 
 
+def _edgekv_gpu_policy_needs_rank_state() -> bool:
+    return _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE or _EDGEKV_GPU_POLICY_VALUE in {'h1_lfu', 'h1_lpe'}
+
+
 def _edgekv_init_pool_state(pool: Any) -> None:
     if hasattr(pool, '_edgekv_h1_scores'):
         return
@@ -316,6 +404,9 @@ def _edgekv_init_pool_state(pool: Any) -> None:
     pool._edgekv_h1_block_objects = {}
     pool._edgekv_h1_freq = {}
     pool._edgekv_h1_recency = {}
+    pool._edgekv_h1_blocks = {}
+    pool._edgekv_h1_rank_heap = []
+    pool._edgekv_h1_rank_version = {}
     pool._edgekv_h1_seq = 0
     pool._edgekv_h1_queue_dirty = True
     pool._edgekv_h1_recent_evictions = 0
@@ -328,6 +419,45 @@ def _edgekv_block_id(block: Any) -> int:
 
 def _edgekv_block_key(kv_cache_group_id: int, block_id: int) -> tuple[int, int]:
     return (int(kv_cache_group_id), int(block_id))
+
+
+def _edgekv_rank_tuple(pool: Any, block_id: int) -> tuple[float, int, int]:
+    policy = _EDGEKV_GPU_POLICY_VALUE
+    recency = int(getattr(pool, '_edgekv_h1_recency', {}).get(block_id, 0))
+    if policy == 'h1_lfu':
+        return (float(getattr(pool, '_edgekv_h1_freq', {}).get(block_id, 0)), recency, block_id)
+    if policy == 'h1_lpe':
+        return (float(getattr(pool, '_edgekv_h1_scores', {}).get(block_id, 0.0)), recency, block_id)
+    return (float(recency), 0, block_id)
+
+
+def _edgekv_heap_touch_block(pool: Any, block: Any) -> None:
+    if not _edgekv_gpu_policy_needs_rank_state() or getattr(block, 'is_null', False):
+        return
+    _edgekv_init_pool_state(pool)
+    block_id = _edgekv_block_id(block)
+    pool._edgekv_h1_blocks[block_id] = block
+    version = int(pool._edgekv_h1_rank_version.get(block_id, 0) or 0) + 1
+    pool._edgekv_h1_rank_version[block_id] = version
+    heapq.heappush(pool._edgekv_h1_rank_heap, (*_edgekv_rank_tuple(pool, block_id), version))
+    pool._edgekv_h1_queue_dirty = True
+
+
+def _edgekv_heap_drop_block(pool: Any, block_id: int) -> None:
+    if not hasattr(pool, '_edgekv_h1_rank_version'):
+        return
+    pool._edgekv_h1_rank_version.pop(int(block_id), None)
+    pool._edgekv_h1_blocks.pop(int(block_id), None)
+
+
+def _edgekv_heap_valid_block(pool: Any, item: tuple[float, int, int, int]) -> Any | None:
+    _score, _recency, block_id, version = item
+    if int(getattr(pool, '_edgekv_h1_rank_version', {}).get(block_id, -1)) != int(version):
+        return None
+    block = getattr(pool, '_edgekv_h1_blocks', {}).get(block_id)
+    if block is None or getattr(block, 'is_null', False):
+        return None
+    return block
 
 
 def _edgekv_group_id_from_block_hash(block_hash: Any) -> int | None:
@@ -769,34 +899,69 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     requested = max(int(num_blocks or 1), 1)
     base_window = max(_edgekv_env_int('H1_LPE_REORDER_WINDOW', 128), 2)
     window_size = max(base_window, requested * 4)
-    if mode == 'full':
-        candidates = blocks
-    else:
-        candidates = blocks[:min(window_size, len(blocks))]
-    _edgekv_note_gpu_stat('free_queue_reorder_blocks', len(candidates))
+    select_count = len(blocks) if mode == 'full' else min(window_size, len(blocks))
+    queue_block_ids = {_edgekv_block_id(block) for block in blocks}
+    for block in blocks:
+        block_id = _edgekv_block_id(block)
+        pool._edgekv_h1_blocks[block_id] = block
+        if block_id not in pool._edgekv_h1_rank_version:
+            _edgekv_heap_touch_block(pool, block)
+    selected: list[Any] = []
+    selected_ids: set[int] = set()
+    stale_pops = 0
+    while pool._edgekv_h1_rank_heap and len(selected) < select_count:
+        item = heapq.heappop(pool._edgekv_h1_rank_heap)
+        block = _edgekv_heap_valid_block(pool, item)
+        if block is None:
+            stale_pops += 1
+            continue
+        block_id = _edgekv_block_id(block)
+        if block_id not in queue_block_ids or block_id in selected_ids:
+            stale_pops += 1
+            continue
+        selected.append(block)
+        selected_ids.add(block_id)
+    if len(selected) < select_count:
+        # Heap can be sparse after a long low-pressure period. Re-seed missing
+        # free blocks once, then continue with heap pops rather than sorting.
+        for block in blocks:
+            block_id = _edgekv_block_id(block)
+            if block_id not in selected_ids:
+                _edgekv_heap_touch_block(pool, block)
+        while pool._edgekv_h1_rank_heap and len(selected) < select_count:
+            item = heapq.heappop(pool._edgekv_h1_rank_heap)
+            block = _edgekv_heap_valid_block(pool, item)
+            if block is None:
+                stale_pops += 1
+                continue
+            block_id = _edgekv_block_id(block)
+            if block_id not in queue_block_ids or block_id in selected_ids:
+                stale_pops += 1
+                continue
+            selected.append(block)
+            selected_ids.add(block_id)
+    if len(selected) < 2:
+        _edgekv_note_gpu_stat('free_queue_reorder_skipped')
+        _edgekv_note_reorder_time(start_ns)
+        return
+    _edgekv_note_gpu_stat('free_queue_reorder_blocks', len(selected))
     _EDGEKV_GPU_STATS['free_queue_reorder_window'] = max(
         int(_EDGEKV_GPU_STATS.get('free_queue_reorder_window', 0) or 0),
-        len(candidates),
+        len(selected),
     )
-    policy = _EDGEKV_GPU_POLICY_VALUE
-
-    def rank(block: Any) -> tuple[float, int, int]:
-        block_id = _edgekv_block_id(block)
-        recency = int(pool._edgekv_h1_recency.get(block_id, 0))
-        if policy == 'h1_lfu':
-            return (float(pool._edgekv_h1_freq.get(block_id, 0)), recency, block_id)
-        if policy == 'h1_lpe':
-            return (float(pool._edgekv_h1_scores.get(block_id, 0.0)), recency, block_id)
-        return (float(recency), 0, block_id)
-
-    ordered = sorted(candidates, key=rank)
-    if [_edgekv_block_id(b) for b in ordered] == [_edgekv_block_id(b) for b in candidates]:
+    current_prefix = [_edgekv_block_id(block) for block in blocks[:len(selected)]]
+    selected_order = [_edgekv_block_id(block) for block in selected]
+    if selected_order == current_prefix:
+        for block in selected:
+            _edgekv_heap_touch_block(pool, block)
         pool._edgekv_h1_queue_dirty = False
         _edgekv_note_reorder_time(start_ns)
         return
-    for block in candidates:
+    for block in selected:
         queue.remove(block)
-    queue.append_n(ordered)
+    queue.append_n(selected)
+    for block in selected:
+        _edgekv_heap_touch_block(pool, block)
     pool._edgekv_h1_queue_dirty = False
     pool._edgekv_h1_recent_evictions = 0
     _edgekv_note_gpu_stat('queue_reorders')
@@ -865,6 +1030,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                                 self._edgekv_h1_score_update_seq[block_id] = int(
                                     profile.get('score_update_seq', 0) or 0
                                 )
+                                _edgekv_heap_touch_block(self, block)
         _edgekv_note_policy_time(start_ns)
         return result
 
@@ -899,7 +1065,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             kv_cache_group_id,
         )
         start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
-        if not _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE:
+        if not _edgekv_gpu_policy_needs_rank_state():
             # h1_lru: native free-queue order already encodes LRU; only keep the
             # admission/cached_blocks diagnostics, skip per-block ranking state.
             for block in new_full_blocks:
@@ -957,13 +1123,16 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             self._edgekv_h1_scores[block_id] = score
             self._edgekv_h1_freq[block_id] = max(int(self._edgekv_h1_freq.get(block_id, 0)), 1)
             self._edgekv_h1_recency[block_id] = self._edgekv_h1_seq
+            _edgekv_heap_touch_block(self, block)
             _edgekv_note_gpu_stat('cached_blocks')
             _edgekv_note_gpu_stat('admissions')
         _edgekv_note_policy_time(start_ns)
 
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:
-        if _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE:
+        if _edgekv_gpu_policy_needs_rank_state():
+            decision_start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
             _edgekv_reorder_free_queue(self, num_blocks)
+            _edgekv_note_eviction_decision_time(decision_start_ns)
         return original_get_new_blocks(self, num_blocks)
 
     def _maybe_evict_cached_block(self: Any, block: Any) -> bool:
@@ -972,7 +1141,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             return evicted
         start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
         _edgekv_note_gpu_stat('evictions')
-        if not _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE:
+        if not _edgekv_gpu_policy_needs_rank_state():
             # h1_lru: only the eviction counter is needed for diagnostics.
             _edgekv_note_policy_time(start_ns)
             return evicted
@@ -1012,6 +1181,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         self._edgekv_h1_recency.pop(block_id, None)
         self._edgekv_h1_access_history.pop(block_id, None)
         self._edgekv_h1_pinned.discard(block_id)
+        _edgekv_heap_drop_block(self, block_id)
         self._edgekv_h1_recent_evictions = int(getattr(self, '_edgekv_h1_recent_evictions', 0) or 0) + 1
         self._edgekv_h1_queue_dirty = True
         _edgekv_note_policy_time(start_ns)
@@ -1020,7 +1190,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
     def touch(self: Any, blocks: tuple[list[Any], ...]) -> None:
         start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
         if _EDGEKV_GPU_POLICY_ENABLED:
-            needs_state = _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE
+            needs_state = _edgekv_gpu_policy_needs_rank_state()
             if needs_state:
                 _edgekv_init_pool_state(self)
             for blocks_per_group in blocks:
@@ -1041,13 +1211,17 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                                     self._edgekv_h1_p_reuse[block_id] = float(profile.get('p_reuse', 0.5))
                                     self._edgekv_h1_scores[block_id] = float(profile.get('score', 0.0))
                                     self._edgekv_h1_score_update_seq[block_id] = score_update_seq
+                        _edgekv_heap_touch_block(self, block)
         _edgekv_note_policy_time(start_ns)
         return original_touch(self, blocks)
 
     def free_blocks(self: Any, ordered_blocks: Any) -> None:
         original_free_blocks(self, ordered_blocks)
-        if _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE:
+        if _edgekv_gpu_policy_needs_rank_state():
             _edgekv_init_pool_state(self)
+            for block in _edgekv_iter_blocks(ordered_blocks):
+                if not getattr(block, 'is_null', False):
+                    _edgekv_heap_touch_block(self, block)
             self._edgekv_h1_queue_dirty = True
 
     BlockPool.get_cached_block = get_cached_block

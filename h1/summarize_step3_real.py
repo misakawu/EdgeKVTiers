@@ -25,6 +25,10 @@ METRICS = [
     ('gpu_prefix_cache_cached_blocks', 'gpu_prefix_cache_cached_blocks'),
     ('free_queue_reorder_time_ms', 'free_queue_reorder_time_ms'),
     ('policy_time_us_avg', 'policy_time_us_avg'),
+    ('eviction_decision_time_us_avg', 'eviction_decision_time_us_avg'),
+    ('score_std', 'score_std'),
+    ('p_reuse_std', 'p_reuse_std'),
+    ('c_recomp_ms_p50', 'c_recomp_ms_p50'),
 ]
 DERIVED = ('request_throughput',)
 

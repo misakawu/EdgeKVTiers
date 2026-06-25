@@ -625,10 +625,19 @@ def run_cell(
         'free_queue_reorder_skipped': int(gpu_cache_stats.get('free_queue_reorder_skipped', 0) or 0),
         'free_queue_reorder_time_ms': round(float(gpu_cache_stats.get('free_queue_reorder_time_ms', 0.0) or 0.0), 6),
         'policy_time_us_avg': round(float(gpu_cache_stats.get('policy_time_us_avg', 0.0) or 0.0), 6),
+        'eviction_decision_time_us_avg': round(
+            float(gpu_cache_stats.get('eviction_decision_time_us_avg', 0.0) or 0.0),
+            6,
+        ),
         'avg_p_reuse': round(float(gpu_cache_stats.get('avg_p_reuse', 0.0) or 0.0), 6),
         'avg_score': round(float(gpu_cache_stats.get('avg_score', 0.0) or 0.0), 9),
         'score_p50': round(float(gpu_cache_stats.get('score_p50', 0.0) or 0.0), 9),
         'score_p95': round(float(gpu_cache_stats.get('score_p95', 0.0) or 0.0), 9),
+        'score_std': round(float(gpu_cache_stats.get('score_std', 0.0) or 0.0), 9),
+        'p_reuse_std': round(float(gpu_cache_stats.get('p_reuse_std', 0.0) or 0.0), 6),
+        'c_recomp_ms_p50': round(float(gpu_cache_stats.get('c_recomp_ms_p50', 0.0) or 0.0), 6),
+        'c_recomp_model': str(gpu_cache_stats.get('c_recomp_model', '')),
+        'eviction_granularity': str(gpu_cache_stats.get('eviction_granularity', '')),
         'lpe_profile_count': int(gpu_cache_stats.get('lpe_profile_count', 0) or 0),
         'admission_count': int(gpu_cache_stats.get('admissions', 0) or 0),
         'admission_rejection_count': int(gpu_cache_stats.get('admission_rejections', 0) or 0),
@@ -708,12 +717,18 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
         'low_score_evictions',
         'hot_prefix_evictions',
         'policy_timing_samples',
+        'eviction_decision_timing_samples',
         'lpe_profile_count',
     }
     sums = {key: int(parent_stats.get(key, 0) or 0) for key in int_keys}
     float_keys = {
         'policy_time_ms_total',
+        'eviction_decision_time_ms_total',
+        'eviction_decision_time_us_avg',
         'free_queue_reorder_time_ms',
+        'score_std',
+        'p_reuse_std',
+        'c_recomp_ms_p50',
     }
     float_sums = {key: float(parent_stats.get(key, 0.0) or 0.0) for key in float_keys}
     profile_count = max(int(parent_stats.get('lpe_profile_count', 0) or 0), 0)
@@ -754,6 +769,11 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
     result['policy_time_us_avg'] = (
         (float_sums['policy_time_ms_total'] * 1000.0) / sums['policy_timing_samples']
         if sums.get('policy_timing_samples') else 0.0
+    )
+    result['eviction_decision_time_us_avg'] = (
+        (float_sums['eviction_decision_time_ms_total'] * 1000.0)
+        / sums['eviction_decision_timing_samples']
+        if sums.get('eviction_decision_timing_samples') else 0.0
     )
     result['evicted_score_avg'] = (
         weighted_evicted_score / sums['evicted_score_count']

@@ -20,8 +20,16 @@ METRICS = (
     'hit_rate',
     'gpu_prefix_cache_evictions',
     'gpu_prefix_cache_cached_blocks',
+    'queue_wait_ms',
+    'prefill_ms',
+    'queue_wait_p95_ms',
+    'prefill_p95_ms',
     'free_queue_reorder_time_ms',
     'policy_time_us_avg',
+    'eviction_decision_time_us_avg',
+    'score_std',
+    'p_reuse_std',
+    'c_recomp_ms_p50',
     'request_throughput',
 )
 
