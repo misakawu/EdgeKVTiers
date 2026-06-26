@@ -7,7 +7,10 @@ GPU memory peak while replaying prompts that share prefixes.
 """
 
 from __future__ import annotations
-
+import sys
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))   # 强制插入最前面
 import argparse
 import concurrent.futures
 import csv
@@ -199,18 +202,21 @@ def load_sharegpt_sessions(path: Path, max_sessions: int, order: str = "file") -
         conversations = row.get("conversations", [])
         if not isinstance(conversations, list):
             continue
-        human_messages = [
-            message_text(msg).strip()
-            for msg in conversations
-            if message_role(msg) in {"human", "user"} and message_text(msg).strip()
-        ]
-        if len(human_messages) < 2:
+        turns: List[dict] = []
+        current_turn: dict | None = None
+        for msg in conversations:
+            role = message_role(msg)
+            text = message_text(msg).strip()
+            if not text:
+                continue
+            if role in {"human", "user"}:
+                current_turn = {"i": len(turns), "user": text}
+                turns.append(current_turn)
+            elif role in {"gpt", "assistant"} and current_turn is not None and "assistant" not in current_turn:
+                current_turn["assistant"] = text
+        if len(turns) < 2:
             continue
         session_id = str(row.get("id", f"sharegpt_{raw_session_idx:06d}"))
-        turns = [
-            {"i": i, "user": text}
-            for i, text in enumerate(human_messages)
-        ]
         sessions.append(
             {
                 "session_id": session_id,
@@ -218,7 +224,7 @@ def load_sharegpt_sessions(path: Path, max_sessions: int, order: str = "file") -
                 "object_type": "sharegpt_session_prefix",
                 "reuse_key": session_id,
                 "source_index": raw_session_idx,
-                "total_user_chars": sum(len(text) for text in human_messages),
+                "total_user_chars": sum(len(str(turn.get("user", ""))) for turn in turns),
                 "turns": turns,
             }
         )
@@ -684,8 +690,36 @@ def rag_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
     return prompts
 
 
+def session_to_cumulative_user_session(session: dict) -> dict:
+    row = dict(session)
+    turns = session.get("turns", [])
+    if not isinstance(turns, list) or row.get("turns_format") in {"cumulative_user", "complete_prompt"}:
+        return row
+    if str(row.get("source", "sharegpt")).lower() == "hotpotqa":
+        return row
+
+    transcript: List[str] = []
+    cumulative_turns: List[dict] = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        user_text = str(turn.get("user", "")).strip()
+        if not user_text:
+            continue
+        next_turn = dict(turn)
+        next_turn["user"] = "\n".join(transcript + [f"User: {user_text}", "Assistant:"])
+        cumulative_turns.append(next_turn)
+        transcript.append(f"User: {user_text}")
+        assistant_text = str(turn.get("assistant", "")).strip()
+        if assistant_text:
+            transcript.append(f"Assistant: {assistant_text}")
+    row["turns"] = cumulative_turns
+    row["turns_format"] = "cumulative_user"
+    return row
+
+
 def write_replay_trace(path: Path, sessions: Sequence[dict]) -> None:
-    write_jsonl(path, sessions)
+    write_jsonl(path, [session_to_cumulative_user_session(session) for session in sessions])
 
 
 def load_replay_sessions(path: Path) -> List[dict]:
@@ -706,11 +740,112 @@ def load_replay_sessions(path: Path) -> List[dict]:
     return sessions
 
 
+def is_flat_replay_prompt(row: dict) -> bool:
+    return "prompt" in row and "turns" not in row
+
+
+def flat_replay_prompt_to_session(row: dict, fallback_index: int) -> dict:
+    session_id = str(row.get("session_id", f"flat_replay_{fallback_index:06d}"))
+    turn_index = int(row.get("turn_index", row.get("i", 0)) or 0)
+    user_text = str(row.get("prompt", "")).strip()
+    session = {k: v for k, v in row.items() if k not in {"prompt", "turns", "turn_index"}}
+    session.setdefault("session_id", session_id)
+    session.setdefault("source", str(row.get("source", "flat_replay")))
+    session.setdefault("object_type", str(row.get("object_type", "flat_prompt")))
+    session.setdefault("reuse_key", str(row.get("reuse_key", session_id)))
+    session["turns"] = [{"i": turn_index, "user": user_text, "prompt_is_complete": True}]
+    return session
+
+
+def complete_prompt_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
+    prompts: List[dict] = []
+    session_id = str(session["session_id"])
+    for turn in session.get("turns", []):
+        turn_index = int(turn.get("i", len(prompts)))
+        prompt = str(turn.get("user", "")).strip()
+        if not prompt:
+            continue
+        row = {
+            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "prompt": prompt,
+            "prompt_chars": len(prompt),
+            "prompt_est_tokens": estimate_tokens(prompt),
+            "n_tokens": count_tokens(prompt, tokenizer),
+            "workload": str(session.get("workload", "sharegpt_session_prefix")),
+            "object_type": str(session.get("object_type", "flat_prompt")),
+            "reuse_key": str(session.get("reuse_key", session_id)),
+            "replay_source": "frozen_replay_trace",
+        }
+        for key, value in session.items():
+            if key not in row and key != "turns":
+                row[key] = value
+        prompts.append(row)
+    return prompts
+
+
+def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
+    prompts: List[dict] = []
+    session_id = str(session["session_id"])
+    for turn in session.get("turns", []):
+        turn_index = int(turn.get("i", len(prompts)))
+        user_text = str(turn.get("user", "")).strip()
+        if not user_text:
+            continue
+        rag = turn.get("rag")
+        rag_prefix = ""
+        if isinstance(rag, dict):
+            context_lines = [
+                f"[{row['chunk_id']}] {row['title']}: {row['text']}"
+                for row in rag.get("chunks", [])
+            ]
+            if context_lines:
+                rag_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
+        prompt = rag_prefix + user_text
+        row = {
+            "request_id": f"{session_id}:turn:{turn_index:03d}",
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "prompt": prompt,
+            "prompt_chars": len(prompt),
+            "prompt_est_tokens": estimate_tokens(prompt),
+            "n_tokens": count_tokens(prompt, tokenizer),
+            "workload": "sharegpt_session_prefix",
+            "object_type": str(session.get("object_type", "sharegpt_session_prefix")),
+            "reuse_key": str(session.get("reuse_key", session_id)),
+            "replay_source": "frozen_replay_trace",
+        }
+        if isinstance(rag, dict):
+            chunks = rag.get("chunks", [])
+            row.update(
+                {
+                    "workload": "sharegpt_hotpotqa_weak_link",
+                    "rag_reuse_key": str(rag.get("reuse_key", "")),
+                    "rag_chunk_ids": [chunk.get("chunk_id", "") for chunk in chunks],
+                    "rag_doc_ids": sorted({chunk.get("doc_id", "") for chunk in chunks}),
+                    "dataset": rag.get("dataset", "hotpotqa"),
+                    "hotpotqa_example_id": rag.get("hotpotqa_example_id", ""),
+                    "hotpotqa_source_path": rag.get("hotpotqa_source_path", ""),
+                    "rag_match_mode": rag.get("match_mode", "weak_round_robin"),
+                }
+            )
+        prompts.append(row)
+    return prompts
+
+
 def replay_sessions_to_prompts(sessions: Sequence[dict], tokenizer=None, max_requests: int = 0) -> List[dict]:
     prompts: List[dict] = []
-    for session in sessions:
+    for session_index, session in enumerate(sessions):
+        if is_flat_replay_prompt(session):
+            session = flat_replay_prompt_to_session(session, session_index)
         source = str(session.get("source", "sharegpt")).lower()
-        if source == "hotpotqa":
+        turns_format = str(session.get("turns_format", ""))
+        if turns_format == "cumulative_user":
+            session_prompts = cumulative_user_session_to_prompts(session, tokenizer)
+        elif any(turn.get("prompt_is_complete") for turn in session.get("turns", [])):
+            session_prompts = complete_prompt_session_to_prompts(session, tokenizer)
+        elif source == "hotpotqa":
             session_prompts = rag_session_to_prompts(session, tokenizer)
         else:
             session_prompts = sharegpt_session_to_prompts(session, tokenizer)

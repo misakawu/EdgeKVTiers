@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -109,6 +110,56 @@ def test_h1_loads_h0_mixed_rag_trace(tmp_path: Path, monkeypatch) -> None:
     assert len(rows) == 6
     assert {row["workload"] for row in rows} == {"sharegpt_session_prefix", "rag_chunk_reuse"}
     assert any(row.get("chunk_ids") for row in rows if row["workload"] == "rag_chunk_reuse")
+
+
+def test_h1_loads_session_turns_jsonl_replay_trace(tmp_path: Path, monkeypatch) -> None:
+    trace_path = tmp_path / "unused_sharegpt.json"
+    trace_path.write_text("[]", encoding="utf-8")
+    replay_path = tmp_path / "session_turns.jsonl"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "session_id": "sg_0007",
+                "turns_format": "cumulative_user",
+                "turns": [
+                    {"i": 0, "user": "User: first user input\nAssistant:"},
+                    {
+                        "i": 1,
+                        "user": "User: first user input\nAssistant: first answer\nUser: second user input\nAssistant:",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(h1.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer())
+    args = argparse.Namespace(
+        model="models/Qwen2.5-7B-Instruct",
+        trace_path=str(trace_path),
+        replay_trace=str(replay_path),
+        workload="mixed",
+        max_requests=8,
+        rag_requests=0,
+        max_sessions=2,
+        hotpotqa_path=tmp_path / "unused_hotpotqa.json",
+        download_hotpotqa=False,
+        hotpotqa_max_examples=0,
+        rag_chunk_words=56,
+        rag_chunks_per_query=2,
+        rag_query_repeats=4,
+        sharegpt_order="file",
+        timeout_s=120.0,
+        max_tokens=16,
+        max_model_len=2048,
+    )
+
+    rows = h1.load_trace(args)
+    assert [row["request_id"] for row in rows] == ["sg_0007:turn:000", "sg_0007:turn:001"]
+    assert rows[0]["prompt"] == "User: first user input\nAssistant:"
+    assert rows[1]["prompt"] == "User: first user input\nAssistant: first answer\nUser: second user input\nAssistant:"
+    assert all(row["replay_source"] == "frozen_replay_trace" for row in rows)
 
 
 def test_h1_trace_side_fields_include_lpe_score() -> None:

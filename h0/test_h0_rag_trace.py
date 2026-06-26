@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -217,17 +218,52 @@ def test_frozen_replay_trace_round_trip(tmp_path: Path) -> None:
     assert sessions[0]["source"] == "sharegpt"
     assert sessions[1]["source"] == "hotpotqa"
     assert sessions[0]["turns"] == [
-        {"i": 0, "user": "first question"},
+        {"i": 0, "user": "first question", "assistant": "first answer"},
         {"i": 1, "user": "second question"},
     ]
     out = tmp_path / "replay.jsonl"
     write_replay_trace(out, sessions)
+    first_line = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert set(first_line) >= {"session_id", "turns"}
+    assert first_line["turns_format"] == "cumulative_user"
+    assert first_line["turns"] == [
+        {"i": 0, "user": "User: first question\nAssistant:", "assistant": "first answer"},
+        {"i": 1, "user": "User: first question\nAssistant: first answer\nUser: second question\nAssistant:"},
+    ]
     replay_args = argparse.Namespace(**vars(args), replay_trace=str(out))
     prompts = load_replay_prompts(replay_args, trace_path)
-    direct_prompts = replay_sessions_to_prompts(sessions, max_requests=8)
-    assert prompts == direct_prompts
+    assert prompts == load_replay_prompts(replay_args, trace_path)
     assert any(row["workload"] == "rag_chunk_reuse" for row in prompts)
     assert all(row["replay_source"] == "frozen_replay_trace" for row in prompts)
+
+
+def test_legacy_flat_prompt_jsonl_still_loads(tmp_path: Path) -> None:
+    trace_path = tmp_path / "unused_sharegpt.json"
+    trace_path.write_text("[]", encoding="utf-8")
+    replay_path = tmp_path / "legacy_flat.jsonl"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "request_id": "legacy:turn:000",
+                "session_id": "legacy",
+                "turn_index": 0,
+                "prompt": "User: legacy prompt\nAssistant:",
+                "workload": "sharegpt_session_prefix",
+                "reuse_key": "legacy",
+                "n_tokens": 4,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        replay_trace=str(replay_path),
+        max_requests=8,
+    )
+    prompts = load_replay_prompts(args, trace_path)
+    assert len(prompts) == 1
+    assert prompts[0]["prompt"] == "User: legacy prompt\nAssistant:"
+    assert prompts[0]["replay_source"] == "frozen_replay_trace"
 
 
 def test_weak_linked_trace_attaches_rag_to_sharegpt_turns(tmp_path: Path) -> None:
@@ -284,5 +320,6 @@ if __name__ == "__main__":
     test_hotpotqa_high_frequency_group_order_is_80_20()
     test_mixed_trace_interleaves_sharegpt_and_rag(Path("/tmp"))
     test_frozen_replay_trace_round_trip(Path("/tmp"))
+    test_legacy_flat_prompt_jsonl_still_loads(Path("/tmp"))
     test_weak_linked_trace_attaches_rag_to_sharegpt_turns(Path("/tmp"))
     print("h0 rag trace tests ok")

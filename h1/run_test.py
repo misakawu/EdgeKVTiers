@@ -12,7 +12,7 @@ from pathlib import Path
 
 import run_step3_budget_tiers as step3
 
-
+OUT_DIR = Path("h1/out")
 BASE = Path("h1/out/run_test")
 POLICIES = ["h1_lru", "h1_lpe"]
 TIERS = [
@@ -26,10 +26,11 @@ def main() -> None:
     parser.add_argument("--visible-devices", default=step3.DEVICES)
     parser.add_argument("--num-prompts", type=int, default=step3.MAX_REQUESTS)
     parser.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
-    parser.add_argument("--base-out", default=str(BASE))
+    # parser.add_argument("--base-out", default=str(BASE))
+    parser.add_argument("--out-dir", default=str("run_test"))
     args = parser.parse_args()
 
-    base_out = Path(args.base_out)
+    base_out = OUT_DIR / args.out_dir
     for tier, budget in TIERS:
         step3.run_step3(
             tier=tier,
@@ -40,7 +41,18 @@ def main() -> None:
             visible_devices=args.visible_devices,
             force=args.force,
             keep_cells=True,
+            max_num_batched_tokens=4096,   # 添加这一行
         )
+        # step3.run_step3(
+        #     tier=tier,
+        #     base_out=base_out,
+        #     budgets=[budget],
+        #     policies=POLICIES,
+        #     num_prompts=args.num_prompts,
+        #     visible_devices=args.visible_devices,
+        #     force=args.force,
+        #     keep_cells=True,
+        # )
 
 
 if __name__ == "__main__":
