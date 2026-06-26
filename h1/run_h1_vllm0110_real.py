@@ -12,8 +12,10 @@ Notes:
   the repo-local ``h1/sitecustomize.py`` runtime patch. The experiment uses GPU
   KV cache only and does not configure vLLM CPU KV offload.
 - vLLM offline ``LLM.generate`` records per-request scheduler metrics when
-  available. ``ttft_proxy_ms`` remains the batch wall-clock latency proxy, while
-  ``queue_wait_ms`` and ``prefill_ms`` are derived from ``RequestOutput.metrics``.
+  available. ``ttft_proxy_ms`` uses per-request first-token timing from
+  ``RequestOutput.metrics`` when available, falling back to the batch wall-clock
+  latency proxy on older builds. ``queue_wait_ms`` and ``prefill_ms`` are also
+  derived from ``RequestOutput.metrics``.
 - hit rate in the summary is measured from real GPU prefix-cache block lookup
   statistics. Per-request rows still carry the H0 trace-side reuse proxy.
 """
@@ -103,6 +105,7 @@ def request_output_timing_ms(output: Any) -> dict[str, float | str | bool]:
         return {
             'queue_wait_ms': 0.0,
             'prefill_ms': 0.0,
+            'ttft_ms': 0.0,
             'd4_metrics_available': False,
             'd4_metrics_source': 'request_output.metrics_missing',
         }
@@ -141,6 +144,15 @@ def request_output_timing_ms(output: Any) -> dict[str, float | str | bool]:
         if scheduled is not None and first_token is not None
         else 0.0
     )
+    ttft_ms = 0.0
+    if arrival is not None and first_token is not None:
+        ttft_ms = max(0.0, (first_token - arrival) * 1000.0)
+    if ttft_ms <= 0.0 and queued is not None and first_token is not None:
+        ttft_ms = max(0.0, (first_token - queued) * 1000.0)
+    if ttft_ms <= 0.0 and time_in_queue is not None and prefill_ms > 0.0:
+        ttft_ms = max(0.0, time_in_queue * 1000.0) + prefill_ms
+    if ttft_ms <= 0.0 and scheduled is not None and first_token is not None:
+        ttft_ms = max(0.0, (first_token - scheduled) * 1000.0)
     available = (
         (time_in_queue is not None or (queued is not None and scheduled is not None)
          or (arrival is not None and scheduled is not None))
@@ -159,6 +171,7 @@ def request_output_timing_ms(output: Any) -> dict[str, float | str | bool]:
     return {
         'queue_wait_ms': queue_wait_ms,
         'prefill_ms': prefill_ms,
+        'ttft_ms': ttft_ms,
         'd4_metrics_available': available,
         'd4_metrics_source': (
             'request_output.metrics'
@@ -621,6 +634,13 @@ def run_cell(
             ):
                 text = output.outputs[0].text
                 timing = request_output_timing_ms(output)
+                timing_ttft_ms = float(timing.get('ttft_ms', 0.0) or 0.0)
+                metrics_available = bool(timing['d4_metrics_available'])
+                ttft_proxy_ms = (
+                    timing_ttft_ms
+                    if metrics_available and timing_ttft_ms > 0.0
+                    else latency_ms
+                )
                 idx = batch_start + offset
                 reuse_key, trace_hit, rag_reuse_key, rag_hit = reuse_info
                 row = {
@@ -637,10 +657,10 @@ def run_cell(
                     'replay_batch_size': args.replay_batch_size,
                     'max_tokens': args.max_tokens,
                     'latency_ms': round(latency_ms, 6),
-                    'ttft_proxy_ms': round(latency_ms, 6),
+                    'ttft_proxy_ms': round(ttft_proxy_ms, 6),
                     'queue_wait_ms': round(float(timing['queue_wait_ms']), 6),
                     'prefill_ms': round(float(timing['prefill_ms']), 6),
-                    'd4_metrics_available': bool(timing['d4_metrics_available']),
+                    'd4_metrics_available': metrics_available,
                     'd4_metrics_source': str(timing['d4_metrics_source']),
                     'output_chars': len(text),
                     'model': args.model,
@@ -800,7 +820,7 @@ def run_cell(
         **cop.summary(),
         'replay_batch_size': args.replay_batch_size,
         'max_num_batched_tokens': resolved_max_num_batched_tokens(args),
-        'ttft_note': 'offline LLM.generate latency is used as TTFT proxy; with replay_batch_size>1 each request receives its concurrent batch latency',
+        'ttft_note': 'ttft_proxy_ms uses per-request RequestOutput.metrics first-token timing when available; if metrics are unavailable or non-positive it falls back to offline LLM.generate batch latency',
     }
     return rows, summary, monitor.samples
 

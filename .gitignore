@@ -1,5 +1,9 @@
 # Runtime outputs and experiment artifacts
 out/
+data/
+runtime/
+**/out/
+**/runtime/
 
 # Large local assets that must not be uploaded
 models/
@@ -15,6 +19,8 @@ __pycache__/
 venv/
 env/
 .env
+.claude/
+.pytest_cache/
 
 # OS/editor noise
 .DS_Store
@@ -28,6 +34,8 @@ env/
 !*.md
 !h1/run_h1_lpe_budget_quick.sh
 !h1/run_h1_lpe_serving_bench.sh
+!h1/run_h1_policy_serving_bench.sh
+!h1/step1_D3/run_step1_D3_monitor.sh
 !h0/configs/*.json
 !env_locks/*.txt
 !.gitignore
