@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Step3 budget-tier calibration / policy comparison (replaces run_step3_budget_tiers.sh).
+"""Step3 budget-tier calibration / policy comparison on the pressure replay trace.
 
-One big task: on the workload fixed by Step2 (prefix_repetition, p8/pl512/s128,
-output_len=1, num_prompts=200, rr=18.5), scan gpu_memory_utilization budgets and
-compare policies (LRU / LFU / vLLM-default / LPE) by p95 TTFT. Each cell runs
-through h1/run_h1_policy_serving_bench.sh.
-
-`run_step3()` is importable and reused by run_step3_repeat.py (which calls it with
-no_finalize=True so all reps are kept until it aggregates the median itself).
+Runs the H1 real replay harness instead of vLLM's built-in benchmark datasets. The
+workload is the frozen H0 ShareGPT+HotpotQA pressure trace by default, so Step3
+uses the same skewed, high-frequency HotpotQA chunk reuse as the rest of H1.
 
     python h1/run_step3_budget_tiers.py
-    python h1/run_step3_budget_tiers.py --budgets "0.710 0.720" --policies "h1_lru h1_lpe"
+    python h1/run_step3_budget_tiers.py --budgets tight mid --policies h1_lru h1_lpe
 
 All configuration lives in the CONFIG block below; no env vars are required.
 """
@@ -26,88 +22,90 @@ DEVICES = "0,1"
 TIER = "tight"
 BASE_OUT = Path("h1/out/step3")
 
-# Budgets (== gpu_memory_utilization values) and policies to compare.
-BUDGETS = ["0.710", "0.720", "0.730"]
-POLICIES = ["h1_lru"]
+BUDGETS = ["tight", "mid", "loose"]
+POLICIES = ["h1_lru", "h1_lfu", "vllm_default", "h1_lpe"]
 
-# Fixed workload (Step2-selected operating point).
-NUM_PROMPTS = 200
-REQUEST_RATE = 18.5
-NUM_PREFIXES = 8
-PREFIX_LEN = 512
-SUFFIX_LEN = 128
-OUTPUT_LEN = 1
-
-# Batching / concurrency (same as Step2 formal tier).
-MAX_CONCURRENCY = 64
-MAX_NUM_SEQS = 4
-MAX_NUM_BATCHED_TOKENS = 4096
-STATS_FLUSH_INTERVAL = 2048
-PROFILE_POLICY_TIME = 1
-
-# LPE knobs (same as Step2 defaults).
-LPE_LIGHT_PATH = 1
-LPE_REORDER_MODE = "window"
-LPE_REORDER_WINDOW = 128
-LPE_PRESSURE_FREE_RATIO = 0.15
-LPE_PRESSURE_EVICTION_WINDOW = 64
+WORKLOAD = "mixed"
+REPLAY_TRACE = Path("data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl")
+HOTPOTQA_PATH = "data/hotpotqa"
+SHAREGPT_ORDER = "longest"
+MAX_SESSIONS = 200
+MAX_REQUESTS = 1024
+RAG_REQUESTS = 100
+HOTPOTQA_MAX_EXAMPLES = 5
+RAG_CHUNK_WORDS = 56
+RAG_CHUNKS_PER_QUERY = 2
+RAG_QUERY_REPEATS = 4
+MAX_TOKENS = 16
+MAX_MODEL_LEN = 2048
+REPLAY_BATCH_SIZE = 64
+TENSOR_PARALLEL_SIZE = 2
+PYTHONPATH = ".:h1:h0"
 # --------------------------------------------------------------------------------------
 
 
-def cell_env(policy, budget, num_prompts, request_rate) -> dict:
-    return {
-        "H1_BENCH_DATASET": "prefix_repetition",
-        "H1_GPU_POLICY": policy,
-        "H1_BENCH_NUM_PROMPTS": num_prompts,
-        "H1_BENCH_REQUEST_RATE": request_rate,
-        "H1_PREFIX_REPETITION_NUM_PREFIXES": NUM_PREFIXES,
-        "H1_PREFIX_REPETITION_PREFIX_LEN": PREFIX_LEN,
-        "H1_PREFIX_REPETITION_SUFFIX_LEN": SUFFIX_LEN,
-        "H1_PREFIX_REPETITION_OUTPUT_LEN": OUTPUT_LEN,
-        "H1_GPU_MEMORY_UTILIZATION": budget,
-        "H1_BENCH_MAX_CONCURRENCY": MAX_CONCURRENCY,
-        "H1_VLLM_MAX_NUM_SEQS": MAX_NUM_SEQS,
-        "H1_VLLM_MAX_NUM_BATCHED_TOKENS": MAX_NUM_BATCHED_TOKENS,
-        "EDGEKV_H1_STATS_FLUSH_INTERVAL": STATS_FLUSH_INTERVAL,
-        "EDGEKV_H1_PROFILE_POLICY_TIME": PROFILE_POLICY_TIME,
-        "H1_LPE_LIGHT_PATH": LPE_LIGHT_PATH,
-        "H1_LPE_REORDER_MODE": LPE_REORDER_MODE,
-        "H1_LPE_REORDER_WINDOW": LPE_REORDER_WINDOW,
-        "H1_LPE_PRESSURE_FREE_RATIO": LPE_PRESSURE_FREE_RATIO,
-        "H1_LPE_PRESSURE_EVICTION_WINDOW": LPE_PRESSURE_EVICTION_WINDOW,
-    }
+def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
+              replay_batch_size: int, replay_trace: Path, hotpotqa_path: str,
+              visible_devices: str) -> list[str]:
+    return [
+        "--out", str(cell_dir),
+        "--dtype", "float16",
+        "--policies", policy,
+        "--budgets", budget,
+        "--workload", WORKLOAD,
+        "--replay-trace", str(replay_trace),
+        "--hotpotqa-path", hotpotqa_path,
+        "--hotpotqa-max-examples", str(HOTPOTQA_MAX_EXAMPLES),
+        "--max-sessions", str(MAX_SESSIONS),
+        "--max-requests", str(max_requests),
+        "--rag-requests", str(RAG_REQUESTS),
+        "--rag-chunk-words", str(RAG_CHUNK_WORDS),
+        "--rag-chunks-per-query", str(RAG_CHUNKS_PER_QUERY),
+        "--rag-query-repeats", str(RAG_QUERY_REPEATS),
+        "--sharegpt-order", SHAREGPT_ORDER,
+        "--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE),
+        "--max-model-len", str(MAX_MODEL_LEN),
+        "--max-tokens", str(MAX_TOKENS),
+        "--replay-batch-size", str(replay_batch_size),
+        "--visible-devices", visible_devices,
+    ]
 
 
 def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIES,
-              num_prompts=NUM_PROMPTS, request_rate=REQUEST_RATE,
-              visible_devices=DEVICES, no_finalize=False, force=False,
+              num_prompts=MAX_REQUESTS, request_rate=0.0, visible_devices=DEVICES,
+              replay_trace=REPLAY_TRACE, replay_batch_size=REPLAY_BATCH_SIZE,
+              hotpotqa_path=HOTPOTQA_PATH, no_finalize=False, force=False,
               keep_cells=False) -> Path:
-    """Run one tier's budget x policy matrix. Returns the tier directory.
-
-    With no_finalize=True the summary/cleanup is deferred (used by the repeat
-    protocol). Otherwise summarizes into <tier_dir>/step3_summary.csv and drops
-    the per-cell outputs unless keep_cells.
-    """
+    """Run one tier's budget x policy matrix on the pressure replay trace."""
     base_out = Path(base_out)
+    replay_trace = Path(replay_trace)
     tier_dir = base_out / tier
     log_dir = tier_dir / "logs"
     if not R.DRY_RUN:
         log_dir.mkdir(parents=True, exist_ok=True)
 
     R.log(f"[step3] tier={tier} out={tier_dir} budgets={budgets} policies={policies}")
-    R.log(f"[step3] workload: prompts={num_prompts} rr={request_rate} prefixes={NUM_PREFIXES} "
-          f"prefix_len={PREFIX_LEN} suffix_len={SUFFIX_LEN} output_len={OUTPUT_LEN}")
+    R.log(f"[step3] workload=pressure_replay trace={replay_trace} max_requests={num_prompts} bs={replay_batch_size}")
     for budget in budgets:
         for policy in policies:
             out_dir = tier_dir / budget / policy
-            R.log(f"[run] tier={tier} budget={budget} policy={policy} prompts={num_prompts} "
-                  f"rr={request_rate} prefixes={NUM_PREFIXES} prefix_len={PREFIX_LEN} "
-                  f"suffix_len={SUFFIX_LEN}")
-            R.run_bench_cell(
-                out_dir, visible_devices,
-                cell_env(policy, budget, num_prompts, request_rate),
-                log_file=log_dir / f"{budget}_{policy}.log", echo=False, force=force,
+            summary_json = out_dir / f"{budget}_{policy}_summary.json"
+            R.log(f"[run] tier={tier} budget={budget} policy={policy} max_requests={num_prompts}")
+            if summary_json.exists() and not force:
+                R.log(f"[skip] {summary_json} already exists")
+                continue
+            if not R.DRY_RUN:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            rc = R.run_real_cell(
+                out_dir,
+                visible_devices,
+                cell_args(out_dir, budget, policy, num_prompts, replay_batch_size,
+                          replay_trace, hotpotqa_path, visible_devices),
+                {"PYTHONPATH": PYTHONPATH, "EDGEKV_H1_GPU_POLICY": policy},
+                log_file=log_dir / f"{budget}_{policy}.log",
             )
+            if rc != 0:
+                raise RuntimeError(f"real replay cell failed (rc={rc}): {out_dir}")
     R.log(f"[step3] done tier={tier}")
 
     if no_finalize:
@@ -119,7 +117,7 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
     R.summarize("summarize_step3_budget_tiers.py",
                 ["--out", str(tier_dir), "--summary", str(summary_csv),
                  "--request-rate", str(request_rate)])
-    R.cleanup_dirs(tier_dir, keep=keep_cells)
+    R.cleanup_dirs(tier_dir, keep=keep_cells, extra=[log_dir])
     R.log(f"[done] summary: {summary_csv}")
     return tier_dir
 
@@ -130,9 +128,12 @@ def main() -> None:
     ap.add_argument("--tier", default=TIER)
     ap.add_argument("--budgets", default=" ".join(BUDGETS))
     ap.add_argument("--policies", default=" ".join(POLICIES))
-    ap.add_argument("--num-prompts", type=int, default=NUM_PROMPTS)
+    ap.add_argument("--num-prompts", type=int, default=MAX_REQUESTS)
+    ap.add_argument("--replay-trace", default=str(REPLAY_TRACE))
+    ap.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
+    ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
     ap.add_argument("--no-finalize", action="store_true", help="defer summary/cleanup (for repeat)")
-    ap.add_argument("--force", action="store_true", help="rerun cells even if aggregate.csv exists")
+    ap.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
     ap.add_argument("--keep-cells", action="store_true", help="retain per-cell outputs and logs")
     args = ap.parse_args()
 
@@ -142,6 +143,9 @@ def main() -> None:
         policies=args.policies.split(),
         num_prompts=args.num_prompts,
         visible_devices=args.visible_devices,
+        replay_trace=Path(args.replay_trace),
+        replay_batch_size=args.replay_batch_size,
+        hotpotqa_path=args.hotpotqa_path,
         no_finalize=args.no_finalize,
         force=args.force,
         keep_cells=args.keep_cells,

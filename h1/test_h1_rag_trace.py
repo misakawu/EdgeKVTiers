@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
 """Smoke tests for H1 reuse of the H0 mixed RAG replay trace."""
 
 from __future__ import annotations
@@ -59,6 +60,22 @@ def write_sharegpt_fixture(path: Path) -> None:
 """.strip(),
         encoding="utf-8",
     )
+
+
+def test_h1_defaults_use_repo_pressure_trace() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    assert h1.DEFAULT_SHAREGPT_TRACE_PATH == repo_root / "data" / "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
+    assert h1.DEFAULT_HOTPOTQA_PATH == repo_root / "data" / "hotpotqa"
+    assert h1.DEFAULT_REPLAY_TRACE_PATH == repo_root / "data" / "edgekv_traces" / "h0_sharegpt_hotpotqa_200sessions_pressure.jsonl"
+
+
+def test_step3_driver_uses_pressure_replay_not_vllm_builtin_dataset() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "h1" / "run_step3_budget_tiers.py").read_text(encoding="utf-8")
+    assert "h0_sharegpt_hotpotqa_200sessions_pressure.jsonl" in source
+    assert "H1_BENCH_DATASET" not in source
+    assert "prefix_repetition" not in source
+
 
 
 def test_h1_loads_h0_mixed_rag_trace(tmp_path: Path, monkeypatch) -> None:

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Summarize H1 step3 budget-tier experiment outputs (one tier dir).
 
-Reads <tier_dir>/<budget>/<policy>/aggregate.csv (written by aggregate_h1_serving_bench.py)
-and writes one concise CSV: one row per (budget, policy) with core TTFT / cache-policy
-metrics plus LPE-vs-LRU p95/mean gains per budget. No path columns.
+Supports both the legacy serving-bench layout (<budget>/<policy>/aggregate.csv)
+and the pressure-replay layout (<budget>/<policy>/<budget>_<policy>_summary.json).
+Writes one concise CSV with core TTFT/cache-policy metrics plus LPE-vs-LRU gains.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ METRICS = (
     'p95_ttft_ms',
     'p50_ttft_ms',
     'mean_ttft_ms',
+    'replay_batch_size',
     'hit_rate',
     'gpu_prefix_cache_evictions',
     'gpu_prefix_cache_cached_blocks',
@@ -47,6 +49,37 @@ def as_float(row: dict[str, str], key: str) -> float:
         return 0.0
 
 
+def row_from_real_summary(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    elapsed = as_float(data, 'elapsed_s')
+    requests = as_float(data, 'requests')
+    throughput = requests / elapsed if elapsed > 0 else 0.0
+    mapped = {
+        'p95_ttft_ms': data.get('ttft_proxy_p95_ms', ''),
+        'p50_ttft_ms': data.get('ttft_proxy_p50_ms', ''),
+        'mean_ttft_ms': data.get('latency_mean_ms', ''),
+        'hit_rate': data.get('hit_rate', ''),
+        'gpu_prefix_cache_evictions': data.get('gpu_prefix_cache_evictions', ''),
+        'gpu_prefix_cache_cached_blocks': data.get('gpu_prefix_cache_cached_blocks', ''),
+        'queue_wait_ms': '',
+        'prefill_ms': '',
+        'queue_wait_p95_ms': '',
+        'prefill_p95_ms': '',
+        'free_queue_reorder_time_ms': data.get('free_queue_reorder_time_ms', ''),
+        'policy_time_us_avg': data.get('policy_time_us_avg', ''),
+        'eviction_decision_time_us_avg': data.get('eviction_decision_time_us_avg', ''),
+        'score_std': data.get('score_std', ''),
+        'p_reuse_std': data.get('p_reuse_std', ''),
+        'c_recomp_ms_p50': data.get('c_recomp_ms_p50', ''),
+        'request_throughput': throughput,
+        'replay_batch_size': data.get('replay_batch_size', ''),
+    }
+    return {key: str(value) for key, value in mapped.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', default='h1/out/step3/tight',
@@ -58,16 +91,21 @@ def main() -> None:
     out_dir = Path(args.out)
     rows: list[dict[str, str]] = []
     by_budget: dict[str, dict[str, dict[str, str]]] = {}
+    sources: list[tuple[str, str, dict[str, str]]] = []
     for aggregate in sorted(out_dir.glob('*/*/aggregate.csv')):
-        policy = aggregate.parent.name
-        budget = aggregate.parent.parent.name
-        source = read_first_row(aggregate)
+        sources.append((aggregate.parent.parent.name, aggregate.parent.name, read_first_row(aggregate)))
+    for summary_json in sorted(out_dir.glob('*/*/*_summary.json')):
+        sources.append((summary_json.parent.parent.name, summary_json.parent.name, row_from_real_summary(summary_json)))
+
+    for budget, policy, source in sources:
+        if not source:
+            continue
         by_budget.setdefault(budget, {})[policy] = source
         throughput = as_float(source, 'request_throughput')
         row = {
             'budget': budget,
             'policy': policy,
-            'saturated': str(throughput < 0.8 * args.request_rate).lower(),
+            'saturated': str(bool(args.request_rate and throughput < 0.8 * args.request_rate)).lower(),
         }
         for metric in METRICS:
             row[metric] = source.get(metric, '')

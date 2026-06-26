@@ -28,8 +28,8 @@
 ### 回放设置
 
 - 主 workload：`mixed`
-- ShareGPT 源文件：`/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json`
-- HotpotQA 源目录：`/DATACENTER3/zhenxiang.wang/data/hotpotqa`
+- ShareGPT 源文件：`data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json`
+- HotpotQA 源目录：`data/hotpotqa`
 - `max_sessions`：`200`
 - `max_requests`：`1024`
 - `rag_requests`：`100`
@@ -47,12 +47,12 @@
 ### 回放输入
 
 1. 独立压力 trace
-   - 输入文件：`/DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl`
+   - 输入文件：`data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl`
    - 结构：ShareGPT session prefix 与 HotpotQA RAG chunk-set 独立交错。
    - 输出目录：`h0/results/h0_vllm_prefix_cache_qwen25_7b_pressure`
 
 2. 弱关联 trace
-   - 输入文件：`/DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_weak_link.jsonl`
+   - 输入文件：`data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_weak_link.jsonl`
    - 结构：将 HotpotQA RAG context 以弱关联方式挂到 ShareGPT turn 前缀中。
    - 输出目录：`h0/results/h0_vllm_prefix_cache_qwen25_7b_weak_link`
 

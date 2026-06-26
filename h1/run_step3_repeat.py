@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Step3 repeatable multi-measurement protocol (replaces run_step3_repeat_protocol.sh).
+"""Step3 repeatable multi-measurement protocol on the pressure replay trace.
 
-One big task: the three LPE_NOT_GOOD scenarios A/B/C, each a 4-policy comparison
-(h1_lru / h1_lfu / vllm_default / h1_lpe) repeated N times so a median removes
-single-run variance:
-
-  A  press_0720_n200  0.720 / n=200  pressured non-saturated (low variance, primary)
-  B  press_0730_n200  0.730 / n=200  non-saturated
-  C  sat_0710_n400    0.710 / n=400  saturated (high variance)
-
-Each rep reuses run_step3() from run_step3_budget_tiers with no_finalize so all reps
-survive until the cross-rep median is computed here. Resumable (cells with an existing
-aggregate.csv are skipped unless --force).
+Each work point is a 4-policy comparison (h1_lru / h1_lfu / vllm_default / h1_lpe)
+repeated N times so a median removes single-run variance. The cells reuse
+run_step3() from run_step3_budget_tiers, which now drives the real H0 pressure
+replay instead of vLLM's built-in benchmark datasets.
 
     python h1/run_step3_repeat.py
     python h1/run_step3_repeat.py --reps 5 --force
@@ -32,12 +25,11 @@ REPS = 3
 POLICIES = ["h1_lru", "h1_lfu", "vllm_default", "h1_lpe"]
 BASE = Path("h1/out/step3_repeat")
 
-# Work points (LPE_NOT_GOOD scenarios A/B/C): (label, budget, num_prompts). Prefix
-# structure fixed p8/pl512/s128, rr18.5, output_len=1 (from run_step3_budget_tiers config).
+# Work points: (label, budget tier, max replay requests) on the pressure trace.
 WORK_POINTS = [
-    ("sat_0710_n400", "0.710", 400),    # C saturated: heavy eviction, high variance
-    ("press_0720_n200", "0.720", 200),  # A pressured non-saturated: primary, low variance
-    ("press_0730_n200", "0.730", 200),  # B non-saturated: policies near-indistinguishable
+    ("pressure_tight_n400", "tight", 400),
+    ("pressure_mid_n400", "mid", 400),
+    ("pressure_loose_n400", "loose", 400),
 ]
 # --------------------------------------------------------------------------------------
 
@@ -62,6 +54,7 @@ def main() -> None:
                 visible_devices=args.visible_devices,
                 no_finalize=True,
                 force=args.force,
+                keep_cells=True,
             )
 
     summary_csv = BASE / "step3_repeat_summary.csv"

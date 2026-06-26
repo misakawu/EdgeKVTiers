@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
 """Smoke tests for H0 RAG chunk reuse trace construction."""
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from run_h0_vllm import (
     build_rag_chunk_prompts,
     build_replay_sessions,
     hotpot_context_items,
+    hotpotqa_high_frequency_group_order,
     load_replay_prompts,
     replay_sessions_to_prompts,
     resolve_hotpotqa_files,
@@ -83,6 +85,18 @@ def test_rag_chunk_trace_reuses_chunk_sets() -> None:
     assert sum(count - 1 for count in counts.values()) >= len(rows) // 2
     assert all(key.startswith("rag:hotpotqa:") for key in counts)
     assert all(row["chunk_ids"] for row in rows)
+
+
+def test_hotpotqa_high_frequency_group_order_is_80_20() -> None:
+    order = hotpotqa_high_frequency_group_order(group_count=10, request_count=100)
+    counts = Counter(order)
+    hot_requests = sum(counts[idx] for idx in range(2))
+    cold_requests = sum(counts[idx] for idx in range(2, 10))
+    assert len(order) == 100
+    assert hot_requests == 80
+    assert cold_requests == 20
+    assert set(counts) == set(range(10))
+
 
 
 def test_hotpotqa_directory_prefers_validation_then_train(tmp_path: Path) -> None:
@@ -267,6 +281,7 @@ def test_weak_linked_trace_attaches_rag_to_sharegpt_turns(tmp_path: Path) -> Non
 
 if __name__ == "__main__":
     test_rag_chunk_trace_reuses_chunk_sets()
+    test_hotpotqa_high_frequency_group_order_is_80_20()
     test_mixed_trace_interleaves_sharegpt_and_rag(Path("/tmp"))
     test_frozen_replay_trace_round_trip(Path("/tmp"))
     test_weak_linked_trace_attaches_rag_to_sharegpt_turns(Path("/tmp"))

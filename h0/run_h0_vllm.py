@@ -26,12 +26,12 @@ from edgekv_cop import COPProfiler, DEFAULT_BW_GBPS, DEFAULT_C_RE_MS_PER_TOKEN, 
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SHAREGPT_TRACE_PATH = Path(
-    "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
+DEFAULT_SHAREGPT_TRACE_PATH = (
+    REPO_ROOT / "data" / "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
 )
-DEFAULT_HOTPOTQA_PATH = Path("/DATACENTER3/zhenxiang.wang/data/hotpotqa")
-DEFAULT_REPLAY_TRACE_PATH = Path(
-    "/DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions.jsonl"
+DEFAULT_HOTPOTQA_PATH = REPO_ROOT / "data" / "hotpotqa"
+DEFAULT_REPLAY_TRACE_PATH = (
+    REPO_ROOT / "data" / "edgekv_traces" / "h0_sharegpt_hotpotqa_200sessions_pressure.jsonl"
 )
 HOTPOTQA_HF_BASE_URL = "https://huggingface.co/datasets/hotpotqa/hotpot_qa/resolve/main/distractor"
 HOTPOTQA_HF_FILES = (
@@ -443,6 +443,33 @@ def load_hotpotqa_chunk_groups(
     return groups
 
 
+def hotpotqa_high_frequency_group_order(group_count: int, request_count: int) -> List[int]:
+    """Return deterministic 80/20 group indices for HotpotQA chunk reuse.
+
+    The first 20% of groups are treated as hot and occupy four out of every
+    five request slots. The remaining groups are still exercised as the cold
+    tail so coverage is preserved while reuse is intentionally skewed.
+    """
+    if group_count <= 0 or request_count <= 0:
+        return []
+    hot_count = max(1, (group_count + 4) // 5)
+    hot_count = min(hot_count, group_count)
+    hot_indices = list(range(hot_count))
+    tail_indices = list(range(hot_count, group_count))
+    order: List[int] = []
+    hot_pos = 0
+    tail_pos = 0
+    for slot in range(request_count):
+        use_tail = bool(tail_indices) and (slot + 1) % 5 == 0
+        if use_tail:
+            order.append(tail_indices[tail_pos % len(tail_indices)])
+            tail_pos += 1
+        else:
+            order.append(hot_indices[hot_pos % len(hot_indices)])
+            hot_pos += 1
+    return order
+
+
 def build_rag_chunk_prompts(
     max_requests: int,
     hotpotqa_path: Path,
@@ -454,11 +481,12 @@ def build_rag_chunk_prompts(
     max_examples: int = 10,
     timeout_s: float = 120.0,
 ) -> List[dict]:
-    """Build a deterministic HotpotQA RAG trace with cross-query chunk reuse.
+    """Build a deterministic HotpotQA RAG trace with high-frequency chunk reuse.
 
-    Each chunk set is placed at the beginning of the prompt and is queried with
-    several different question suffixes. That shape lets vLLM prefix caching
-    reuse the retrieved chunk prefix across requests.
+    The retrieved chunk prefix stays at the beginning of each prompt, while the
+    group schedule makes the first 20% of chunk groups account for about 80% of
+    RAG requests. This gives LFU/LPE a stable hot/cold signal instead of the old
+    near-uniform sequential reuse pattern.
     """
 
     prompts: List[dict] = []
@@ -473,16 +501,18 @@ def build_rag_chunk_prompts(
         chunks_per_query,
         timeout_s,
     )
-    request_index = 0
-    while len(prompts) < max_requests:
-        group_row = groups[request_index % len(groups)]
+    group_order = hotpotqa_high_frequency_group_order(len(groups), max_requests)
+    group_access_counts = [0 for _ in groups]
+    for request_index, group_index in enumerate(group_order):
+        group_row = groups[group_index]
         group = group_row["chunks"]
         reuse_key = "rag:hotpotqa:" + "|".join(row["chunk_id"] for row in group)
         context_lines = []
         for row in group:
             context_lines.append(f"[{row['chunk_id']}] {row['title']}: {row['text']}")
         context_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
-        repeat_index = (request_index // len(groups)) % max(1, query_repeats)
+        repeat_index = group_access_counts[group_index] % max(1, query_repeats)
+        group_access_counts[group_index] += 1
         query = group_row["question"]
         if repeat_index > 0:
             query = f"{query} Answer in a different concise wording. Variant {repeat_index}."
@@ -509,7 +539,6 @@ def build_rag_chunk_prompts(
                 "answer": group_row["answer"],
             }
         )
-        request_index += 1
     return prompts[:max_requests]
 
 
@@ -533,36 +562,52 @@ def build_rag_sessions(
         chunks_per_query,
         timeout_s,
     )
+    group_order = hotpotqa_high_frequency_group_order(len(groups), max_requests)
+    group_access_counts = [0 for _ in groups]
     sessions: List[dict] = []
+    session_seq = 0
     request_count = 0
-    for group_index, group_row in enumerate(groups):
-        if request_count >= max_requests:
-            break
+    current_group_index: int | None = None
+    current_session: dict | None = None
+
+    def start_session(group_index: int, group_row: dict) -> dict:
+        nonlocal session_seq
         group = group_row["chunks"]
         reuse_key = "rag:hotpotqa:" + "|".join(row["chunk_id"] for row in group)
-        turns = []
-        for repeat_index in range(max(1, query_repeats)):
-            if request_count >= max_requests:
-                break
-            query = group_row["question"]
-            if repeat_index > 0:
-                query = f"{query} Answer in a different concise wording. Variant {repeat_index}."
-            turns.append({"i": repeat_index, "user": query})
-            request_count += 1
-        sessions.append(
-            {
-                "session_id": f"rag_hotpot_{group_index:06d}",
-                "source": "hotpotqa",
-                "object_type": "rag_chunk_set",
-                "reuse_key": reuse_key,
-                "dataset": "hotpotqa",
-                "hotpotqa_example_id": group_row["example_id"],
-                "hotpotqa_source_path": group_row["source_path"],
-                "answer": group_row["answer"],
-                "chunks": group,
-                "turns": turns,
-            }
-        )
+        session = {
+            "session_id": f"rag_hotpot_{session_seq:06d}_group_{group_index:06d}",
+            "source": "hotpotqa",
+            "object_type": "rag_chunk_set",
+            "reuse_key": reuse_key,
+            "dataset": "hotpotqa",
+            "hotpotqa_example_id": group_row["example_id"],
+            "hotpotqa_source_path": group_row["source_path"],
+            "answer": group_row["answer"],
+            "chunks": group,
+            "turns": [],
+        }
+        session_seq += 1
+        sessions.append(session)
+        return session
+
+    for group_index in group_order:
+        group_row = groups[group_index]
+        if (
+            current_session is None
+            or current_group_index != group_index
+            or len(current_session.get("turns", [])) >= max(1, query_repeats)
+        ):
+            current_group_index = group_index
+            current_session = start_session(group_index, group_row)
+        repeat_index = group_access_counts[group_index] % max(1, query_repeats)
+        query = group_row["question"]
+        if repeat_index > 0:
+            query = f"{query} Answer in a different concise wording. Variant {repeat_index}."
+        current_session["turns"].append({"i": repeat_index, "user": query})
+        group_access_counts[group_index] += 1
+        request_count += 1
+        if request_count >= max_requests:
+            break
     return sessions
 
 

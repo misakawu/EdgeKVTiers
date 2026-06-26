@@ -4,7 +4,7 @@ Each run_*.py file holds the full configuration of one "big task" at the top and
 uses these helpers to execute its experiment matrix. The helpers wrap the lower
 level executors that are *not* rewritten:
 
-  - h1/run_h1_policy_serving_bench.sh   (vllm serve + vllm bench serve + aggregate)
+  - h1/run_h1_policy_serving_bench.sh   (compat wrapper around pressure replay)
   - h1/run_h1_vllm0110_real.py          (the skewed-reuse replay harness)
 
 and the summarize_*.py aggregators, then clean up per-cell intermediates.
@@ -27,7 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DRY_RUN = os.environ.get("EDGEKV_DRY_RUN", "0") == "1"
 
 # Lower-level executors (relative to ROOT).
-SERVING_BENCH = "h1/run_h1_policy_serving_bench.sh"
+PRESSURE_REPLAY_WRAPPER = "h1/run_h1_policy_serving_bench.sh"
+SERVING_BENCH = PRESSURE_REPLAY_WRAPPER
 REAL_HARNESS = "h1/run_h1_vllm0110_real.py"
 CONDA_ENV = "edgekv-vllm0110"
 
@@ -77,7 +78,7 @@ def _run_streaming(cmd: list[str], *, env: dict[str, str] | None,
 def run_bench_cell(out_dir: Path, visible_devices: str, env_overrides: dict[str, str],
                    *, log_file: Path | None = None, echo: bool = True,
                    force: bool = False) -> bool:
-    """Run one serving-bench cell via run_h1_policy_serving_bench.sh.
+    """Run one pressure-replay cell via run_h1_policy_serving_bench.sh.
 
     Resumable: if out_dir/aggregate.csv already exists and not force, skip and
     return False. Returns True if the cell was executed. Raises on non-zero exit
@@ -92,7 +93,7 @@ def run_bench_cell(out_dir: Path, visible_devices: str, env_overrides: dict[str,
     cmd = ["bash", SERVING_BENCH, str(out_dir), visible_devices]
     rc = _run_streaming(cmd, env=env, log_file=log_file, echo=echo)
     if rc != 0:
-        raise RuntimeError(f"serving bench cell failed (rc={rc}): {out_dir}")
+        raise RuntimeError(f"pressure replay wrapper cell failed (rc={rc}): {out_dir}")
     return True
 
 

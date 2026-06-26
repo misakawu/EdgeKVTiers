@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Summarize the Step3 repeat protocol: median across reps per (point, budget, policy).
+"""Summarize the Step3 repeat protocol: median across reps per point/budget/policy.
 
-Reads <base>/<point>/rep*/<point>/<budget>/<policy>/aggregate.csv (the layout produced by
-run_step3_repeat_protocol.sh, which drives run_step3_budget_tiers.sh once per rep) and writes
-one concise CSV with the median of each core TTFT / cache-policy metric across reps. No path
-columns.
+Supports both the legacy serving-bench aggregate.csv layout and the pressure-replay
+summary JSON layout emitted by h1/run_h1_vllm0110_real.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -34,6 +33,7 @@ METRICS = (
     'p_reuse_std',
     'c_recomp_ms_p50',
     'request_throughput',
+    'replay_batch_size',
 )
 
 
@@ -50,6 +50,37 @@ def fnum(v) -> float:
         return 0.0
 
 
+def row_from_real_summary(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    elapsed = fnum(data.get('elapsed_s'))
+    requests = fnum(data.get('requests'))
+    throughput = requests / elapsed if elapsed > 0 else 0.0
+    mapped = {
+        'p95_ttft_ms': data.get('ttft_proxy_p95_ms', ''),
+        'p50_ttft_ms': data.get('ttft_proxy_p50_ms', ''),
+        'mean_ttft_ms': data.get('latency_mean_ms', ''),
+        'hit_rate': data.get('hit_rate', ''),
+        'gpu_prefix_cache_evictions': data.get('gpu_prefix_cache_evictions', ''),
+        'gpu_prefix_cache_cached_blocks': data.get('gpu_prefix_cache_cached_blocks', ''),
+        'queue_wait_ms': '',
+        'prefill_ms': '',
+        'queue_wait_p95_ms': '',
+        'prefill_p95_ms': '',
+        'free_queue_reorder_time_ms': data.get('free_queue_reorder_time_ms', ''),
+        'policy_time_us_avg': data.get('policy_time_us_avg', ''),
+        'eviction_decision_time_us_avg': data.get('eviction_decision_time_us_avg', ''),
+        'score_std': data.get('score_std', ''),
+        'p_reuse_std': data.get('p_reuse_std', ''),
+        'c_recomp_ms_p50': data.get('c_recomp_ms_p50', ''),
+        'request_throughput': throughput,
+        'replay_batch_size': data.get('replay_batch_size', ''),
+    }
+    return {key: str(value) for key, value in mapped.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', default='h1/out/step3_repeat')
@@ -57,15 +88,23 @@ def main() -> None:
     args = parser.parse_args()
 
     base = Path(args.base)
-    # key -> metric -> [values across reps]
     collected: dict[tuple[str, str, str], dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
+
     for aggregate in sorted(base.glob('*/rep*/*/*/*/aggregate.csv')):
         policy = aggregate.parent.name
         budget = aggregate.parent.parent.name
         point = aggregate.parents[4].name
         source = read_first_row(aggregate)
+        for metric in METRICS:
+            collected[(point, budget, policy)][metric].append(fnum(source.get(metric)))
+
+    for summary_json in sorted(base.glob('*/rep*/*/*/*_summary.json')):
+        policy = summary_json.parent.name
+        budget = summary_json.parent.parent.name
+        point = summary_json.parents[4].name
+        source = row_from_real_summary(summary_json)
         for metric in METRICS:
             collected[(point, budget, policy)][metric].append(fnum(source.get(metric)))
 

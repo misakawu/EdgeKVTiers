@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+OUT_DIR="${1:-h1/out/h1_policy_pressure_replay_$(date +%Y%m%d_%H%M%S)}"
+VISIBLE_DEVICES="${2:-${H1_VISIBLE_DEVICES:-0,1}}"
+POLICY="${H1_GPU_POLICY:-h1_lru}"
+GPU_UTIL="${H1_GPU_MEMORY_UTILIZATION:-0.710}"
+MODEL="${H1_MODEL:-models/Qwen2.5-7B-Instruct}"
+REPLAY_TRACE="${H1_REPLAY_TRACE:-data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl}"
+HOTPOTQA_PATH="${H1_HOTPOTQA_PATH:-data/hotpotqa}"
+NUM_PROMPTS="${H1_BENCH_NUM_PROMPTS:-128}"
+REPLAY_BATCH_SIZE="${H1_REPLAY_BATCH_SIZE:-${H1_BENCH_MAX_CONCURRENCY:-1}}"
+MAX_MODEL_LEN="${H1_MAX_MODEL_LEN:-2048}"
+MAX_TOKENS="${H1_MAX_TOKENS:-16}"
+TENSOR_PARALLEL_SIZE="${H1_TENSOR_PARALLEL_SIZE:-2}"
+ATTENTION_BACKEND="${H1_ATTENTION_BACKEND:-TRITON_ATTN}"
+
+case "$GPU_UTIL" in
+  0.710) BUDGET="tight" ;;
+  0.735) BUDGET="mid" ;;
+  0.774) BUDGET="loose" ;;
+  *) BUDGET="${H1_BUDGET:-tight}" ;;
+esac
+
+mkdir -p "$OUT_DIR"
+MAIN_LOG="$OUT_DIR/run.log"
+: > "$MAIN_LOG"
+
+echo "[run] pressure replay wrapper out=$OUT_DIR" | tee -a "$MAIN_LOG"
+echo "[run] policy=$POLICY budget=$BUDGET trace=$REPLAY_TRACE prompts=$NUM_PROMPTS batch=$REPLAY_BATCH_SIZE devices=$VISIBLE_DEVICES" | tee -a "$MAIN_LOG"
+
+PYTHONPATH=.:h1:h0 \
+CUDA_VISIBLE_DEVICES="$VISIBLE_DEVICES" \
+VLLM_USE_V1=1 \
+VLLM_ATTENTION_BACKEND="$ATTENTION_BACKEND" \
+VLLM_NO_USAGE_STATS=1 \
+EDGEKV_H1_GPU_POLICY="$POLICY" \
+EDGEKV_H1_STATS_DIR="$OUT_DIR/edgekv_gpu_stats" \
+EDGEKV_C_RE_MS_PER_TOKEN="${EDGEKV_C_RE_MS_PER_TOKEN:-0.12}" \
+EDGEKV_BW_GBPS="${EDGEKV_BW_GBPS:-1.0}" \
+EDGEKV_D_DESER_MS="${EDGEKV_D_DESER_MS:-3.0}" \
+conda run --no-capture-output -n edgekv-vllm0110 \
+  python h1/run_h1_vllm0110_real.py \
+    --out "$OUT_DIR" \
+    --model "$MODEL" \
+    --dtype float16 \
+    --policies "$POLICY" \
+    --budgets "$BUDGET" \
+    --workload mixed \
+    --replay-trace "$REPLAY_TRACE" \
+    --hotpotqa-path "$HOTPOTQA_PATH" \
+    --max-requests "$NUM_PROMPTS" \
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --max-tokens "$MAX_TOKENS" \
+    --replay-batch-size "$REPLAY_BATCH_SIZE" \
+    --visible-devices "$VISIBLE_DEVICES" \
+  2>&1 | tee -a "$MAIN_LOG"
+
+echo "[run] summary: $OUT_DIR/h1_vllm_real_summary.csv" | tee -a "$MAIN_LOG"

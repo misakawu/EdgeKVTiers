@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
 """Legacy CPU offload policy smoke tests.
 
 H0/H1 experiments are GPU-only. These tests are disabled by default so the

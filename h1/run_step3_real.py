@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Step3 on the real ShareGPT+HotpotQA mixed workload (real replay harness).
 
-Mirrors run_step3_repeat.py but swaps the synthetic ``prefix_repetition`` serving
-bench for the real mixed replay (``h1/run_h1_vllm0110_real.py``): 4 policies x 3 GPU
+Mirrors run_step3_repeat.py on the real mixed pressure replay
+(``h1/run_h1_vllm0110_real.py``): 4 policies x 3 GPU
 memory budgets x N reps, cross-rep median, 4-panel visualization. The two real
 datasets are frozen once into a replay trace (h0/build_h0_replay_trace.py) and reused
 by every cell so the large ShareGPT JSON is parsed only once.
@@ -34,11 +34,11 @@ REPS = 3
 POLICIES = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
 BUDGETS = ["tight", "mid", "loose"]
 BASE = Path("h1/out/step3_real")
-TRACE = BASE / "trace.jsonl"
+TRACE = Path("data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl")
 
-# The two real datasets (== run_h1_vllm0110_real.py defaults).
-SHAREGPT_PATH = "/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
-HOTPOTQA_PATH = "/DATACENTER3/zhenxiang.wang/data/hotpotqa"
+# Repo-local real datasets (== run_h1_vllm0110_real.py defaults).
+SHAREGPT_PATH = "data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
+HOTPOTQA_PATH = "data/hotpotqa"
 
 # Replay / workload knobs (aligned with h1/run_h1_vllm_real.sh).
 WORKLOAD = "mixed"
@@ -67,8 +67,9 @@ PYTHONPATH = ".:h1:h0"
 
 def build_trace(args: argparse.Namespace) -> None:
     """Freeze the mixed ShareGPT+HotpotQA replay trace once from the two JSON inputs."""
-    if TRACE.exists() and not args.force:
-        R.log(f"[trace] reuse existing {TRACE}")
+    trace_path = Path(args.replay_trace)
+    if trace_path.exists() and not args.force:
+        R.log(f"[trace] reuse existing {trace_path}")
         return
     cmd = [
         "conda", "run", "--no-capture-output", "-n", R.CONDA_ENV,
@@ -84,13 +85,13 @@ def build_trace(args: argparse.Namespace) -> None:
         "--rag-chunk-words", str(RAG_CHUNK_WORDS),
         "--rag-chunks-per-query", str(RAG_CHUNKS_PER_QUERY),
         "--rag-query-repeats", str(RAG_QUERY_REPEATS),
-        "--out", str(TRACE),
+        "--out", str(trace_path),
     ]
-    R.log(f"[trace] building {TRACE} from ShareGPT+HotpotQA")
+    R.log(f"[trace] building {trace_path} from ShareGPT+HotpotQA")
     if R.DRY_RUN:
         R.log(f"[dry-run] cmd: {' '.join(cmd)}")
         return
-    TRACE.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONPATH": PYTHONPATH}
     subprocess.run(cmd, cwd=R.ROOT, env=env, check=True)
 
@@ -103,7 +104,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, replay_batch_size: int,
         "--policies", policy,
         "--budgets", budget,
         "--workload", WORKLOAD,
-        "--replay-trace", str(TRACE),
+        "--replay-trace", str(args.replay_trace),
         "--hotpotqa-path", args.hotpotqa_path,
         "--hotpotqa-max-examples", str(HOTPOTQA_MAX_EXAMPLES),
         "--max-sessions", str(MAX_SESSIONS),
@@ -135,6 +136,7 @@ def main() -> None:
                          "(e.g. --batch-sweep 2 32 64 128),定位预算开始咬合的并发点")
     ap.add_argument("--sharegpt-path", default=SHAREGPT_PATH)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
+    ap.add_argument("--replay-trace", default=str(TRACE))
     ap.add_argument("--force", action="store_true", help="rerun cells (and rebuild trace) even if outputs exist")
     ap.add_argument("--keep-cells", action="store_true", help="retain per-rep cell outputs and logs")
     args = ap.parse_args()

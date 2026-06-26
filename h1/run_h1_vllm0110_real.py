@@ -40,12 +40,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 H0_DIR = REPO_ROOT / 'h0'
 if str(H0_DIR) not in sys.path:
     sys.path.insert(0, str(H0_DIR))
-DEFAULT_SHAREGPT_TRACE_PATH = Path(
-    '/DATACENTER3/zhenxiang.wang/data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json'
+DEFAULT_SHAREGPT_TRACE_PATH = (
+    REPO_ROOT / 'data' / 'ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json'
 )
-DEFAULT_HOTPOTQA_PATH = Path('/DATACENTER3/zhenxiang.wang/data/hotpotqa')
-DEFAULT_REPLAY_TRACE_PATH = Path(
-    '/DATACENTER3/zhenxiang.wang/data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions.jsonl'
+DEFAULT_HOTPOTQA_PATH = REPO_ROOT / 'data' / 'hotpotqa'
+DEFAULT_REPLAY_TRACE_PATH = (
+    REPO_ROOT / 'data' / 'edgekv_traces' / 'h0_sharegpt_hotpotqa_200sessions_pressure.jsonl'
 )
 
 from run_h0_vllm import (
