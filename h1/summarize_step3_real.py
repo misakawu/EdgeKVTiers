@@ -20,6 +20,10 @@ from pathlib import Path
 METRICS = [
     ('p95_ttft_ms', 'ttft_proxy_p95_ms'),
     ('p50_ttft_ms', 'ttft_proxy_p50_ms'),
+    ('queue_wait_ratio_mean', 'queue_wait_ratio_mean'),
+    ('queue_wait_p95_ms', 'queue_wait_p95_ms'),
+    ('prefill_p95_ms', 'prefill_p95_ms'),
+    ('batch_queue_span_p95_ms', 'batch_queue_span_p95_ms'),
     ('hit_rate', 'hit_rate'),
     ('gpu_prefix_cache_evictions', 'gpu_prefix_cache_evictions'),
     ('gpu_prefix_cache_cached_blocks', 'gpu_prefix_cache_cached_blocks'),
@@ -47,10 +51,11 @@ def main() -> None:
     args = parser.parse_args()
 
     base = Path(args.base)
-    # (budget, policy, replay_batch_size) -> column -> [values across reps].
+    # (budget, policy, replay_batch_size, batch_order, warmup_batches) ->
+    # column -> [values across reps].
     # replay_batch_size is a key so a --batch-sweep run keeps each concurrency separate;
     # a normal (single-concurrency) run just yields one batch value per (budget, policy).
-    collected: dict[tuple[str, str, str], dict[str, list[float]]] = defaultdict(
+    collected: dict[tuple[str, str, str, str, str], dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
     for sjson in sorted(base.glob('rep*/*/*_summary.json')):
@@ -63,7 +68,9 @@ def main() -> None:
         budget = str(data.get('budget', ''))
         policy = str(data.get('policy', ''))
         batch = str(data.get('replay_batch_size', ''))
-        key = (budget, policy, batch)
+        batch_order = str(data.get('batch_order', 'original'))
+        warmup_batches = str(data.get('warmup_batches', '0'))
+        key = (budget, policy, batch, batch_order, warmup_batches)
         for col, src in METRICS:
             collected[key][col].append(fnum(data.get(src)))
         elapsed = fnum(data.get('elapsed_s'))
@@ -72,17 +79,30 @@ def main() -> None:
 
     columns = [c for c, _ in METRICS] + list(DERIVED)
     rows: list[dict[str, object]] = []
-    for (budget, policy, batch), metric_vals in sorted(collected.items()):
+    for (budget, policy, batch, batch_order, warmup_batches), metric_vals in sorted(collected.items()):
         reps = max((len(v) for v in metric_vals.values()), default=0)
         row: dict[str, object] = {
-            'budget': budget, 'policy': policy, 'replay_batch_size': batch, 'reps': reps,
+            'budget': budget,
+            'policy': policy,
+            'replay_batch_size': batch,
+            'batch_order': batch_order,
+            'warmup_batches': warmup_batches,
+            'reps': reps,
         }
         for col in columns:
             vals = metric_vals.get(col, [])
             row[col] = round(statistics.median(vals), 6) if vals else ''
         rows.append(row)
 
-    fields = ['budget', 'policy', 'replay_batch_size', 'reps', *columns]
+    fields = [
+        'budget',
+        'policy',
+        'replay_batch_size',
+        'batch_order',
+        'warmup_batches',
+        'reps',
+        *columns,
+    ]
     summary_path = Path(args.summary)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open('w', encoding='utf-8', newline='') as f:

@@ -97,6 +97,88 @@ h1/
 3. `run_step3_real.py` 只做 real-replay 对照，不作为真实 TTFT 主证据。
 4. `sitecustomize.py` 是策略实现和优化的唯一关键位置。
 
+## 启动方式
+
+从仓库根目录启动：
+
+```bash
+cd /DATACENTER3/zhenxiang.wang/work/EdgeKVTiers
+```
+
+高层脚本会通过 `conda run --no-capture-output -n edgekv-vllm0110` 启动底层 vLLM cell，并自动设置 `PYTHONPATH=.:h1:h0`、`CUDA_VISIBLE_DEVICES`、`VLLM_USE_V1=1` 和 `EDGEKV_H1_GPU_POLICY`。通常不需要手动激活 conda 环境。
+
+先用 dry-run 检查命令：
+
+```bash
+EDGEKV_DRY_RUN=1 python3 h1/run_step3_real.py \
+  --recommended-batch-sweep \
+  --reps 1 \
+  --budgets tight \
+  --policies h1_lru \
+  --max-requests 8 \
+  --visible-devices 0,1 \
+  --keep-cells
+```
+
+常用启动命令：
+
+```bash
+# 快速 smoke test：LRU/LPE, tight/mid, 保留 cell 输出。
+python3 h1/run_test.py --visible-devices 0,1 --num-prompts 64 --force
+
+# 主重复实验：三档压力点 × 四策略 × reps，输出跨 rep 中位数。
+python3 h1/run_step3_repeat.py --visible-devices 0,1
+
+# 单个 budget-tier 矩阵：适合调参和局部复跑。
+python3 h1/run_step3_budget_tiers.py \
+  --visible-devices 0,1 \
+  --budgets "tight mid loose" \
+  --policies "h1_lru h1_lfu vllm_default h1_lpe"
+
+# real-replay 并发扫描：先用 8/16/32/64 选工作点。
+python3 h1/run_step3_real.py --batch-sweep 8 16 32 64 --visible-devices 0,1
+
+# real-replay 单点：默认推荐并发 32。
+python3 h1/run_step3_real.py --visible-devices 0,1 --replay-batch-size 32
+
+# length_bucket 对照：比较同一并发下 batch 内排队跨度。
+python3 h1/run_step3_real.py \
+  --visible-devices 0,1 \
+  --replay-batch-size 32 \
+  --batch-order length_bucket \
+  --warmup-batches 1
+```
+
+底层 harness 也可以直接运行：
+
+```bash
+PYTHONPATH=.:h1:h0 conda run --no-capture-output -n edgekv-vllm0110 \
+  python h1/run_h1_vllm0110_real.py \
+  --policies h1_lru \
+  --budgets tight \
+  --max-requests 128 \
+  --replay-batch-size 32 \
+  --visible-devices 0,1
+```
+
+常用输出：
+
+```text
+h1/out/run_test/
+h1/out/step3/<tier>/step3_summary.csv
+h1/out/step3_repeat/step3_repeat_summary.csv
+h1/out/step3_real/step3_real_summary.csv
+```
+
+real-replay 的排队诊断重点看：
+
+```text
+queue_wait_ratio_mean
+queue_wait_p95_ms
+prefill_p95_ms
+batch_queue_span_p95_ms
+```
+
 ## 关键文档
 
 - [h1_self_correction.md](./h1_self_correction.md): 记录从第一次失败到最终修正的完整过程。

@@ -430,12 +430,46 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
         tokenizer=tokenizer,
     )
     filtered: list[dict[str, Any]] = []
-    for item in prompts:
+    for original_index, item in enumerate(prompts):
         if int(item['n_tokens']) + args.max_tokens <= args.max_model_len:
+            item = dict(item)
+            item['_trace_original_index'] = original_index
             filtered.append(item)
         if len(filtered) >= args.max_requests:
             break
     return filtered
+
+
+def item_token_count(item: dict[str, Any]) -> int:
+    for key in ('n_tokens', 'prompt_est_tokens'):
+        try:
+            value = int(item.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return estimate_tokens(str(item.get('prompt', '')))
+
+
+def length_bucket_id(n_tokens: int) -> int:
+    """Coarse token-length bucket, using power-of-two ranges."""
+    return max(1, int(n_tokens)).bit_length() - 1
+
+
+def order_trace_for_batches(
+    trace: list[dict[str, Any]],
+    batch_order: str,
+) -> list[dict[str, Any]]:
+    if batch_order == 'original':
+        return list(trace)
+    if batch_order != 'length_bucket':
+        raise ValueError(f'unknown batch_order={batch_order!r}')
+    indexed = [
+        (length_bucket_id(item_token_count(item)), idx, item)
+        for idx, item in enumerate(trace)
+    ]
+    indexed.sort(key=lambda row: (row[0], row[1]))
+    return [item for _, _, item in indexed]
 
 
 def trace_side_reuse(
@@ -464,7 +498,7 @@ def request_trace_fields(
         hit=bool(trace_hit or rag_hit),
         access_index=event_index,
     )
-    fields = {k: v for k, v in item.items() if k != 'prompt'}
+    fields = {k: v for k, v in item.items() if k not in {'prompt', '_trace_original_index'}}
     fields.update(
         {
             'workload': workload,
@@ -485,6 +519,7 @@ def request_trace_fields(
             'size_mb': round(profile.size_mb, 6),
             'size_scope': 'per_gpu_logical_full_kv_estimate',
             'kv_mib_per_token': round(kv_mib_per_token, 9),
+            'trace_original_index': item.get('_trace_original_index', event_index),
         }
     )
     return fields
@@ -542,6 +577,26 @@ def release_llm(llm: LLM | None) -> None:
         pass
 
 
+def reset_after_warmup(llm: LLM, stats_dir: Path) -> None:
+    reset_prefix_cache = getattr(llm, 'reset_prefix_cache', None)
+    if callable(reset_prefix_cache):
+        try:
+            reset_prefix_cache()
+        except Exception:
+            pass
+    try:
+        import sitecustomize
+
+        reset_stats = getattr(sitecustomize, 'reset_edgekv_gpu_cache_stats', None)
+        if callable(reset_stats):
+            reset_stats()
+    except Exception:
+        pass
+    if stats_dir.exists():
+        shutil.rmtree(stats_dir)
+    stats_dir.mkdir(parents=True, exist_ok=True)
+
+
 def run_cell(
     args: argparse.Namespace,
     trace: list[dict[str, Any]],
@@ -551,6 +606,7 @@ def run_cell(
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     llm: LLM | None = None
     rows: list[dict[str, Any]] = []
+    batch_queue_spans: list[float] = []
     monitor = GpuMemoryMonitor()
     started = time.time()
     ok = False
@@ -586,8 +642,22 @@ def run_cell(
     try:
         monitor.start()
         llm = build_llm(args, policy, gpu_memory_utilization)
-        for batch_start in range(0, len(trace), args.replay_batch_size):
-            batch = trace[batch_start:batch_start + args.replay_batch_size]
+        replay_trace = order_trace_for_batches(trace, args.batch_order)
+        if args.warmup_batches > 0 and replay_trace:
+            warmup_count = min(len(replay_trace), args.replay_batch_size, 8)
+            warmup_prompts = [
+                f'Warmup request {i}. Reply with one short sentence.'
+                for i in range(warmup_count)
+            ]
+            warmup_sampling = [
+                SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+                for _ in warmup_prompts
+            ]
+            for _ in range(args.warmup_batches):
+                llm.generate(warmup_prompts, warmup_sampling)
+            reset_after_warmup(llm, stats_dir)
+        for batch_start in range(0, len(replay_trace), args.replay_batch_size):
+            batch = replay_trace[batch_start:batch_start + args.replay_batch_size]
             prompts = [str(item['prompt']) for item in batch]
             trace_reuse = [trace_side_reuse(item, reuse_seen) for item in batch]
             trace_fields_batch = [
@@ -629,6 +699,7 @@ def run_cell(
             t0 = time.perf_counter()
             outputs = llm.generate(prompts, sampling)
             latency_ms = (time.perf_counter() - t0) * 1000.0
+            batch_rows: list[dict[str, Any]] = []
             for offset, (item, output, reuse_info, trace_fields) in enumerate(
                 zip(batch, outputs, trace_reuse, trace_fields_batch)
             ):
@@ -654,6 +725,7 @@ def run_cell(
                     'budget_per_gpu_target_memory_mib': round(float(budget['per_gpu_target_memory_mib']), 6),
                     'event_index': idx,
                     'batch_start_index': batch_start,
+                    'batch_order': args.batch_order,
                     'replay_batch_size': args.replay_batch_size,
                     'max_tokens': args.max_tokens,
                     'latency_ms': round(latency_ms, 6),
@@ -669,6 +741,19 @@ def run_cell(
                 }
                 if rag_reuse_key:
                     row['rag_reuse_key'] = rag_reuse_key
+                batch_rows.append(row)
+            batch_queue_values = [
+                float(row.get('queue_wait_ms', 0.0) or 0.0)
+                for row in batch_rows
+                if row.get('d4_metrics_available')
+            ]
+            batch_queue_span_ms = (
+                max(batch_queue_values) - min(batch_queue_values)
+                if batch_queue_values else 0.0
+            )
+            batch_queue_spans.append(batch_queue_span_ms)
+            for row in batch_rows:
+                row['batch_queue_span_ms'] = round(batch_queue_span_ms, 6)
                 rows.append(row)
             for item in batch:
                 reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
@@ -699,8 +784,15 @@ def run_cell(
     d4_valid = [row for row in valid if row.get('d4_metrics_available')]
     queue_wait_values = [float(row.get('queue_wait_ms', 0.0) or 0.0) for row in d4_valid]
     prefill_values = [float(row.get('prefill_ms', 0.0) or 0.0) for row in d4_valid]
+    queue_wait_ratio_values = [
+        float(row.get('queue_wait_ms', 0.0) or 0.0)
+        / float(row.get('ttft_proxy_ms', 0.0) or 0.0)
+        for row in d4_valid
+        if float(row.get('ttft_proxy_ms', 0.0) or 0.0) > 0.0
+    ]
     d4_queue_wait_p95_ms = percentile(queue_wait_values, 95)
     d4_prefill_p95_ms = percentile(prefill_values, 95)
+    batch_queue_span_p95_ms = percentile(batch_queue_spans, 95)
     d4_ttft_p95_ms = percentile(ttft_values, 95)
     trace_hit_count = sum(1 for row in valid if row.get('hit'))
     gpu_cache_stats: dict[str, Any] = {}
@@ -759,8 +851,10 @@ def run_cell(
         'latency_mean_ms': round(statistics.mean(ttft_values), 6) if ttft_values else 0.0,
         'queue_wait_ms': round(statistics.mean(queue_wait_values), 6) if queue_wait_values else 0.0,
         'prefill_ms': round(statistics.mean(prefill_values), 6) if prefill_values else 0.0,
+        'queue_wait_ratio_mean': round(statistics.mean(queue_wait_ratio_values), 6) if queue_wait_ratio_values else 0.0,
         'queue_wait_p95_ms': round(d4_queue_wait_p95_ms, 6),
         'prefill_p95_ms': round(d4_prefill_p95_ms, 6),
+        'batch_queue_span_p95_ms': round(batch_queue_span_p95_ms, 6),
         'queue_wait_p95_ratio': round(d4_queue_wait_p95_ms / d4_ttft_p95_ms, 6) if d4_ttft_p95_ms else 0.0,
         'prefill_p95_ratio': round(d4_prefill_p95_ms / d4_ttft_p95_ms, 6) if d4_ttft_p95_ms else 0.0,
         'd4_metrics_available_count': d4_metrics_available_count,
@@ -819,6 +913,8 @@ def run_cell(
         'd_deser_ms': round(args.d_deser_ms, 9),
         **cop.summary(),
         'replay_batch_size': args.replay_batch_size,
+        'batch_order': args.batch_order,
+        'warmup_batches': args.warmup_batches,
         'max_num_batched_tokens': resolved_max_num_batched_tokens(args),
         'ttft_note': 'ttft_proxy_ms uses per-request RequestOutput.metrics first-token timing when available; if metrics are unavailable or non-positive it falls back to offline LLM.generate batch latency',
     }
@@ -974,6 +1070,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-tokens', type=int, default=16)
     parser.add_argument('--replay-batch-size', type=int, default=1)
     parser.add_argument(
+        '--batch-order',
+        choices=('original', 'length_bucket'),
+        default='original',
+        help=(
+            'Order requests before batching. original preserves trace order; '
+            'length_bucket groups similar prompt lengths while preserving order '
+            'within each length bucket.'
+        ),
+    )
+    parser.add_argument(
+        '--warmup-batches',
+        type=int,
+        default=0,
+        help='Run this many small warmup batches before measured replay; not written to CSV.',
+    )
+    parser.add_argument(
         '--max-num-batched-tokens',
         type=int,
         default=None,
@@ -987,7 +1099,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--d-deser-ms', type=float, default=float(os.environ.get('EDGEKV_D_DESER_MS', DEFAULT_D_DESER_MS)))
     parser.add_argument('--visible-devices', default='0,1')
     parser.add_argument('--stats-dir', default='')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.warmup_batches < 0:
+        parser.error('--warmup-batches must be >= 0')
+    return args
 
 
 def main() -> None:

@@ -13,7 +13,8 @@ by every cell so the large ShareGPT JSON is parsed only once.
 Each cell runs as one isolated conda process (single policy+budget) for clean GPU
 memory between cells, like the per-cell isolation of the serving-bench path.
 
-    python h1/run_step3_real.py --visible-devices 0,1
+    python h1/run_step3_real.py --batch-sweep 8 16 32 64 --visible-devices 0,1
+    python h1/run_step3_real.py --visible-devices 0,1 --replay-batch-size 32
     python h1/run_step3_real.py --reps 1 --budgets tight --policies h1_lru h1_lpe --max-requests 64
     EDGEKV_DRY_RUN=1 python h1/run_step3_real.py   # print commands only
 
@@ -22,6 +23,7 @@ All configuration lives in the CONFIG block below; no env vars are required.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -52,11 +54,13 @@ RAG_CHUNKS_PER_QUERY = 2
 RAG_QUERY_REPEATS = 4
 MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
-# h1-report.md 方案一:把并发从 2 抬到 64,让活跃 KV 真正争抢容量、触发 eviction 重算,
-# 使预算/策略开始咬合。build_llm() 已由 replay_batch_size 派生 max_num_seqs /
-# max_num_batched_tokens(run_h1_vllm0110_real.py:399-400),无需改执行器。
-# 注意:ttft_proxy_ms 仍是整批 generate 的墙钟(批延迟代理),并发越大单批越长。
-REPLAY_BATCH_SIZE = 64
+# Default to a conservative pressure point. Use --batch-sweep 8 16 32 64 to
+# choose the final point from queue_wait_p95_ms / ttft_proxy_p95_ms and policy
+# separation instead of making batch size 64 the main conclusion by default.
+REPLAY_BATCH_SIZE = 32
+DEFAULT_BATCH_SWEEP = [8, 16, 32, 64]
+DEFAULT_BATCH_ORDER = "original"
+DEFAULT_WARMUP_BATCHES = 0
 TENSOR_PARALLEL_SIZE = 2
 
 # run_h1_vllm0110_real.py imports edgekv_cop from the repo root, so "." must be on
@@ -118,8 +122,23 @@ def cell_args(cell_dir: Path, budget: str, policy: str, replay_batch_size: int,
         "--max-model-len", str(MAX_MODEL_LEN),
         "--max-tokens", str(MAX_TOKENS),
         "--replay-batch-size", str(replay_batch_size),
+        "--batch-order", args.batch_order,
+        "--warmup-batches", str(args.warmup_batches),
         "--visible-devices", args.visible_devices,
     ]
+
+
+def summary_matches_config(summary_json: Path, replay_batch_size: int,
+                           args: argparse.Namespace) -> bool:
+    try:
+        data = json.loads(summary_json.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        int(data.get("replay_batch_size", -1)) == replay_batch_size
+        and str(data.get("batch_order", DEFAULT_BATCH_ORDER)) == args.batch_order
+        and int(data.get("warmup_batches", DEFAULT_WARMUP_BATCHES)) == args.warmup_batches
+    )
 
 
 def main() -> None:
@@ -132,8 +151,16 @@ def main() -> None:
     ap.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE,
                     help="concurrency per cell (drives max_num_seqs / max_num_batched_tokens)")
     ap.add_argument("--batch-sweep", nargs="+", type=int, default=None,
-                    help="h1-report 方案一并发扫描:固定单一 budget,对这些 replay_batch_size 各跑一轮 "
-                         "(e.g. --batch-sweep 2 32 64 128),定位预算开始咬合的并发点")
+                    help="并发扫描:固定单一 budget,对这些 replay_batch_size 各跑一轮 "
+                         "(recommended: --batch-sweep 8 16 32 64),用 queue_wait_p95_ms "
+                         "/ ttft_proxy_p95_ms 和策略差异选工作点")
+    ap.add_argument("--recommended-batch-sweep", action="store_true",
+                    help=f"use the recommended sweep sizes: {' '.join(map(str, DEFAULT_BATCH_SWEEP))}")
+    ap.add_argument("--batch-order", choices=("original", "length_bucket"),
+                    default=DEFAULT_BATCH_ORDER,
+                    help="request order before batching; length_bucket groups similar prompt lengths")
+    ap.add_argument("--warmup-batches", type=int, default=DEFAULT_WARMUP_BATCHES,
+                    help="run this many synthetic warmup batches before measured replay")
     ap.add_argument("--sharegpt-path", default=SHAREGPT_PATH)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
     ap.add_argument("--replay-trace", default=str(TRACE))
@@ -145,6 +172,9 @@ def main() -> None:
         BASE.mkdir(parents=True, exist_ok=True)
 
     build_trace(args)
+
+    if args.recommended_batch_sweep:
+        args.batch_sweep = DEFAULT_BATCH_SWEEP
 
     # Default mode: full budget x policy matrix at a single concurrency. Sweep mode
     # (--batch-sweep): fix one budget (first of --budgets, default tight) and add the
@@ -158,18 +188,31 @@ def main() -> None:
 
     total = args.reps * len(budgets) * len(args.policies) * len(batch_sizes)
     idx = 0
+    cell_suffix_parts = []
+    if args.batch_order != DEFAULT_BATCH_ORDER:
+        cell_suffix_parts.append(args.batch_order)
+    if args.warmup_batches != DEFAULT_WARMUP_BATCHES:
+        cell_suffix_parts.append(f"warm{args.warmup_batches}")
+    cell_suffix = ("_" + "_".join(cell_suffix_parts)) if cell_suffix_parts else ""
     for rep in range(1, args.reps + 1):
         for budget in budgets:
             for policy in args.policies:
                 for bs in batch_sizes:
                     idx += 1
-                    cell_name = f"{budget}_{policy}_bs{bs}" if sweeping else f"{budget}_{policy}"
+                    cell_name = (
+                        f"{budget}_{policy}_bs{bs}{cell_suffix}"
+                        if sweeping else f"{budget}_{policy}{cell_suffix}"
+                    )
                     cell_dir = BASE / f"rep{rep}" / cell_name
                     # harness writes {budget}_{policy}_summary.json (prefix is budget+policy only)
                     summary_json = cell_dir / f"{budget}_{policy}_summary.json"
                     R.log(f"[protocol {idx}/{total}] rep={rep} budget={budget} policy={policy} bs={bs}")
-                    if summary_json.exists() and not args.force:
-                        R.log(f"[skip] {summary_json} already exists")
+                    if (
+                        summary_json.exists()
+                        and not args.force
+                        and summary_matches_config(summary_json, bs, args)
+                    ):
+                        R.log(f"[skip] {summary_json} already exists with matching config")
                         continue
                     if not R.DRY_RUN:
                         cell_dir.mkdir(parents=True, exist_ok=True)
