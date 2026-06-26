@@ -65,6 +65,58 @@ except Exception:
     pass
 
 
+def patch_edgekv_vllm_request_metrics() -> bool:
+    """Expose vLLM v1 per-request timing stats on RequestOutput.metrics.
+
+    vLLM 0.11 keeps RequestStateStats for logging/tracing, but the offline
+    LLMEngine path does not pass those stats into RequestOutput. The experiment
+    runner reads RequestOutput.metrics, so attach a compatible RequestMetrics
+    object after vLLM builds each output.
+    """
+    try:
+        from vllm.sequence import RequestMetrics
+        from vllm.v1.engine.output_processor import RequestState
+    except Exception:
+        return False
+
+    original = getattr(RequestState, '_new_request_output', None)
+    if original is None:
+        return False
+    if getattr(original, '_edgekv_request_metrics_patch', False):
+        return True
+
+    def _edgekv_new_request_output(self: Any, *args: Any, **kwargs: Any) -> Any:
+        output = original(self, *args, **kwargs)
+        try:
+            stats = getattr(self, 'stats', None)
+            if stats is None or getattr(output, 'metrics', None) is not None:
+                return output
+            scheduled_ts = float(getattr(stats, 'scheduled_ts', 0.0) or 0.0)
+            queued_ts = float(getattr(stats, 'queued_ts', 0.0) or 0.0)
+            first_token_ts = float(getattr(stats, 'first_token_ts', 0.0) or 0.0)
+            last_token_ts = float(getattr(stats, 'last_token_ts', 0.0) or 0.0)
+            time_in_queue = (
+                max(0.0, scheduled_ts - queued_ts)
+                if scheduled_ts > 0.0 and queued_ts > 0.0
+                else None
+            )
+            output.metrics = RequestMetrics(
+                arrival_time=float(getattr(stats, 'arrival_time', 0.0) or 0.0),
+                last_token_time=last_token_ts,
+                first_scheduled_time=scheduled_ts if scheduled_ts > 0.0 else None,
+                first_token_time=first_token_ts if first_token_ts > 0.0 else None,
+                time_in_queue=time_in_queue,
+                finished_time=last_token_ts if getattr(output, 'finished', False) and last_token_ts > 0.0 else None,
+            )
+        except Exception:
+            pass
+        return output
+
+    _edgekv_new_request_output._edgekv_request_metrics_patch = True
+    RequestState._new_request_output = _edgekv_new_request_output
+    return True
+
+
 _EDGEKV_GPU_STATS: dict[str, int] = {
     'lookup_hits': 0,
     'lookup_misses': 0,
@@ -714,6 +766,15 @@ def _edgekv_profile_from_meta(meta: dict[str, Any], block_size: int) -> dict[str
 
 def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
     size_mb = float(profile.get('size_mb', 0.0) or 0.0)
+    if size_mb <= 0.0:
+        n_tokens = max(float(profile.get('n_tokens', 1) or 1), 1.0)
+        size_mb = _edgekv_env_float('EDGEKV_MU_KV_MB_PER_TOKEN', 0.12) * n_tokens
+        profile['size_mb'] = size_mb
+        profile['size_source'] = 'fallback_theoretical'
+    else:
+        profile['size_source'] = str(
+            profile.get('size_source') or 'vllm_kv_cache_spec_page_size_bytes'
+        )
     if size_mb <= 0.0:
         profile['score'] = 0.0
         return

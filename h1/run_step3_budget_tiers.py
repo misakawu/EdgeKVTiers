@@ -39,6 +39,7 @@ RAG_QUERY_REPEATS = 4
 MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
 REPLAY_BATCH_SIZE = 64
+MAX_NUM_BATCHED_TOKENS = 64
 TENSOR_PARALLEL_SIZE = 2
 PYTHONPATH = ".:h1:h0"
 # --------------------------------------------------------------------------------------
@@ -46,7 +47,7 @@ PYTHONPATH = ".:h1:h0"
 
 def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
               replay_batch_size: int, replay_trace: Path, hotpotqa_path: str,
-              visible_devices: str) -> list[str]:
+              visible_devices: str, max_num_batched_tokens: int) -> list[str]:
     return [
         "--out", str(cell_dir),
         "--dtype", "float16",
@@ -67,6 +68,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
         "--max-model-len", str(MAX_MODEL_LEN),
         "--max-tokens", str(MAX_TOKENS),
         "--replay-batch-size", str(replay_batch_size),
+        "--max-num-batched-tokens", str(max_num_batched_tokens),
         "--visible-devices", visible_devices,
     ]
 
@@ -74,6 +76,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
 def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIES,
               num_prompts=MAX_REQUESTS, request_rate=0.0, visible_devices=DEVICES,
               replay_trace=REPLAY_TRACE, replay_batch_size=REPLAY_BATCH_SIZE,
+              max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
               hotpotqa_path=HOTPOTQA_PATH, no_finalize=False, force=False,
               keep_cells=False) -> Path:
     """Run one tier's budget x policy matrix on the pressure replay trace."""
@@ -96,12 +99,23 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
                 continue
             if not R.DRY_RUN:
                 out_dir.mkdir(parents=True, exist_ok=True)
+            env_overrides = {
+                "PYTHONPATH": PYTHONPATH,
+                "EDGEKV_H1_GPU_POLICY": policy,
+                "EDGEKV_H1_PROFILE_POLICY_TIME": "1",
+            }
+            if policy == "h1_lpe":
+                env_overrides.update({
+                    "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
+                    "EDGEKV_H1_RUNTIME_MONITOR": "1",
+                    "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
+                })
             rc = R.run_real_cell(
                 out_dir,
                 visible_devices,
                 cell_args(out_dir, budget, policy, num_prompts, replay_batch_size,
-                          replay_trace, hotpotqa_path, visible_devices),
-                {"PYTHONPATH": PYTHONPATH, "EDGEKV_H1_GPU_POLICY": policy},
+                          replay_trace, hotpotqa_path, visible_devices, max_num_batched_tokens),
+                env_overrides,
                 log_file=log_dir / f"{budget}_{policy}.log",
             )
             if rc != 0:
@@ -131,6 +145,7 @@ def main() -> None:
     ap.add_argument("--num-prompts", type=int, default=MAX_REQUESTS)
     ap.add_argument("--replay-trace", default=str(REPLAY_TRACE))
     ap.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=MAX_NUM_BATCHED_TOKENS)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
     ap.add_argument("--no-finalize", action="store_true", help="defer summary/cleanup (for repeat)")
     ap.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
@@ -145,6 +160,7 @@ def main() -> None:
         visible_devices=args.visible_devices,
         replay_trace=Path(args.replay_trace),
         replay_batch_size=args.replay_batch_size,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         hotpotqa_path=args.hotpotqa_path,
         no_finalize=args.no_finalize,
         force=args.force,

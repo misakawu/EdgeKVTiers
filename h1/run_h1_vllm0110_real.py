@@ -11,9 +11,9 @@ Notes:
 - H1 policies are applied to vLLM v1 GPU prefix-cache block eviction through
   the repo-local ``h1/sitecustomize.py`` runtime patch. The experiment uses GPU
   KV cache only and does not configure vLLM CPU KV offload.
-- vLLM offline ``LLM.generate`` does not expose first-token streaming timing, so
-  this runner records per-request end-to-end latency as ``ttft_proxy_ms``. For a
-  true TTFT value, run through OpenAI streaming server mode.
+- vLLM offline ``LLM.generate`` records per-request scheduler metrics when
+  available. ``ttft_proxy_ms`` remains the batch wall-clock latency proxy, while
+  ``queue_wait_ms`` and ``prefill_ms`` are derived from ``RequestOutput.metrics``.
 - hit rate in the summary is measured from real GPU prefix-cache block lookup
   statistics. Per-request rows still carry the H0 trace-side reuse proxy.
 """
@@ -67,7 +67,7 @@ from vllm import LLM, SamplingParams
 POLICIES = ('vllm_default', 'h1_lru', 'h1_lfu', 'h1_lpe')
 BUDGET_GPU_MEMORY_UTILIZATION = {
     'super_tight': 0.710,  # extreme/saturation budget (== old tight value)
-    'tight': 0.710,
+    'tight': 0.720,
     'mid': 0.735,
     'loose': 0.774,
 }
@@ -87,6 +87,85 @@ def percentile(values: list[float], pct: float) -> float:
         return values[lo]
     w = pos - lo
     return values[lo] * (1.0 - w) + values[hi] * w
+
+
+def request_output_timing_ms(output: Any) -> dict[str, float | str | bool]:
+    """Extract vLLM RequestMetrics timing fields, falling back to zeros.
+
+    vLLM stores timestamps/durations in seconds. vLLM 0.11 uses
+    ``first_scheduled_time`` and ``time_in_queue`` on ``RequestMetrics``; the
+    repo-local sitecustomize patch may also expose v1 internal
+    ``queued_ts/scheduled_ts`` values. Keep this defensive so older/newer builds
+    still produce CSV columns instead of failing a run.
+    """
+    metrics = getattr(output, 'metrics', None)
+    if metrics is None:
+        return {
+            'queue_wait_ms': 0.0,
+            'prefill_ms': 0.0,
+            'd4_metrics_available': False,
+            'd4_metrics_source': 'request_output.metrics_missing',
+        }
+
+    def ts(name: str) -> float | None:
+        value = getattr(metrics, name, None)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    arrival = ts('arrival_time')
+    queued = ts('queued_ts')
+    scheduled = ts('first_scheduled_time')
+    if scheduled is None:
+        scheduled = ts('scheduled_time')
+    if scheduled is None:
+        scheduled = ts('scheduled_ts')
+    first_token = ts('first_token_time')
+    if first_token is None:
+        first_token = ts('first_token_ts')
+    time_in_queue = ts('time_in_queue')
+
+    if time_in_queue is not None:
+        queue_wait_ms = max(0.0, time_in_queue * 1000.0)
+    elif queued is not None and scheduled is not None:
+        queue_wait_ms = max(0.0, (scheduled - queued) * 1000.0)
+    elif arrival is not None and scheduled is not None:
+        queue_wait_ms = max(0.0, (scheduled - arrival) * 1000.0)
+    else:
+        queue_wait_ms = 0.0
+    prefill_ms = (
+        max(0.0, (first_token - scheduled) * 1000.0)
+        if scheduled is not None and first_token is not None
+        else 0.0
+    )
+    available = (
+        (time_in_queue is not None or (queued is not None and scheduled is not None)
+         or (arrival is not None and scheduled is not None))
+        and scheduled is not None
+        and first_token is not None
+    )
+    missing = [
+        name
+        for name, value in (
+            ('queue_wait_source', time_in_queue if time_in_queue is not None else queued if queued is not None else arrival),
+            ('first_scheduled_time', scheduled),
+            ('first_token_time', first_token),
+        )
+        if value is None
+    ]
+    return {
+        'queue_wait_ms': queue_wait_ms,
+        'prefill_ms': prefill_ms,
+        'd4_metrics_available': available,
+        'd4_metrics_source': (
+            'request_output.metrics'
+            if available
+            else f"request_output.metrics_missing:{','.join(missing)}"
+        ),
+    }
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -241,7 +320,17 @@ def resolve_budget(
     per_gpu_total_mib: float,
 ) -> dict[str, Any]:
     base_bytes = param_count * (MODEL_PRECISION_BITS / 8.0) * MODEL_MEMORY_HEADROOM
-    gpu_memory_utilization = BUDGET_GPU_MEMORY_UTILIZATION[budget_name]
+    if budget_name in BUDGET_GPU_MEMORY_UTILIZATION:
+        gpu_memory_utilization = BUDGET_GPU_MEMORY_UTILIZATION[budget_name]
+    else:
+        try:
+            gpu_memory_utilization = float(budget_name)
+        except ValueError as exc:
+            known = ', '.join(sorted(BUDGET_GPU_MEMORY_UTILIZATION))
+            raise ValueError(
+                f'unknown budget={budget_name!r}; use one of {{{known}}} or a '
+                'numeric gpu_memory_utilization such as 0.60'
+            ) from exc
     per_gpu_target_mib = gpu_memory_utilization * per_gpu_total_mib
     target_mib = per_gpu_target_mib * max(args.tensor_parallel_size, 1)
     if not 0.0 < gpu_memory_utilization < 1.0:
@@ -388,6 +477,24 @@ def request_trace_fields(
     return fields
 
 
+def resolved_max_num_batched_tokens(args: argparse.Namespace) -> int:
+    default_value = args.max_model_len * args.replay_batch_size
+    value = args.max_num_batched_tokens
+    if value is None:
+        return default_value
+    if value < args.replay_batch_size:
+        raise ValueError(
+            'max_num_batched_tokens must be >= replay_batch_size '
+            f'({value} < {args.replay_batch_size})'
+        )
+    if value > default_value:
+        raise ValueError(
+            'max_num_batched_tokens must be <= max_model_len * replay_batch_size '
+            f'({value} > {default_value})'
+        )
+    return value
+
+
 def build_llm(args: argparse.Namespace, policy: str, gpu_memory_utilization: float) -> LLM:
     os.environ['EDGEKV_H1_GPU_POLICY'] = policy
     return LLM(
@@ -397,9 +504,11 @@ def build_llm(args: argparse.Namespace, policy: str, gpu_memory_utilization: flo
         max_model_len=args.max_model_len,
         enforce_eager=True,
         max_num_seqs=args.replay_batch_size,
-        max_num_batched_tokens=args.max_model_len * args.replay_batch_size,
+        max_num_batched_tokens=resolved_max_num_batched_tokens(args),
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=True,
+        swap_space=0,
+        cpu_offload_gb=0,
         disable_log_stats=False,
     )
 
@@ -437,6 +546,8 @@ def run_cell(
     gpu_memory_utilization = float(budget['gpu_memory_utilization'])
     model_config = load_model_config(args.model)
     kv_mib_per_token = kv_size_mib_per_token(model_config, args.tensor_parallel_size)
+    os.environ['EDGEKV_MU_KV_MB_PER_TOKEN'] = str(kv_mib_per_token)
+    os.environ['EDGEKV_C_RE_MS_PER_TOKEN'] = str(args.c_re_ms_per_token)
     cop = COPProfiler(
         mu_kv_mb_per_token=kv_mib_per_token,
         c_re_ms_per_token=args.c_re_ms_per_token,
@@ -451,6 +562,9 @@ def run_cell(
     try:
         import sitecustomize
 
+        patch_metrics = getattr(sitecustomize, 'patch_edgekv_vllm_request_metrics', None)
+        if callable(patch_metrics):
+            patch_metrics()
         reset_stats = getattr(sitecustomize, 'reset_edgekv_gpu_cache_stats', None)
         if callable(reset_stats):
             reset_stats()
@@ -506,6 +620,7 @@ def run_cell(
                 zip(batch, outputs, trace_reuse, trace_fields_batch)
             ):
                 text = output.outputs[0].text
+                timing = request_output_timing_ms(output)
                 idx = batch_start + offset
                 reuse_key, trace_hit, rag_reuse_key, rag_hit = reuse_info
                 row = {
@@ -523,6 +638,10 @@ def run_cell(
                     'max_tokens': args.max_tokens,
                     'latency_ms': round(latency_ms, 6),
                     'ttft_proxy_ms': round(latency_ms, 6),
+                    'queue_wait_ms': round(float(timing['queue_wait_ms']), 6),
+                    'prefill_ms': round(float(timing['prefill_ms']), 6),
+                    'd4_metrics_available': bool(timing['d4_metrics_available']),
+                    'd4_metrics_source': str(timing['d4_metrics_source']),
                     'output_chars': len(text),
                     'model': args.model,
                     'tensor_parallel_size': args.tensor_parallel_size,
@@ -556,6 +675,13 @@ def run_cell(
 
     valid = [row for row in rows if 'ttft_proxy_ms' in row]
     ttft_values = [float(row['ttft_proxy_ms']) for row in valid]
+    d4_metrics_available_count = sum(1 for row in valid if row.get('d4_metrics_available'))
+    d4_valid = [row for row in valid if row.get('d4_metrics_available')]
+    queue_wait_values = [float(row.get('queue_wait_ms', 0.0) or 0.0) for row in d4_valid]
+    prefill_values = [float(row.get('prefill_ms', 0.0) or 0.0) for row in d4_valid]
+    d4_queue_wait_p95_ms = percentile(queue_wait_values, 95)
+    d4_prefill_p95_ms = percentile(prefill_values, 95)
+    d4_ttft_p95_ms = percentile(ttft_values, 95)
     trace_hit_count = sum(1 for row in valid if row.get('hit'))
     gpu_cache_stats: dict[str, Any] = {}
     try:
@@ -608,9 +734,17 @@ def run_cell(
         'sharegpt_order': args.sharegpt_order,
         'hotpotqa_max_examples': args.hotpotqa_max_examples,
         'ttft_proxy_p50_ms': round(percentile(ttft_values, 50), 6),
-        'ttft_proxy_p95_ms': round(percentile(ttft_values, 95), 6),
-        'latency_p95_ms': round(percentile(ttft_values, 95), 6),
+        'ttft_proxy_p95_ms': round(d4_ttft_p95_ms, 6),
+        'latency_p95_ms': round(d4_ttft_p95_ms, 6),
         'latency_mean_ms': round(statistics.mean(ttft_values), 6) if ttft_values else 0.0,
+        'queue_wait_ms': round(statistics.mean(queue_wait_values), 6) if queue_wait_values else 0.0,
+        'prefill_ms': round(statistics.mean(prefill_values), 6) if prefill_values else 0.0,
+        'queue_wait_p95_ms': round(d4_queue_wait_p95_ms, 6),
+        'prefill_p95_ms': round(d4_prefill_p95_ms, 6),
+        'queue_wait_p95_ratio': round(d4_queue_wait_p95_ms / d4_ttft_p95_ms, 6) if d4_ttft_p95_ms else 0.0,
+        'prefill_p95_ratio': round(d4_prefill_p95_ms / d4_ttft_p95_ms, 6) if d4_ttft_p95_ms else 0.0,
+        'd4_metrics_available_count': d4_metrics_available_count,
+        'd4_metrics_available_ratio': round(d4_metrics_available_count / max(len(valid), 1), 6),
         'hit_rate': round(gpu_hit_rate, 6),
         'hit_source': 'gpu_prefix_cache_block_lookup',
         'gpu_prefix_cache_lookup_total': gpu_lookup_total,
@@ -665,6 +799,7 @@ def run_cell(
         'd_deser_ms': round(args.d_deser_ms, 9),
         **cop.summary(),
         'replay_batch_size': args.replay_batch_size,
+        'max_num_batched_tokens': resolved_max_num_batched_tokens(args),
         'ttft_note': 'offline LLM.generate latency is used as TTFT proxy; with replay_batch_size>1 each request receives its concurrent batch latency',
     }
     return rows, summary, monitor.samples
@@ -806,13 +941,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sharegpt-order', choices=('file', 'longest'), default='longest')
     parser.add_argument('--timeout-s', type=float, default=120.0)
     parser.add_argument('--policies', nargs='+', default=list(POLICIES), choices=POLICIES)
-    parser.add_argument('--budgets', nargs='+', default=list(BUDGET_GPU_MEMORY_UTILIZATION), choices=list(BUDGET_GPU_MEMORY_UTILIZATION))
+    parser.add_argument(
+        '--budgets',
+        nargs='+',
+        default=list(BUDGET_GPU_MEMORY_UTILIZATION),
+        help='Budget names (tight/mid/loose) or numeric gpu_memory_utilization values such as 0.60.',
+    )
     parser.add_argument('--max-sessions', type=int, default=200)
     parser.add_argument('--max-requests', type=int, default=1024)
     parser.add_argument('--tensor-parallel-size', type=int, default=2)
     parser.add_argument('--max-model-len', type=int, default=2048)
     parser.add_argument('--max-tokens', type=int, default=16)
     parser.add_argument('--replay-batch-size', type=int, default=1)
+    parser.add_argument(
+        '--max-num-batched-tokens',
+        type=int,
+        default=None,
+        help=(
+            'vLLM scheduler/profile token cap. Defaults to '
+            'max_model_len * replay_batch_size for backward compatibility.'
+        ),
+    )
     parser.add_argument('--c-re-ms-per-token', type=float, default=float(os.environ.get('EDGEKV_C_RE_MS_PER_TOKEN', DEFAULT_C_RE_MS_PER_TOKEN)))
     parser.add_argument('--bw-gbps', type=float, default=float(os.environ.get('EDGEKV_BW_GBPS', DEFAULT_BW_GBPS)))
     parser.add_argument('--d-deser-ms', type=float, default=float(os.environ.get('EDGEKV_D_DESER_MS', DEFAULT_D_DESER_MS)))
