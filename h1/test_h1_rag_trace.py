@@ -374,19 +374,49 @@ def test_sitecustomize_reorder_records_candidate_window(monkeypatch) -> None:
         def __init__(self, block_id: int) -> None:
             self.block_id = block_id
             self.is_null = False
+            self.prev_free_block = None
+            self.next_free_block = None
 
     class Queue:
+        """Faithful mini vLLM FreeKVCacheBlockQueue.
+
+        The incremental reorder reads the head window and uses the prev/next
+        link pointers as the O(1) free-queue membership signal, so the fake must
+        model the doubly-linked list (fake head/tail, nulling pointers on
+        remove, relinking on append_n) rather than just a Python list.
+        """
+
         def __init__(self) -> None:
-            self.blocks = [Block(1), Block(2), Block(3)]
+            self.fake_free_list_head = Block(-1)
+            self.fake_free_list_tail = Block(-1)
+            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+            self.num_free_blocks = 0
+            self.append_n([Block(1), Block(2), Block(3)])
 
         def get_all_free_blocks(self):
-            return list(self.blocks)
+            out = []
+            node = self.fake_free_list_head.next_free_block
+            while node is not None and node.next_free_block is not None:
+                out.append(node)
+                node = node.next_free_block
+            return out
 
         def remove(self, block):
-            self.blocks.remove(block)
+            block.prev_free_block.next_free_block = block.next_free_block
+            block.next_free_block.prev_free_block = block.prev_free_block
+            block.prev_free_block = block.next_free_block = None
+            self.num_free_blocks -= 1
 
         def append_n(self, blocks):
-            self.blocks.extend(blocks)
+            last = self.fake_free_list_tail.prev_free_block
+            for block in blocks:
+                block.prev_free_block = last
+                last.next_free_block = block
+                last = block
+            last.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = last
+            self.num_free_blocks += len(blocks)
 
     class Pool:
         enable_caching = True

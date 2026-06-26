@@ -114,6 +114,7 @@ _EDGEKV_GPU_PROFILE_POLICY_TIME = os.environ.get('EDGEKV_H1_PROFILE_POLICY_TIME'
 _EDGEKV_GPU_POLICY_TIME_NS = 0
 _EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
 _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
+_EDGEKV_LPE_MONITOR_SEQ = 0
 _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
 _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
 _EDGEKV_ENV_FLOAT_CACHE: dict[tuple[str, float], tuple[str | None, float]] = {}
@@ -165,6 +166,76 @@ def _edgekv_stats_dir() -> Path | None:
     return Path(value) if value else None
 
 
+def _edgekv_lpe_monitor_path() -> Path | None:
+    value = os.environ.get('EDGEKV_H1_RUNTIME_MONITOR_PATH', '').strip()
+    if value:
+        return Path(value)
+    if not _edgekv_env_bool('EDGEKV_H1_RUNTIME_MONITOR', False):
+        return None
+    stats_dir = _edgekv_stats_dir()
+    return (stats_dir / 'edgekv_lpe_runtime_monitor.jsonl') if stats_dir is not None else None
+
+
+def _edgekv_record_lpe_monitor(
+    lpe_action: str,
+    *,
+    block_id: int | None = None,
+    kv_cache_group_id: int | None = None,
+    profile: dict[str, Any] | None = None,
+    hit: bool | None = None,
+    **extra: Any,
+) -> None:
+    if not _EDGEKV_GPU_POLICY_IS_LPE:
+        return
+    path = _edgekv_lpe_monitor_path()
+    if path is None:
+        return
+    global _EDGEKV_LPE_MONITOR_SEQ
+    _EDGEKV_LPE_MONITOR_SEQ += 1
+    c_re = _edgekv_env_float('EDGEKV_C_RE_MS_PER_TOKEN', 0.12)
+    record: dict[str, Any] = {
+        'seq': _EDGEKV_LPE_MONITOR_SEQ,
+        'ts': time.time(),
+        'pid': os.getpid(),
+        'policy': _edgekv_gpu_policy(),
+        'lpe_action': str(lpe_action),
+        'hit': hit,
+        'block_id': int(block_id) if block_id is not None else None,
+        'kv_cache_group_id': int(kv_cache_group_id) if kv_cache_group_id is not None else None,
+        'c_re': c_re,
+        'c_re_ms_per_token': c_re,
+    }
+    if profile is not None:
+        c_recomp_ms = float(profile.get('c_recomp_ms', 0.0) or 0.0)
+        record.update({
+            'object_id': str(profile.get('object_id', '')),
+            'object_type': str(profile.get('object_type', 'unknown')),
+            'n_tokens': int(profile.get('n_tokens', 0) or 0),
+            'c_recomp': c_recomp_ms,
+            'c_recomp_ms': c_recomp_ms,
+            'p_reuse': float(profile.get('p_reuse', 0.0) or 0.0),
+            'score': float(profile.get('score', 0.0) or 0.0),
+            'size_mb': float(profile.get('size_mb', 0.0) or 0.0),
+            'resident_block_count': int(profile.get('resident_block_count', 0) or 0),
+            'access_count': int(profile.get('access_count', 0) or 0),
+            'hit_count': int(profile.get('hit_count', 0) or 0),
+        })
+    for key, value in extra.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            record[key] = value
+        elif isinstance(value, (list, tuple)):
+            record[key] = [item for item in value if isinstance(item, (str, int, float, bool)) or item is None]
+        else:
+            record[key] = str(value)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            f.write('\n')
+    except Exception:
+        pass
+
+
 def _edgekv_flush_gpu_cache_stats() -> None:
     stats_dir = _edgekv_stats_dir()
     if stats_dir is None:
@@ -200,7 +271,7 @@ def _edgekv_note_policy_time(start_ns: int) -> None:
 
 
 def _edgekv_note_eviction_decision_time(start_ns: int) -> None:
-    global _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
+    global _EDGEKV_GPU_EVICTION_DECISION_TIME_NS, _EDGEKV_GPU_POLICY_TIME_NS
     if not _EDGEKV_GPU_PROFILE_POLICY_TIME or start_ns <= 0:
         return
     elapsed = time.perf_counter_ns() - start_ns
@@ -217,7 +288,7 @@ def _edgekv_note_reorder_time(start_ns: int) -> None:
 
 def reset_edgekv_gpu_cache_stats() -> None:
     global _EDGEKV_GPU_STATS_UPDATES, _EDGEKV_GPU_POLICY_TIME_NS, _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
-    global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS
+    global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS, _EDGEKV_LPE_MONITOR_SEQ
     global _EDGEKV_GPU_EVICTED_SCORE_TOTAL, _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL
     for key in _EDGEKV_GPU_STATS:
         _EDGEKV_GPU_STATS[key] = 0
@@ -230,6 +301,7 @@ def reset_edgekv_gpu_cache_stats() -> None:
     _EDGEKV_GPU_POLICY_TIME_NS = 0
     _EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
     _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
+    _EDGEKV_LPE_MONITOR_SEQ = 0
     _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
     _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
     _EDGEKV_ENV_FLOAT_CACHE.clear()
@@ -364,6 +436,9 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
                 'object_type': str(profile.get('object_type', 'unknown')),
                 'p_reuse': float(profile.get('p_reuse', 0.0) or 0.0),
                 'score': float(profile.get('score', 0.0) or 0.0),
+                'n_tokens': int(profile.get('n_tokens', 0) or 0),
+                'c_re': _edgekv_env_float('EDGEKV_C_RE_MS_PER_TOKEN', 0.12),
+                'c_recomp': float(profile.get('c_recomp_ms', 0.0) or 0.0),
                 'c_recomp_ms': float(profile.get('c_recomp_ms', 0.0) or 0.0),
                 'size_bytes': int(profile.get('size_bytes', 0) or 0),
                 'size_mb': float(profile.get('size_mb', 0.0) or 0.0),
@@ -875,6 +950,59 @@ def _edgekv_queue_pressure(pool: Any, queue: Any, num_blocks: int | None = None)
     return False
 
 
+def _edgekv_block_in_free_queue(block: Any) -> bool:
+    """O(1) membership test for vLLM's free-block linked list.
+
+    vLLM nulls both link pointers on popleft_n()/remove() and re-links them on
+    append()/append_n(), so a non-null prev+next pair uniquely marks a block as
+    currently resident in the free queue. This lets the reorder validate heap
+    candidates without materializing the whole queue.
+    """
+    return (
+        getattr(block, 'prev_free_block', None) is not None
+        and getattr(block, 'next_free_block', None) is not None
+    )
+
+
+def _edgekv_free_queue_head_window(queue: Any, limit: int) -> list[Any]:
+    """Return up to ``limit`` real blocks from the head of the free queue.
+
+    Walks at most ``limit`` nodes (the fake tail has next_free_block=None), so
+    cost is O(limit) regardless of how many blocks are free. Used both to seed
+    still-untracked head blocks into the rank heap and to detect a no-op move.
+    """
+    head = getattr(queue, 'fake_free_list_head', None)
+    if head is None or limit <= 0:
+        return []
+    out: list[Any] = []
+    node = getattr(head, 'next_free_block', None)
+    while node is not None and getattr(node, 'next_free_block', None) is not None and len(out) < limit:
+        if not getattr(node, 'is_null', False):
+            out.append(node)
+        node = node.next_free_block
+    return out
+
+
+def _edgekv_compact_rank_heap(pool: Any) -> None:
+    """Rebuild the rank heap from live versions, dropping stale lazy entries.
+
+    Every touch/cache/free pushes a fresh heap entry without removing the old
+    one, so the heap grows with access count. Periodic compaction keeps heappop
+    cost bounded by the number of tracked (resident) blocks rather than by total
+    load, which is what keeps reorder latency flat as throughput rises.
+    """
+    versions = getattr(pool, '_edgekv_h1_rank_version', {})
+    blocks = getattr(pool, '_edgekv_h1_blocks', {})
+    new_heap: list[tuple[float, int, int, int]] = []
+    for block_id, version in versions.items():
+        block = blocks.get(block_id)
+        if block is None or getattr(block, 'is_null', False):
+            continue
+        new_heap.append((*_edgekv_rank_tuple(pool, block_id), int(version)))
+    heapq.heapify(new_heap)
+    pool._edgekv_h1_rank_heap = new_heap
+
+
 def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None:
     if not _EDGEKV_GPU_POLICY_ENABLED or not getattr(pool, 'enable_caching', False):
         return
@@ -885,62 +1013,66 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     if mode == 'off' or not _edgekv_queue_pressure(pool, queue, num_blocks):
         return
     start_ns = time.perf_counter_ns()
-    try:
-        all_blocks = queue.get_all_free_blocks()
-    except Exception:
-        _edgekv_note_gpu_stat('free_queue_reorder_skipped')
-        _edgekv_note_reorder_time(start_ns)
-        return
-    blocks = [block for block in all_blocks if not getattr(block, 'is_null', False)]
-    if len(blocks) < 2:
+    free_count = _edgekv_free_queue_length(queue)
+    if free_count < 2:
         _edgekv_note_gpu_stat('free_queue_reorder_skipped')
         _edgekv_note_reorder_time(start_ns)
         return
     requested = max(int(num_blocks or 1), 1)
     base_window = max(_edgekv_env_int('H1_LPE_REORDER_WINDOW', 128), 2)
     window_size = max(base_window, requested * 4)
-    select_count = len(blocks) if mode == 'full' else min(window_size, len(blocks))
-    queue_block_ids = {_edgekv_block_id(block) for block in blocks}
-    for block in blocks:
+    select_count = free_count if mode == 'full' else min(window_size, free_count)
+
+    # Incremental selection (D2): the rank heap is kept up to date on every
+    # cache/touch/free/evict, so the reorder never scans the whole free queue.
+    # We read only the O(select_count) head window -- to seed any head blocks
+    # not yet in the heap (e.g. pristine blocks never touched) and to detect a
+    # no-op -- then pop the lowest-rank candidates straight from the heap.
+    # Total cost is O(select_count + stale_pops) per call, independent of how
+    # many blocks are free, replacing the previous O(num_free) full re-scan.
+    head_window = _edgekv_free_queue_head_window(queue, select_count)
+    for block in head_window:
         block_id = _edgekv_block_id(block)
         pool._edgekv_h1_blocks[block_id] = block
         if block_id not in pool._edgekv_h1_rank_version:
             _edgekv_heap_touch_block(pool, block)
+
+    # Keep the lazy-deletion heap from bloating with stale entries as load rises.
+    compact_floor = max(_edgekv_env_int('H1_LPE_HEAP_COMPACT_MIN', 1024), 2)
+    if len(pool._edgekv_h1_rank_heap) > max(compact_floor, 4 * len(pool._edgekv_h1_rank_version)):
+        _edgekv_compact_rank_heap(pool)
+
     selected: list[Any] = []
     selected_ids: set[int] = set()
     stale_pops = 0
-    while pool._edgekv_h1_rank_heap and len(selected) < select_count:
-        item = heapq.heappop(pool._edgekv_h1_rank_heap)
+    heap = pool._edgekv_h1_rank_heap
+    while heap and len(selected) < select_count:
+        item = heapq.heappop(heap)
         block = _edgekv_heap_valid_block(pool, item)
         if block is None:
             stale_pops += 1
             continue
         block_id = _edgekv_block_id(block)
-        if block_id not in queue_block_ids or block_id in selected_ids:
+        if block_id in selected_ids or not _edgekv_block_in_free_queue(block):
             stale_pops += 1
             continue
         selected.append(block)
         selected_ids.add(block_id)
-    if len(selected) < select_count:
-        # Heap can be sparse after a long low-pressure period. Re-seed missing
-        # free blocks once, then continue with heap pops rather than sorting.
-        for block in blocks:
+    if _EDGEKV_GPU_POLICY_IS_LPE:
+        for rank, block in enumerate(selected):
             block_id = _edgekv_block_id(block)
-            if block_id not in selected_ids:
-                _edgekv_heap_touch_block(pool, block)
-        while pool._edgekv_h1_rank_heap and len(selected) < select_count:
-            item = heapq.heappop(pool._edgekv_h1_rank_heap)
-            block = _edgekv_heap_valid_block(pool, item)
-            if block is None:
-                stale_pops += 1
-                continue
-            block_id = _edgekv_block_id(block)
-            if block_id not in queue_block_ids or block_id in selected_ids:
-                stale_pops += 1
-                continue
-            selected.append(block)
-            selected_ids.add(block_id)
+            _edgekv_record_lpe_monitor(
+                'reorder_candidate',
+                block_id=block_id,
+                profile=_edgekv_block_profile(pool, block_id),
+                selected_rank=rank,
+                hit=None,
+            )
     if len(selected) < 2:
+        # Heap held no usable free candidates; re-push what we popped and bail
+        # without falling back to a full-queue scan.
+        for block in selected:
+            _edgekv_heap_touch_block(pool, block)
         _edgekv_note_gpu_stat('free_queue_reorder_skipped')
         _edgekv_note_reorder_time(start_ns)
         return
@@ -949,7 +1081,7 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
         int(_EDGEKV_GPU_STATS.get('free_queue_reorder_window', 0) or 0),
         len(selected),
     )
-    current_prefix = [_edgekv_block_id(block) for block in blocks[:len(selected)]]
+    current_prefix = [_edgekv_block_id(block) for block in head_window[:len(selected)]]
     selected_order = [_edgekv_block_id(block) for block in selected]
     if selected_order == current_prefix:
         for block in selected:
@@ -1012,6 +1144,11 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         if _EDGEKV_GPU_POLICY_ENABLED and getattr(self, 'enable_caching', False):
             if result is None:
                 _edgekv_note_gpu_stat('lookup_misses')
+                _edgekv_record_lpe_monitor(
+                    'lookup_miss',
+                    hit=False,
+                    kv_cache_group_ids=[int(group_id) for group_id in kv_cache_group_ids],
+                )
             else:
                 _edgekv_note_gpu_stat('lookup_hits')
                 if _EDGEKV_GPU_POLICY_IS_LPE:
@@ -1024,6 +1161,14 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                         profile = _edgekv_block_profile(self, block_id, int(group_id))
                         if profile is not None:
                             refreshed = _edgekv_note_profile_access(profile, hit=True)
+                            _edgekv_record_lpe_monitor(
+                                'lookup_hit',
+                                block_id=block_id,
+                                kv_cache_group_id=int(group_id),
+                                profile=profile,
+                                hit=True,
+                                score_refreshed=refreshed,
+                            )
                             if refreshed:
                                 self._edgekv_h1_p_reuse[block_id] = float(profile.get('p_reuse', 0.5))
                                 self._edgekv_h1_scores[block_id] = float(profile.get('score', 0.0))
@@ -1088,10 +1233,14 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             self._edgekv_h1_seq += 1
             score = float(meta.get('score', 0.0) or 0.0)
             p_reuse = float(meta.get('p_reuse', 0.5) or 0.5)
+            profile: dict[str, Any] | None = None
+            object_id = ''
+            object_type = ''
+            n_tokens = 0
+            block_index = num_cached_blocks + offset
+            block_start = block_index * block_size
+            block_end = (block_index + 1) * block_size
             if _EDGEKV_GPU_POLICY_IS_LPE:
-                block_index = num_cached_blocks + offset
-                block_start = block_index * block_size
-                block_end = (block_index + 1) * block_size
                 if prefix_len > 0 and block_start < prefix_len and cached_lpe_prefix_profile is not None:
                     object_id = cached_lpe_prefix_id
                     profile = cached_lpe_prefix_profile
@@ -1126,6 +1275,19 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             _edgekv_heap_touch_block(self, block)
             _edgekv_note_gpu_stat('cached_blocks')
             _edgekv_note_gpu_stat('admissions')
+            _edgekv_record_lpe_monitor(
+                'admit',
+                block_id=block_id,
+                kv_cache_group_id=int(kv_cache_group_id),
+                profile=profile,
+                hit=False,
+                block_index=block_index,
+                block_start=block_start,
+                block_end=block_end,
+                pinned=pinned,
+                score=score,
+                p_reuse=p_reuse,
+            )
         _edgekv_note_policy_time(start_ns)
 
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:
@@ -1150,6 +1312,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         score = float(self._edgekv_h1_scores.get(block_id, 0.0) or 0.0)
         p_reuse = float(self._edgekv_h1_p_reuse.get(block_id, 0.0) or 0.0)
         is_pinned = block_id in self._edgekv_h1_pinned
+        profile = None
         if _EDGEKV_GPU_POLICY_IS_LPE:
             old_block_hash = getattr(block, 'block_hash', None)
             kv_cache_group_id = _edgekv_group_id_from_block_hash(old_block_hash)
@@ -1173,6 +1336,17 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                 _edgekv_note_gpu_stat('evict_high_reuse')
             else:
                 _edgekv_note_gpu_stat('evict_drop')
+            _edgekv_record_lpe_monitor(
+                'evict',
+                block_id=block_id,
+                kv_cache_group_id=kv_cache_group_id,
+                profile=profile,
+                hit=False,
+                evicted=True,
+                is_pinned=is_pinned,
+                score=score,
+                p_reuse=p_reuse,
+            )
             _edgekv_drop_block_object(self, kv_cache_group_id, block_id)
         self._edgekv_h1_scores.pop(block_id, None)
         self._edgekv_h1_p_reuse.pop(block_id, None)
@@ -1211,13 +1385,25 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                                     self._edgekv_h1_p_reuse[block_id] = float(profile.get('p_reuse', 0.5))
                                     self._edgekv_h1_scores[block_id] = float(profile.get('score', 0.0))
                                     self._edgekv_h1_score_update_seq[block_id] = score_update_seq
+                                _edgekv_record_lpe_monitor(
+                                    'touch',
+                                    block_id=block_id,
+                                    profile=profile,
+                                    hit=None,
+                                )
                         _edgekv_heap_touch_block(self, block)
         _edgekv_note_policy_time(start_ns)
         return original_touch(self, blocks)
 
     def free_blocks(self: Any, ordered_blocks: Any) -> None:
+        needs_state = _edgekv_gpu_policy_needs_rank_state()
+        if needs_state:
+            # ordered_blocks may be a one-shot iterator (e.g. reversed(...));
+            # materialize it so both the original call and our touch loop see
+            # the full block list.
+            ordered_blocks = list(ordered_blocks)
         original_free_blocks(self, ordered_blocks)
-        if _edgekv_gpu_policy_needs_rank_state():
+        if needs_state:
             _edgekv_init_pool_state(self)
             for block in _edgekv_iter_blocks(ordered_blocks):
                 if not getattr(block, 'is_null', False):
