@@ -30,6 +30,7 @@ env/
 # New files are expected to be source/docs only unless explicitly staged.
 *
 !*/
+!*.md
 !*.py
 !h1/run_h1_lpe_budget_quick.sh
 !h1/run_h1_lpe_serving_bench.sh
