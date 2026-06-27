@@ -281,6 +281,9 @@ def sharegpt_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
                     "rag_match_mode": rag.get("match_mode", "weak_round_robin"),
                 }
             )
+        for key, value in session.items():
+            if key not in row and key != "turns":
+                row[key] = value
         prompts.append(row)
         transcript.append(f"User: {user_text}")
         assistant_text = str(turn.get("assistant", "")).strip()
@@ -665,28 +668,30 @@ def rag_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
         if not query:
             continue
         prompt = context_prefix + f"Question: {query}\nAnswer:"
-        prompts.append(
-            {
-                "request_id": f"{session['session_id']}:turn:{turn_index:03d}",
-                "session_id": str(session["session_id"]),
-                "turn_index": turn_index,
-                "prompt": prompt,
-                "prompt_chars": len(prompt),
-                "prompt_est_tokens": estimate_tokens(prompt),
-                "n_tokens": count_tokens(prompt, tokenizer),
-                "workload": "rag_chunk_reuse",
-                "object_type": str(session.get("object_type", "rag_chunk_set")),
-                "reuse_key": str(session["reuse_key"]),
-                "chunk_ids": [row["chunk_id"] for row in chunks],
-                "doc_ids": sorted({row["doc_id"] for row in chunks}),
-                "dataset": session.get("dataset", "hotpotqa"),
-                "hotpotqa_example_id": session.get("hotpotqa_example_id", ""),
-                "hotpotqa_source_path": session.get("hotpotqa_source_path", ""),
-                "query": query,
-                "answer": session.get("answer", ""),
-                "replay_source": "frozen_replay_trace",
-            }
-        )
+        row = {
+            "request_id": f"{session['session_id']}:turn:{turn_index:03d}",
+            "session_id": str(session["session_id"]),
+            "turn_index": turn_index,
+            "prompt": prompt,
+            "prompt_chars": len(prompt),
+            "prompt_est_tokens": estimate_tokens(prompt),
+            "n_tokens": count_tokens(prompt, tokenizer),
+            "workload": "rag_chunk_reuse",
+            "object_type": str(session.get("object_type", "rag_chunk_set")),
+            "reuse_key": str(session["reuse_key"]),
+            "chunk_ids": [row["chunk_id"] for row in chunks],
+            "doc_ids": sorted({row["doc_id"] for row in chunks}),
+            "dataset": session.get("dataset", "hotpotqa"),
+            "hotpotqa_example_id": session.get("hotpotqa_example_id", ""),
+            "hotpotqa_source_path": session.get("hotpotqa_source_path", ""),
+            "query": query,
+            "answer": session.get("answer", ""),
+            "replay_source": "frozen_replay_trace",
+        }
+        for key, value in session.items():
+            if key not in row and key not in {"turns", "chunks"}:
+                row[key] = value
+        prompts.append(row)
     return prompts
 
 
@@ -830,6 +835,9 @@ def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[di
                     "rag_match_mode": rag.get("match_mode", "weak_round_robin"),
                 }
             )
+        for key, value in session.items():
+            if key not in row and key != "turns":
+                row[key] = value
         prompts.append(row)
     return prompts
 

@@ -31,7 +31,6 @@ env/
 *
 !*/
 !*.py
-!*.md
 !h1/run_h1_lpe_budget_quick.sh
 !h1/run_h1_lpe_serving_bench.sh
 !h1/run_h1_policy_serving_bench.sh

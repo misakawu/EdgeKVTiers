@@ -13,7 +13,10 @@ import sys
 from pathlib import Path
 
 H1_DIR = Path(__file__).resolve().parent
-H0_DIR = H1_DIR.parent / "h0"
+REPO_ROOT = H1_DIR.parent
+H0_DIR = REPO_ROOT / "h0"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(H1_DIR) not in sys.path:
     sys.path.insert(0, str(H1_DIR))
 if str(H0_DIR) not in sys.path:
@@ -525,3 +528,88 @@ def test_cop_profiler_updates_reuse_and_score() -> None:
     profile = cop.update_from_item(item, hit=False, access_index=3)
     assert 0.0 < profile.p_reuse < 1.0
     assert round(profile.score, 6) == round(profile.p_reuse * 0.12 / 0.25, 6)
+
+
+def test_cop_profiler_prior_separates_hot_and_cold() -> None:
+    cop = COPProfiler(mu_kv_mb_per_token=0.25, c_re_ms_per_token=0.12)
+    hot = cop.update_from_item(
+        {
+            "reuse_key": "hot-a",
+            "object_type": "sharegpt_hot_context",
+            "n_tokens": 10,
+            "p_reuse_prior": 0.95,
+        },
+        hit=False,
+        access_index=1,
+    )
+    cold = cop.update_from_item(
+        {
+            "reuse_key": "cold-a",
+            "object_type": "sharegpt_cold_context",
+            "n_tokens": 10,
+            "p_reuse_prior": 0.05,
+        },
+        hit=True,
+        access_index=2,
+    )
+    assert hot.p_reuse_prior == 0.95
+    assert cold.p_reuse_prior == 0.05
+    assert hot.p_reuse > cold.p_reuse
+    assert hot.score > cold.score
+
+
+def test_h1_trace_fields_preserve_prior_temperature() -> None:
+    item = {
+        "request_id": "req-hot",
+        "session_id": "req-hot",
+        "prompt": "hot prompt",
+        "n_tokens": 64,
+        "workload": "sharegpt_session_prefix",
+        "object_type": "sharegpt_hot_context",
+        "reuse_key": "hot-key",
+        "temperature": "hot",
+        "p_reuse_prior": 0.95,
+    }
+    fields = h1.request_trace_fields(
+        item,
+        trace_hit=False,
+        rag_hit=False,
+        policy="h1_lpe",
+        kv_mib_per_token=0.25,
+        cop=h1.COPProfiler(mu_kv_mb_per_token=0.25),
+        event_index=0,
+    )
+    assert fields["temperature"] == "hot"
+    assert fields["p_reuse_prior"] == 0.95
+    assert fields["p_reuse"] > 0.65
+
+
+def test_sitecustomize_refresh_keeps_hot_prior_after_first_miss() -> None:
+    sitecustomize = load_h1_sitecustomize()
+    profile = {
+        "object_id": "hot",
+        "object_type": "sharegpt_hot_context",
+        "n_tokens": 64,
+        "size_mb": 16.0,
+        "p_reuse_prior": 0.95,
+        "access_count": 1,
+        "hit_count": 0,
+        "c_recomp_ms": 7.68,
+    }
+    sitecustomize._edgekv_refresh_profile_reuse(profile)
+    assert profile["p_type"] == 0.90
+    assert profile["p_reuse"] > 0.70
+
+    cold_profile = {
+        "object_id": "cold",
+        "object_type": "sharegpt_cold_context",
+        "n_tokens": 64,
+        "size_mb": 16.0,
+        "p_reuse_prior": 0.05,
+        "access_count": 1,
+        "hit_count": 1,
+        "c_recomp_ms": 7.68,
+    }
+    sitecustomize._edgekv_refresh_profile_reuse(cold_profile)
+    assert cold_profile["p_type"] == 0.10
+    assert cold_profile["p_reuse"] < profile["p_reuse"]

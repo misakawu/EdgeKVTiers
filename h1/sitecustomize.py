@@ -715,13 +715,18 @@ def _edgekv_profile_from_values(
     c_recomp_ms = float(meta.get('c_recomp_ms', 0.0) or 0.0) or (c_re * n_tokens)
     c_restore_ms = float(meta.get('c_restore_ms', 0.0) or 0.0)
     risk_exp = float(meta.get('risk_exp', 0.15) or 0.15)
+    p_reuse_prior = _edgekv_meta_p_reuse_prior(meta)
+    initial_p_reuse = float(meta.get('p_reuse', 0.0) or 0.0)
+    if initial_p_reuse <= 0.0:
+        initial_p_reuse = p_reuse_prior if p_reuse_prior is not None else 0.5
     profile = _EDGEKV_GPU_LPE_PROFILES.setdefault(
         object_id,
         {
             'object_id': object_id,
             'object_type': object_type or 'unknown',
             'n_tokens': n_tokens,
-            'p_reuse': float(meta.get('p_reuse', 0.5) or 0.5),
+            'p_reuse': initial_p_reuse,
+            'p_reuse_prior': p_reuse_prior if p_reuse_prior is not None else '',
             'c_recomp_ms': c_recomp_ms,
             'c_restore_ms': c_restore_ms,
             'risk_exp': risk_exp,
@@ -745,8 +750,12 @@ def _edgekv_profile_from_values(
             'risk_exp': risk_exp,
         }
     )
+    if p_reuse_prior is not None:
+        profile['p_reuse_prior'] = p_reuse_prior
     if 'p_reuse' in meta:
         profile['p_reuse'] = float(meta.get('p_reuse', profile.get('p_reuse', 0.5)) or 0.5)
+    elif p_reuse_prior is not None:
+        profile['p_reuse'] = p_reuse_prior
     _edgekv_recompute_profile_score(profile)
     return profile
 
@@ -792,12 +801,29 @@ def _edgekv_lpe_reuse_weights() -> tuple[float, float, float, float]:
     return w_freq, w_recency, w_type, max(w_freq + w_recency + w_type, 1e-9)
 
 
+def _edgekv_p_reuse_prior_weight() -> float:
+    return _edgekv_clamp(_edgekv_env_float('H1_LPE_W_PRIOR', 0.70), 0.0, 1.0)
+
+
+def _edgekv_meta_p_reuse_prior(meta: dict[str, Any]) -> float | None:
+    if 'p_reuse_prior' not in meta:
+        return None
+    try:
+        return _edgekv_clamp(float(meta.get('p_reuse_prior')), 0.01, 0.99)
+    except (TypeError, ValueError):
+        return None
+
+
 def _edgekv_clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
 def _edgekv_object_type_prior(object_type: str) -> float:
     normalized = str(object_type or 'unknown').lower()
+    if 'hot' in normalized:
+        return 0.90
+    if 'cold' in normalized:
+        return 0.10
     if 'prefix' in normalized:
         return 0.80
     if 'session' in normalized:
@@ -829,9 +855,20 @@ def _edgekv_refresh_profile_reuse(profile: dict[str, Any]) -> None:
         + (w_recency * p_recency)
         + (w_type * p_type)
     ) / weight_sum
+    p_reuse_prior = None
+    if profile.get('p_reuse_prior', '') != '':
+        try:
+            p_reuse_prior = _edgekv_clamp(float(profile.get('p_reuse_prior')), 0.01, 0.99)
+        except (TypeError, ValueError):
+            p_reuse_prior = None
+    if p_reuse_prior is not None:
+        prior_weight = _edgekv_p_reuse_prior_weight()
+        p_reuse = (prior_weight * p_reuse_prior) + ((1.0 - prior_weight) * p_reuse)
     profile['p_freq'] = p_freq
     profile['p_recency'] = p_recency
     profile['p_type'] = p_type
+    if p_reuse_prior is not None:
+        profile['p_reuse_prior'] = p_reuse_prior
     profile['p_reuse'] = _edgekv_clamp(p_reuse, 0.01, 0.99)
     _edgekv_recompute_profile_score(profile)
 

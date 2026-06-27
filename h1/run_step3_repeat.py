@@ -62,6 +62,9 @@ def main() -> None:
     R.summarize("summarize_step3_repeat.py",
                 ["--base", str(BASE), "--summary", str(summary_csv)])
 
+    R.log("[validate-d3] writing d3_validation.json for LPE cells")
+    R.validate_d3_for_lpe_cells(BASE)
+
     R.cleanup_dirs(BASE, keep=args.keep_cells)
     R.log(f"[done] summary: {summary_csv}")
     R.log("REPEAT_PROTOCOL_DONE")

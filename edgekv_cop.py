@@ -12,6 +12,19 @@ from typing import Any, Deque
 DEFAULT_C_RE_MS_PER_TOKEN = 0.12
 DEFAULT_BW_GBPS = 1.0
 DEFAULT_D_DESER_MS = 3.0
+DEFAULT_P_REUSE_PRIOR_WEIGHT = 0.70
+
+
+def p_reuse_prior_from_item(item: dict[str, Any]) -> float | None:
+    for key in ('p_reuse_prior', 'reuse_prior'):
+        if key not in item:
+            continue
+        try:
+            prior = float(item.get(key))
+        except (TypeError, ValueError):
+            continue
+        return max(0.01, min(0.99, prior))
+    return None
 
 
 def object_id_from_item(item: dict[str, Any]) -> str:
@@ -63,6 +76,8 @@ class ObjectProfile:
     last_access_index: int = 0
     last_access_ts: float = field(default_factory=time.time)
     p_reuse: float = 0.5
+    p_reuse_prior: float | None = None
+    p_reuse_prior_weight: float = DEFAULT_P_REUSE_PRIOR_WEIGHT
     size_mb: float = 0.0
     c_recomp_ms: float = 0.0
     c_restore_ms: float = 0.0
@@ -104,6 +119,9 @@ class ObjectProfile:
         freq_rate = self.hit_count / max(self.access_count, 1)
         recency_bonus = 1.0 / (1.0 + math.log1p(max(self.access_count - self.hit_count, 0)))
         estimate = 0.55 * recent_rate + 0.35 * freq_rate + 0.10 * recency_bonus
+        if self.p_reuse_prior is not None:
+            weight = max(0.0, min(1.0, float(self.p_reuse_prior_weight)))
+            estimate = (weight * float(self.p_reuse_prior)) + ((1.0 - weight) * estimate)
         return max(0.01, min(0.99, estimate))
 
     def to_dict(self) -> dict[str, Any]:
@@ -113,6 +131,10 @@ class ObjectProfile:
             'n_tokens': int(self.n_tokens),
             'size_mb': round(self.size_mb, 6),
             'p_reuse': round(self.p_reuse, 6),
+            'p_reuse_prior': (
+                round(float(self.p_reuse_prior), 6)
+                if self.p_reuse_prior is not None else ''
+            ),
             'c_recomp_ms': round(self.c_recomp_ms, 6),
             'c_restore_ms': round(self.c_restore_ms, 6),
             'risk_exp': round(self.risk_exp, 6),
@@ -149,6 +171,7 @@ class COPProfiler:
         oid = object_id or object_id_from_item(item)
         otype = object_type_from_item(item)
         n_tokens = max(int(item.get('n_tokens', 1) or 1), 1)
+        p_reuse_prior = p_reuse_prior_from_item(item)
         profile = self.profiles.get(oid)
         if profile is None:
             profile = ObjectProfile(
@@ -160,12 +183,15 @@ class COPProfiler:
                 bw_gbps=self.bw_gbps,
                 d_deser_ms=self.d_deser_ms,
                 risk_exp=expiry_risk(otype, item),
+                p_reuse_prior=p_reuse_prior,
             )
             profile.recompute()
             self.profiles[oid] = profile
         else:
             profile.object_type = otype
             profile.risk_exp = expiry_risk(otype, item)
+            if p_reuse_prior is not None:
+                profile.p_reuse_prior = p_reuse_prior
         profile.update_access(hit=hit, access_index=access_index, n_tokens=n_tokens)
         return profile
 

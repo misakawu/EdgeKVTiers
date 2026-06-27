@@ -176,6 +176,29 @@ def plot(budgets: list[dict[str, Any]], out_png: Path) -> None:
     plt.close(fig)
 
 
+def plot_histogram(budgets: list[dict[str, Any]], field: str, out_png: Path, title: str, xlabel: str) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
+    colors = ["#2a9d8f", "#e76f51"]
+    for ax, bucket, color in zip(axes, budgets, colors, strict=True):
+        values = [float(p[field]) for p in bucket["points"] if float(p[field]) > 0.0]
+        if values:
+            ax.hist(values, bins=min(40, max(8, int(math.sqrt(len(values))))), color=color, alpha=0.82)
+            stats_map = bucket["stats"][field]
+            ax.axvline(stats_map["p50"], color="#222222", linewidth=1.2, label=f"p50={stats_map['p50']:.3g}")
+            ax.axvline(stats_map["p95"], color="#555555", linewidth=1.0, linestyle="--", label=f"p95={stats_map['p95']:.3g}")
+            ax.legend(loc="upper right", fontsize=8, frameon=False)
+            ax.text(0.02, 0.95, f"count={len(values)}\nstd={stats_map['std']:.3g}", transform=ax.transAxes, va="top", fontsize=9)
+        ax.set_title(bucket["label"])
+        ax.set_xlabel(xlabel)
+        ax.grid(True, alpha=0.25)
+    axes[0].set_ylabel("event count")
+    fig.suptitle(title)
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _fmt_stats(values: dict[str, float]) -> str:
     return (
         f"count={int(values['count'])}, mean={values['mean']:.6g}, "
@@ -197,8 +220,15 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         "",
         "## 输出文件",
         "- 图片：`h1/step1_D3/out/step1_D3_c_recomp_vs_n.png`",
+        "- 图片：`h1/step1_D3/out/step1_D3_score_histogram.png`",
+        "- 图片：`h1/step1_D3/out/step1_D3_p_reuse_histogram.png`",
         "- summary：`h1/step1_D3/out/step1_D3_summary.json`",
         "- runtime 原始数据：`h1/step1_D3/runtime/{tight,mid}/**/runtime_monitor.jsonl`",
+        "",
+        "## 三行验收日志",
+        "- `c_recomp/n_tokens`: 见 `c_recomp_ms` 与 `c_re` 统计，以及 `step1_D3_c_recomp_vs_n.png`。",
+        "- `eviction_granularity`: LPE 执行粒度为 `vLLM prefix-cache block`，runtime 事件包含 `block_id/block_start/block_end`。",
+        "- `score/p_reuse histogram`: 见 `step1_D3_score_histogram.png` 与 `step1_D3_p_reuse_histogram.png`。",
         "",
         "## 真实运行数据",
     ]
@@ -222,6 +252,8 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         lines.append("")
     lines.extend([
         "## 代码依据：runtime 监控字段如何写出",
+        "位置：`h1/sitecustomize.py`，函数 `_edgekv_record_lpe_monitor()`，当前约第 231 行。",
+        "",
         "`_edgekv_record_lpe_monitor()` 在 LPE 策略开启且设置 `EDGEKV_H1_RUNTIME_MONITOR_PATH` 后写 JSONL。`n_tokens/c_recomp/p_reuse/score` 来自真实运行中的 object profile；`lpe_action/hit/block_id` 来自当前 hook 事件。",
         "",
         "```python",
@@ -233,6 +265,8 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         "```",
         "",
         "## 代码依据：c_recomp 如何计算",
+        "位置：`h1/sitecustomize.py`，对象 profile 更新逻辑，当前约第 715 行。",
+        "",
         "`c_recomp` 实际写出的值就是 `profile['c_recomp_ms']`。如果请求 meta 没有显式 `c_recomp_ms`，代码按 `c_re * n_tokens` 计算。",
         "",
         "```python",
@@ -243,6 +277,8 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         "```",
         "",
         "## 代码依据：p_reuse 与 score 如何计算",
+        "位置：`h1/sitecustomize.py`，对象 profile 评分逻辑，当前约第 760-792 行。",
+        "",
         "`p_reuse` 是命中比例、miss recency 项、对象类型先验三者加权；默认权重为 `0.55/0.30/0.15`。`score` 在对象有 resident size 后按收益/容量计算。",
         "",
         "```python",
@@ -255,6 +291,8 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         "```",
         "",
         "## 代码依据：LPE 按 block 驱逐",
+        "位置：`h1/sitecustomize.py`，free queue 候选记录当前约第 1163 行；`_maybe_evict_cached_block()` hook 当前约第 1398 行。",
+        "",
         "驱逐候选从 free queue/rank heap 中选出的是 `block`，真正 evict hook 是 `_maybe_evict_cached_block(self, block)`。因此执行粒度是 block；对象 profile 通过 block 映射提供分数。",
         "",
         "```python",
@@ -270,6 +308,8 @@ def write_report(budgets: list[dict[str, Any]], out_md: Path) -> None:
         "```",
         "",
         "## 生成脚本口径",
+        "位置：`h1/step1_D3/build_step1_d3.py`，`collect_budget()` 中 `real_points` 过滤逻辑，当前约第 100 行。",
+        "",
         "`build_step1_d3.py` 只保留 `n_tokens>0` 且 `c_recomp_ms/c_recomp>0` 的真实事件点；没有真实事件时默认报错。",
         "",
         "```python",
@@ -289,6 +329,20 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     budgets = [collect_budget(label, budget, args.runtime_root, args.allow_fallback) for label, budget in BUCKETS]
     plot(budgets, args.out / "step1_D3_c_recomp_vs_n.png")
+    plot_histogram(
+        budgets,
+        "score",
+        args.out / "step1_D3_score_histogram.png",
+        "H1 Step1 D3: real LPE runtime score histogram",
+        "score",
+    )
+    plot_histogram(
+        budgets,
+        "p_reuse",
+        args.out / "step1_D3_p_reuse_histogram.png",
+        "H1 Step1 D3: real LPE runtime p_reuse histogram",
+        "p_reuse",
+    )
     payload = {
         "generated_from": str(args.runtime_root),
         "data_policy": "runtime JSONL only unless --allow-fallback is passed",

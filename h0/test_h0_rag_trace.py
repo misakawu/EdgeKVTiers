@@ -315,6 +315,55 @@ def test_weak_linked_trace_attaches_rag_to_sharegpt_turns(tmp_path: Path) -> Non
     assert linked[0]["rag_reuse_key"].startswith("rag:hotpotqa:")
 
 
+def test_rag_replay_preserves_temperature_prior_fields() -> None:
+    sessions = [
+        {
+            "session_id": "rag_hot_0",
+            "source": "hotpotqa",
+            "object_type": "rag_hot_chunk_set",
+            "reuse_key": "rag:hot:0",
+            "dataset": "hotpotqa",
+            "hotpotqa_example_id": "hp",
+            "hotpotqa_source_path": "fixture",
+            "answer": "answer",
+            "chunks": [
+                {
+                    "chunk_id": "c0",
+                    "doc_id": "d0",
+                    "title": "Doc",
+                    "text": "Reusable context text.",
+                }
+            ],
+            "temperature": "hot",
+            "p_reuse_prior": 0.95,
+            "turns": [{"i": 0, "user": "Question?"}],
+        }
+    ]
+    prompts = replay_sessions_to_prompts(sessions, max_requests=1)
+    assert prompts[0]["temperature"] == "hot"
+    assert prompts[0]["p_reuse_prior"] == 0.95
+    assert prompts[0]["object_type"] == "rag_hot_chunk_set"
+
+
+def test_cumulative_replay_preserves_temperature_prior_fields() -> None:
+    sessions = [
+        {
+            "session_id": "sg_hot_0",
+            "source": "sharegpt",
+            "object_type": "sharegpt_hot_context",
+            "reuse_key": "sg:hot:0",
+            "turns_format": "cumulative_user",
+            "temperature": "hot",
+            "p_reuse_prior": 0.95,
+            "turns": [{"i": 0, "user": "User: fixed context\nAssistant:"}],
+        }
+    ]
+    prompts = replay_sessions_to_prompts(sessions, max_requests=1)
+    assert prompts[0]["temperature"] == "hot"
+    assert prompts[0]["p_reuse_prior"] == 0.95
+    assert prompts[0]["object_type"] == "sharegpt_hot_context"
+
+
 if __name__ == "__main__":
     test_rag_chunk_trace_reuses_chunk_sets()
     test_hotpotqa_high_frequency_group_order_is_80_20()
@@ -322,4 +371,6 @@ if __name__ == "__main__":
     test_frozen_replay_trace_round_trip(Path("/tmp"))
     test_legacy_flat_prompt_jsonl_still_loads(Path("/tmp"))
     test_weak_linked_trace_attaches_rag_to_sharegpt_turns(Path("/tmp"))
+    test_rag_replay_preserves_temperature_prior_fields()
+    test_cumulative_replay_preserves_temperature_prior_fields()
     print("h0 rag trace tests ok")

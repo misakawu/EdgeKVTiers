@@ -15,6 +15,7 @@ them -- used to diff a run_*.py against the .sh it replaces.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,14 @@ def _run_streaming(cmd: list[str], *, env: dict[str, str] | None,
     """
     if DRY_RUN:
         log(f"[dry-run] cmd: {' '.join(cmd)}")
+        if env is not None:
+            interesting = {
+                key: env[key]
+                for key in sorted(env)
+                if key.startswith("EDGEKV_H1_") or key in {"PYTHONPATH", "CUDA_VISIBLE_DEVICES"}
+            }
+            for key, value in interesting.items():
+                log(f"[dry-run] env {key}={value}")
         if log_file is not None:
             log(f"[dry-run] log: {log_file}")
         return 0
@@ -89,7 +98,15 @@ def run_bench_cell(out_dir: Path, visible_devices: str, env_overrides: dict[str,
         log(f"[skip] {out_dir} already has aggregate.csv")
         return False
 
-    env = {**os.environ, **{k: str(v) for k, v in env_overrides.items()}}
+    env_defaults = {"EDGEKV_H1_PROFILE_POLICY_TIME": "1"}
+    policy = str(env_overrides.get("EDGEKV_H1_GPU_POLICY", os.environ.get("H1_GPU_POLICY", "")))
+    if policy == "h1_lpe":
+        env_defaults.update({
+            "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
+            "EDGEKV_H1_RUNTIME_MONITOR": "1",
+            "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
+        })
+    env = {**os.environ, **env_defaults, **{k: str(v) for k, v in env_overrides.items()}}
     cmd = ["bash", SERVING_BENCH, str(out_dir), visible_devices]
     rc = _run_streaming(cmd, env=env, log_file=log_file, echo=echo)
     if rc != 0:
@@ -106,6 +123,15 @@ def run_real_cell(out_dir: Path, visible_devices: str, cli_args: list[str],
     output redirected to log_file (no console echo). Returns the exit code; the
     caller decides whether a non-zero code is fatal (the .sh only warned).
     """
+    out_dir = Path(out_dir)
+    env_defaults = {"EDGEKV_H1_PROFILE_POLICY_TIME": "1"}
+    policy = str(env_overrides.get("EDGEKV_H1_GPU_POLICY", ""))
+    if policy == "h1_lpe":
+        env_defaults.update({
+            "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
+            "EDGEKV_H1_RUNTIME_MONITOR": "1",
+            "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
+        })
     env = {
         **os.environ,
         "PYTHONPATH": "h1:h0",
@@ -113,6 +139,7 @@ def run_real_cell(out_dir: Path, visible_devices: str, cli_args: list[str],
         "VLLM_USE_V1": "1",
         "VLLM_ATTENTION_BACKEND": attention_backend,
         "VLLM_NO_USAGE_STATS": "1",
+        **env_defaults,
         **{k: str(v) for k, v in env_overrides.items()},
     }
     cmd = [
@@ -129,6 +156,63 @@ def summarize(script_name: str, args: list[str]) -> None:
         log(f"[dry-run] summarize: {' '.join(cmd)}")
         return
     subprocess.run(cmd, cwd=ROOT, check=True)
+
+
+def validate_d3_for_lpe_cells(base_out: Path) -> None:
+    """Write d3_validation.json for every retained LPE cell below base_out."""
+    base_out = Path(base_out)
+    if DRY_RUN:
+        log(f"[dry-run] validate-d3 under {base_out}")
+        return
+    seen: set[Path] = set()
+    cell_dirs: list[Path] = []
+    for summary_json in sorted(base_out.glob("**/*_h1_lpe_summary.json")):
+        cell_dir = summary_json.parent
+        if cell_dir not in seen:
+            seen.add(cell_dir)
+            cell_dirs.append(cell_dir)
+    manifest: list[dict[str, object]] = []
+    for cell_dir in cell_dirs:
+        stats_dirs = [
+            path
+            for path in sorted((cell_dir / "edgekv_gpu_stats").glob("*_h1_lpe"))
+            if path.is_dir()
+        ]
+        if not stats_dirs and (cell_dir / "edgekv_gpu_stats").is_dir():
+            stats_dirs = [cell_dir / "edgekv_gpu_stats"]
+        if not stats_dirs:
+            log(f"[warn] no D3 stats dir found for {cell_dir}")
+            continue
+        out_json = cell_dir / "d3_validation.json"
+        cmd = [
+            sys.executable,
+            str(Path("h1") / "validate_d3.py"),
+            str(stats_dirs[0]),
+            "--out-json",
+            str(out_json),
+        ]
+        log(f"[validate-d3] {cell_dir}")
+        rc = subprocess.run(cmd, cwd=ROOT).returncode
+        if rc != 0:
+            log(f"[warn] validate_d3 failed rc={rc}: {cell_dir}")
+            manifest.append({"cell_dir": str(cell_dir), "stats_dir": str(stats_dirs[0]), "ok": False, "rc": rc})
+            continue
+        try:
+            payload = json.loads(out_json.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        manifest.append({
+            "cell_dir": str(cell_dir),
+            "stats_dir": str(stats_dirs[0]),
+            "out_json": str(out_json),
+            "ok": True,
+            "result": payload,
+        })
+    if manifest:
+        (base_out / "d3_validation_summary.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
 
 def cleanup_dirs(base_out: Path, *, keep: bool, only: list[str] | None = None,

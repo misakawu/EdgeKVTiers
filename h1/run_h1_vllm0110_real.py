@@ -510,6 +510,10 @@ def request_trace_fields(
             'rag_hit': rag_hit if item.get('rag_reuse_key') else '',
             'rag_hit_source': 'trace_side_rag_reuse_key' if item.get('rag_reuse_key') else '',
             'p_reuse': round(profile.p_reuse, 6),
+            'p_reuse_prior': (
+                round(float(profile.p_reuse_prior), 6)
+                if profile.p_reuse_prior is not None else item.get('p_reuse_prior', '')
+            ),
             'c_recomp_ms': round(profile.c_recomp_ms, 6),
             'c_restore_ms': round(profile.c_restore_ms, 6),
             'risk_exp': round(profile.risk_exp, 6),
@@ -604,6 +608,9 @@ def run_cell(
     budget_name: str,
     budget: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    out_dir = Path(args.out)
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
     llm: LLM | None = None
     rows: list[dict[str, Any]] = []
     batch_queue_spans: list[float] = []
@@ -615,6 +622,16 @@ def run_cell(
     gpu_memory_utilization = float(budget['gpu_memory_utilization'])
     model_config = load_model_config(args.model)
     kv_mib_per_token = kv_size_mib_per_token(model_config, args.tensor_parallel_size)
+    os.environ.setdefault('EDGEKV_H1_PROFILE_POLICY_TIME', '1')
+    if policy == 'h1_lpe':
+        os.environ.setdefault('EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES', '1')
+        os.environ.setdefault('EDGEKV_H1_RUNTIME_MONITOR', '1')
+        monitor_path = (
+            out_dir / 'runtime_monitor.jsonl'
+            if len(args.budgets) == 1 and len(args.policies) == 1
+            else out_dir / f'{budget_name}_{policy}_runtime_monitor.jsonl'
+        )
+        os.environ.setdefault('EDGEKV_H1_RUNTIME_MONITOR_PATH', str(monitor_path))
     os.environ['EDGEKV_MU_KV_MB_PER_TOKEN'] = str(kv_mib_per_token)
     os.environ['EDGEKV_C_RE_MS_PER_TOKEN'] = str(args.c_re_ms_per_token)
     cop = COPProfiler(
@@ -686,6 +703,8 @@ def run_cell(
                             'workload': trace_fields.get('workload', ''),
                             'n_tokens': trace_fields.get('n_tokens', 0),
                             'p_reuse': trace_fields.get('p_reuse', 0.0),
+                            'p_reuse_prior': trace_fields.get('p_reuse_prior', ''),
+                            'temperature': trace_fields.get('temperature', ''),
                             'c_recomp_ms': trace_fields.get('c_recomp_ms', 0.0),
                             'c_restore_ms': trace_fields.get('c_restore_ms', 0.0),
                             'risk_exp': trace_fields.get('risk_exp', 0.0),
@@ -871,6 +890,7 @@ def run_cell(
         'free_queue_reorder_calls': int(gpu_cache_stats.get('free_queue_reorder_calls', 0) or 0),
         'free_queue_reorder_blocks': int(gpu_cache_stats.get('free_queue_reorder_blocks', 0) or 0),
         'free_queue_reorder_skipped': int(gpu_cache_stats.get('free_queue_reorder_skipped', 0) or 0),
+        'free_queue_reorder_window': int(gpu_cache_stats.get('free_queue_reorder_window', 0) or 0),
         'free_queue_reorder_time_ms': round(float(gpu_cache_stats.get('free_queue_reorder_time_ms', 0.0) or 0.0), 6),
         'policy_time_us_avg': round(float(gpu_cache_stats.get('policy_time_us_avg', 0.0) or 0.0), 6),
         'eviction_decision_time_us_avg': round(
@@ -965,6 +985,7 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
         'free_queue_reorder_calls',
         'free_queue_reorder_blocks',
         'free_queue_reorder_skipped',
+        'free_queue_reorder_window',
         'low_score_evictions',
         'hot_prefix_evictions',
         'policy_timing_samples',
