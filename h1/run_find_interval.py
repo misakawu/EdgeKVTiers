@@ -59,7 +59,12 @@ def _read_cell_metrics(summary_json: Path) -> dict:
     ratio = data.get("queue_wait_p95_ratio")
     if ratio in (None, ""):
         ratio = (qwait_p95 / p95) if p95 > 0.0 else 0.0
+    ok = bool(data.get("ok", True))
+    requests = int(data.get("requests", 0) or 0)
     return {
+        "ok": ok,
+        "requests": requests,
+        "error": str(data.get("error", "") or ""),
         "hit_rate": fnum("hit_rate"),
         "p95_ttft_ms": p95,
         "queue_wait_p95_ms": qwait_p95,
@@ -69,6 +74,8 @@ def _read_cell_metrics(summary_json: Path) -> dict:
 
 
 def _in_window(m: dict) -> bool:
+    if not m.get("ok", True) or int(m.get("requests", 0) or 0) <= 0:
+        return False
     return (HIT_LO <= m["hit_rate"] <= HIT_HI) and (m["qwait_ratio"] < QWAIT_RATIO_MAX)
 
 
@@ -135,6 +142,8 @@ def _pick_refine_span(by_budget: dict[str, dict[str, dict]],
         (b, pol[reference_policy]["hit_rate"])
         for b, pol in by_budget.items()
         if reference_policy in pol
+        and pol[reference_policy].get("ok", True)
+        and int(pol[reference_policy].get("requests", 0) or 0) > 0
     ]
     if len(present) < 2:
         return None
@@ -172,24 +181,31 @@ def _report(by_budget: dict[str, dict[str, dict]], reference_policy: str,
     """打印 + 落盘（csv/json）每个 (budget,policy) 的窗口判定与推荐区间。"""
     budgets = sorted(by_budget, key=_budget_sort_key, reverse=True)
     rows: list[dict] = []
+    failed: list[dict] = []
     for b in budgets:
         for pol in sorted(by_budget[b]):
             m = by_budget[b][pol]
-            rows.append({
+            row = {
                 "budget": b,
                 "policy": pol,
+                "status": "ok" if m.get("ok", True) and int(m.get("requests", 0) or 0) > 0 else "failed",
+                "requests": int(m.get("requests", 0) or 0),
                 "hit_rate": round(m["hit_rate"], 6),
                 "p95_ttft_ms": round(m["p95_ttft_ms"], 3),
                 "queue_wait_p95_ms": round(m["queue_wait_p95_ms"], 3),
                 "qwait_ratio": round(m["qwait_ratio"], 6),
                 "in_window": _in_window(m),
-            })
+                "error": str(m.get("error", "") or ""),
+            }
+            rows.append(row)
+            if row["status"] == "failed":
+                failed.append(row)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "find_interval_report.csv"
     json_path = out_dir / "find_interval_report.json"
-    fields = ["budget", "policy", "hit_rate", "p95_ttft_ms",
-              "queue_wait_p95_ms", "qwait_ratio", "in_window"]
+    fields = ["budget", "policy", "status", "requests", "hit_rate", "p95_ttft_ms",
+              "queue_wait_p95_ms", "qwait_ratio", "in_window", "error"]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -214,18 +230,24 @@ def _report(by_budget: dict[str, dict[str, dict]], reference_policy: str,
         {"window": {"hit_lo": HIT_LO, "hit_hi": HIT_HI, "qwait_ratio_max": QWAIT_RATIO_MAX},
          "reference_policy": reference_policy,
          "cells": rows,
+         "failed_cells": failed,
          "recommended_budgets": recommended},
         ensure_ascii=False, indent=2), encoding="utf-8")
 
     R.log(f"[find_interval] wrote {csv_path} / {json_path}")
     print("\n=== H1 区间扫描结果（窗口: hit∈[{:.2f},{:.2f}] 且 qwait/p95<{:.0%}）==="
           .format(HIT_LO, HIT_HI, QWAIT_RATIO_MAX))
-    print(f"{'budget':>8} {'policy':>14} {'hit_rate':>9} {'p95_ttft':>10} "
-          f"{'qwait/p95':>10} {'in_window':>10}")
+    print(f"{'budget':>8} {'policy':>14} {'status':>8} {'req':>5} {'hit_rate':>9} "
+          f"{'p95_ttft':>10} {'qwait/p95':>10} {'in_window':>10}")
     for r in rows:
-        print(f"{r['budget']:>8} {r['policy']:>14} {r['hit_rate']:>9.4f} "
-              f"{r['p95_ttft_ms']:>10.1f} {r['qwait_ratio']:>10.4f} "
+        print(f"{r['budget']:>8} {r['policy']:>14} {r['status']:>8} {r['requests']:>5} "
+              f"{r['hit_rate']:>9.4f} {r['p95_ttft_ms']:>10.1f} {r['qwait_ratio']:>10.4f} "
               f"{str(r['in_window']):>10}")
+    if failed:
+        print("\n--- 失败 cell（不参与窗口判定）---")
+        for r in failed:
+            err = (r["error"][:120] + "...") if len(r["error"]) > 120 else r["error"]
+            print(f"  budget={r['budget']} policy={r['policy']} requests={r['requests']} error={err}")
     print("\n--- 推荐 budget 区间（参考策略 {} 落入有效窗口）---".format(reference_policy))
     if recommended:
         for e in recommended:

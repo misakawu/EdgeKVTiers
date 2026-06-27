@@ -34,7 +34,7 @@ DEFAULT_SHAREGPT_TRACE_PATH = (
 )
 DEFAULT_HOTPOTQA_PATH = REPO_ROOT / "data" / "hotpotqa"
 DEFAULT_REPLAY_TRACE_PATH = (
-    REPO_ROOT / "data" / "edgekv_traces" / "h0_sharegpt_hotpotqa_200sessions_pressure.jsonl"
+    REPO_ROOT / "data" / "edgekv_traces" / "sharegpt_hotpotqa_session.jsonl"
 )
 HOTPOTQA_HF_BASE_URL = "https://huggingface.co/datasets/hotpotqa/hotpot_qa/resolve/main/distractor"
 HOTPOTQA_HF_FILES = (

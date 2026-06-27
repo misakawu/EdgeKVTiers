@@ -47,7 +47,7 @@ DEFAULT_SHAREGPT_TRACE_PATH = (
 )
 DEFAULT_HOTPOTQA_PATH = REPO_ROOT / 'data' / 'hotpotqa'
 DEFAULT_REPLAY_TRACE_PATH = (
-    REPO_ROOT / 'data' / 'edgekv_traces' / 'h0_sharegpt_hotpotqa_200sessions_pressure.jsonl'
+    REPO_ROOT / 'data' / 'edgekv_traces' / 'sharegpt_hotpotqa_session.jsonl'
 )
 
 from run_h0_vllm import (

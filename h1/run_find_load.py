@@ -2,11 +2,11 @@
 # TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
 """H1 第二步「旋钮2：去饱和」负载扫描器（接续 run_find_interval 的发现）。
 
-背景：在 3× RTX 2080 Ti（11GB）上，Qwen2.5-7B + TP=2 的引擎可启动下限≈0.72，budget
-（旋钮1）没有向下扫的空间；能启动的 budget≈0.735 处命中率已落在窗口 [0.5,0.85] 内，
-真正不达标的是 queue_wait/p95≈0.51~0.86 > 0.50（**饱和**）。饱和由**负载**决定，不由 budget
-决定。本脚本**固定 budget**，改扫并发旋钮 `replay_batch_size`（= vLLM max_num_seqs），
-把 qwait/p95 压到 < 0.50，找出既非死区也非饱和的有效工作点。
+背景：在 3× RTX 2080 Ti（11GB）上，Qwen2.5-7B + TP=2 的低 budget 档无法启动，budget
+（旋钮1）没有向下扫的空间；最新实测显示，能启动的 budget≈0.735 处命中率仍约 0.95，
+高于窗口 [0.5,0.85]。本脚本只固定 budget 扫并发旋钮 `replay_batch_size`
+（= vLLM max_num_seqs），用于把 qwait/p95 压到 < 0.50；若命中率仍偏高，说明当前 workload
+是高复用死区，需要改 trace/workload，而不是继续扫 batch size。
 
     # 默认：budget=0.735，扫 replay_batch_size 16/8/4/2
     python h1/run_find_load.py
@@ -39,7 +39,7 @@ from run_find_interval import (
 
 # ----------------------------------------------------------------------------- CONFIG
 BASE_OUT = Path("h1/out/find_load")
-BUDGET = "0.735"                          # 固定在引擎可启动且命中在窗口内的档（见 run_find_interval 发现）
+BUDGET = "0.735"                          # 固定在引擎可启动的档；最新实测 hit 仍偏高，需要后续调 workload
 POLICIES = ["h1_lru", "h1_lpe"]          # 每档跑这两个；lru 为窗口判定参考
 REFERENCE_POLICY = "h1_lru"
 BATCH_SIZES = [16, 8, 4, 2]              # 并发旋钮 = vLLM max_num_seqs，从默认 16 往下去饱和

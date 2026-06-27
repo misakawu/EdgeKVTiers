@@ -2,7 +2,7 @@
 
 > 对照基准：`h1/H1_复盘与重跑配置单.md`
 > 更新日期：2026-06-27
-> 一句话现状：**第一步（D1-D4 四个测量/实现修复）已全部完成**；第二步 B 的两个前置扫描已跑到最新进度：`find_interval` 证明低 budget 档无法启动，`find_load` 证明降并发可去饱和但 hit 仍约 0.952、未进入 0.5-0.85 有效窗口。**下一步应先调工作集/trace 降低复用率，再做四策略重跑**。
+> 一句话现状：**第一步（D1-D4 四个测量/实现修复）已全部完成**；第二步 B 已从前置扫描推进到“换到正确区间重跑”。已生成并固定合理的真实 trace：`data/edgekv_traces/sharegpt_hotpotqa_session.jsonl`（summary 同目录保留），默认 H0/H1 运行入口已切到该文件。**下一步按三档 budget × 两策略（`h1_lru`/`h1_lpe`）正式测试**。
 
 ---
 
@@ -16,7 +16,8 @@
 | D4 | TTFT 拆 `queue_wait_ms` + `prefill_ms` | ✅ 完成 | summary `d4_metrics_available_ratio=1.0`、`prefill_p95_ratio=0.9999`、`queue_wait_p95_ratio=0.0001` |
 | B-1 | budget 下扫找有效窗口（旋钮1） | ⚠️ 已跑，未得到可用窗口 | `h1/out/find_interval/`：0.30/0.40/0.50/0.60/0.65 均 `ok=false`，引擎初始化失败；报告中的 hit=0 是失败占位，不是实验数据 |
 | B-2 | 固定 budget 去饱和（旋钮2） | ⚠️ 已跑，去饱和成功但仍在死区 | `h1/out/find_load/`：bs2/4/8 queue_wait≈0，但 hit≈0.952>0.85；bs16 接近排队边界；无推荐工作点 |
-| B-3 | 四策略有效窗口重跑出主图 | ⏳ 待开始（需先造出有效窗口） | 候选：调 trace/workload 扩大工作集或降低复用率，再跑 LRU/LFU/LPE/default |
+| B-3 | workload 旋钮造有效窗口 | ✅ 已完成并固化为正式 trace | `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl`：真实 prompt 第一行均为 `[TRACE_OBJECT ...]`；RAG 使用 `complete_prompt`，replay 后 marker 保持第一行；summary 显示 cold scan 每轮约 18k-20k tokens，hot 工作集约 6.5k tokens |
+| B-4 | 正确区间正式重跑 | ⏳ 当前进行中 / 下一步 | 使用固定 trace `sharegpt_hotpotqa_session.jsonl`，跑三档 budget（tight/mid/loose 或配置单指定三档）× 两策略 `h1_lru`、`h1_lpe`；保持同一到达序列、同一 batch 设置，优先 reps>=3 |
 | C | 异质探针仿真验证唯一出路 | ⏳ 未开始 | — |
 | 决策树 | 2026-07-04 组会给 Go/A/C 结论 | ⏳ 未到 | — |
 
@@ -69,14 +70,14 @@
 
 ---
 
-## 4. 第二步 B 最新进展（截至 `h1/out/find_load`）
+## 4. 第二步 B 最新进展（截至 `h1/out/find_workload`）
 
 **目标不变**：把「缓存策略质量」逼成真正瓶颈——命中率落入 **0.5-0.85** 且 `queue_wait/p95 < 50%` 的有效窗口，四策略（LRU/LFU/LPE/default）出「命中率-p95」主图 + 「budget-命中率」健全性图 + 有效窗口内降幅表。
 
 **旋钮1：budget 下扫（`h1/out/find_interval`）**
 - 已扫 0.30/0.40/0.50/0.60，并额外有 0.65 产物。
 - 这些 cell 的 summary 均为 `ok=false` / `requests=0` / `RuntimeError: Engine core initialization failed`，`hit_rate=0`、`p95=0` 是失败占位。
-- 结论：当前 **3×RTX 2080 Ti（11GB）+ Qwen2.5-7B/TP=2** 下，继续靠降低 `gpu_memory_utilization` 进入有效窗口不可行；同时 `run_find_interval.py` 需要过滤 `ok=false` cell，避免报告把失败占位写成普通指标。
+- 结论：当前 **3×RTX 2080 Ti（11GB）+ Qwen2.5-7B/TP=2** 下，继续靠降低 `gpu_memory_utilization` 进入有效窗口不可行；`run_find_interval.py` 已改为过滤 `ok=false` cell，失败档单列 failed，不参与窗口判定。
 
 **旋钮2：固定 budget=0.735 扫并发（`h1/out/find_load`）**
 
@@ -95,27 +96,54 @@
 1. 降 batch_size 能把排队项压到近似 0（bs2/4/8 的 `qwait/p95≈0`），D4 指标可用。
 2. 命中率几乎不随 batch_size 变化，稳定在约 0.952，仍高于有效窗口上界 0.85；因此当前 workload 仍是死区，不能直接进入四策略主图。
 3. 已扫档位里 LPE 的 p95 全部慢于 LRU（bs2 慢 8.4%、bs4 慢 9.2%、bs8 慢 11.1%、bs16 慢 9.4%），且 hit 基本打平；这与 D3 的同质退化结论一致，但由于还未进入有效窗口，不能把它当作 B 的最终判定。
-4. `run_find_load.py` 顶部注释仍写“budget≈0.735 处命中率已落在窗口内”，已与最新结果不符；后续应顺手修正文档注释。
+4. `run_find_load.py` 顶部过期注释已修正：0.735 当前仍是 hit 过高的 workload 死区，batch 扫描只负责去饱和。
 
-**当前 B 阶段结论**：两个原旋钮已分工清楚。budget 下扫受硬件/模型启动下限卡住；batch 下扫只能去饱和，不能降低命中率。下一步必须换第三个旋钮：**调整 trace/workload，让工作集变大或复用率变低**，把 hit 从约 0.95 拉到 0.5-0.85，再做四策略对比。
+**旋钮3：固定 budget=0.735、batch_size=8 扫 workload unique prefix（`h1/out/find_workload`）**
+
+先做了一个 metadata-only 负控：只改 `reuse_key/session_id/rag_reuse_key`，不改 prompt 文本，`uf250/500/750/900` 的 GPU hit 仍全部约 0.952。结论：vLLM GPU prefix cache 的真实 hit 由 prompt token 前缀决定，不由 COP/CSV metadata 决定。随后将扫描器改为对选中请求在 prompt 开头注入 per-request unique marker，再重跑 LRU。
+
+| workload knob | policy | hit_rate | p95 TTFT(ms) | qwait/p95 | 窗口判定 |
+| --- | --- | ---: | ---: | ---: | --- |
+| uf250 | h1_lru | 0.918169 | 1097.694 | 0.000036 | hit 仍过高 |
+| uf500 | h1_lru | 0.851698 | 1199.308 | 0.000035 | 贴近上界但略高于 0.85 |
+| uf750 | h1_lru | 0.686856 | 1125.238 | 0.000038 | ✅ 有效窗口 |
+| uf900 | h1_lru | 0.566836 | 1092.128 | 0.000038 | ✅ 有效窗口 |
+
+**当前 B 阶段结论**：前置扫描已经证明，metadata-only 改动无效，真实 prompt prefix 才能改变 vLLM GPU prefix-cache hit。现在已不再使用 `uf750/uf900` 临时派生 trace，而是固化为正式 trace：`data/edgekv_traces/sharegpt_hotpotqa_session.jsonl`。该 trace 的结构是 budget-sensitive 的 hot prime -> cold scan -> hot probe ladder：`estimated_hot_working_set_tokens=6512`，`estimated_cold_scan_tokens_per_round=[18454, 18369, 20593]`，预期低 budget 更容易驱逐 hot prefix，中/高 budget 保留更多 hot prefix。
+
+**当前所在步骤**：`h1/H1_复盘与重跑配置单.md` 第 4 节「第二步：换到正确区间重跑」。下一步不再继续造 trace，而是用固定 trace 做正式策略对比。
+
+**下一步运行矩阵**：三档 budget × 两策略：
+
+| 维度 | 设定 |
+| --- | --- |
+| trace | `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl` |
+| budget | 三档：优先沿用 `tight` / `mid` / `loose`；如要贴合配置单，可替换为当前机器可启动的三个数值档 |
+| policies | `h1_lru`, `h1_lpe` |
+| batch/order | 固定同一 `replay_batch_size`、`batch_order=original`、同一到达序列 |
+| requests | trace 全量 281，或固定 `--num-prompts 281` 保证每档一致 |
+| reps | 建议 `reps>=3`；若先 smoke，可每档每策略 1 次确认可启动 |
+
+推荐直接使用 `h1/run_step3_budget_tiers.py` 或在 `h1/run_test.py` 的两策略 smoke 基础上扩展三档。当前各运行入口默认 trace 已改为 `sharegpt_hotpotqa_session.jsonl`，因此不再需要额外传旧的 pressure trace 路径。
 
 ---
 
 ## 5. 下一步任务清单
 
 ### P0 — 修正扫描器报告语义
-- [ ] `run_find_interval.py` / 汇总逻辑过滤 `ok=false`、`requests=0` 的 summary；失败 cell 单独列为 failed，不参与窗口判定。
-- [ ] 修正 `run_find_load.py` 注释：budget=0.735 在最新实测中 **未** 进入 hit 窗口，当前问题是 workload 死区而非仅仅饱和。
+- [x] `run_find_interval.py` / 汇总逻辑过滤 `ok=false`、`requests=0` 的 summary；失败 cell 单独列为 failed，不参与窗口判定。
+- [x] 修正 `run_find_load.py` 注释：budget=0.735 在最新实测中 **未** 进入 hit 窗口，当前问题是 workload 死区而非仅仅饱和。
 
 ### P0 — 造出有效窗口
-- [ ] 固定一个去饱和并发作为基准，优先用 `batch_size=8`（p95 仍有统计量、`qwait/p95≈0`）或 `batch_size=4`（更快、也去饱和）。
-- [ ] 调整 trace/workload 降复用率：增加不重复 session / 增加 unique prefix / 降低 hot session 重复比例 / 增加 RAG chunk 多样性。目标先用 LRU 跑到 `hit_rate=0.5-0.85`。
-- [ ] 找到窗口后，再固定同一 trace、同一到达序列、同一 batch_size，跑四策略：`vllm_default`、`h1_lru`、`h1_lfu`、`h1_lpe`，每点 `reps>=3`。
+- [x] 固定一个去饱和并发作为基准，优先用 `batch_size=8`（p95 仍有统计量、`qwait/p95≈0`）。
+- [x] 调整 trace/workload 降复用率：增加真实 unique prompt prefix；LRU 已在 `uf750`/`uf900` 跑到 `hit_rate=0.5-0.85`。
+- [x] 找到窗口并固化正式 trace：`data/edgekv_traces/sharegpt_hotpotqa_session.jsonl`；旧 trace 已清理，只保留 JSONL 和 summary。
+- [ ] 用固定 trace、同一到达序列、同一 batch 设置，跑三档 budget × 两策略：`h1_lru`、`h1_lpe`，建议每点 `reps>=3`。
 
 ### P1 — B 阶段正式交付
 - [ ] 生成「hit_rate/budget 或 workload knob - p95 TTFT」主图，标出有效窗口。
 - [ ] 生成「knob - hit_rate」健全性图。
-- [ ] 生成有效窗口内 `LPE vs LRU/LFU/default` 的 p95 降幅表，同时附 `queue_wait/p95` 确认未饱和。
+- [ ] 生成三档内 `LPE vs LRU` 的 p95 降幅表，同时附 `queue_wait/p95` 确认未饱和，并记录 hit 是否随 budget 增加。
 - [ ] 用 B 的多负载/多工作点结果补 D2 验收：`free_queue_reorder_time_ms` 是否不随负载显著上涨；当前 `find_load` 中 LPE reorder time 约 409-463ms/256req，仍需归一化到 per decision / per request 再判断。
 
 ### P1 — C 探针与 7-04 决策
@@ -135,13 +163,21 @@
 | `h1/step1_D3/runtime_pathB_backup_20260627/` | 旧 path-B 数据备份 |
 | `h1/out/find_interval/*` | B-1 budget 下扫产物；当前为失败占位，需要过滤 `ok=false` 后重报 |
 | `h1/out/find_load/*` | B-2 batch 扫描产物；确认去饱和成功但 hit 仍约 0.952 |
+| `h1/run_find_interval.py` | 过滤失败 cell：`ok=false` / `requests=0` 单列 failed，不参与窗口判定 |
+| `h1/run_find_load.py` | 修正过期注释：0.735 未进入 hit 窗口，batch 只负责去饱和 |
+| `h1/run_find_workload.py` | 新增 workload 扫描器：生成 unique prompt prefix 派生 trace，固定 bs8 找有效窗口，并支持 `--four-policies` / `--reps` |
+| `scripts/optimize_h0_pressure_trace.py` | 固化正式 budget-sensitive trace 生成器：对象 marker 首行、RAG `complete_prompt`、budget ladder 排列、summary 输出，并默认清理旧 trace |
+| `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl`、`.summary.json` | B-3 正式 trace；旧 `h0_*pressure` / `h0_budget_sensitive*` 已清理 |
+| `h0/run_h0_vllm.py`、`h1/run_h1_vllm0110_real.py`、`h1/run_step3_budget_tiers.py`、`h1/run_step3_real.py`、相关 shell/test | 默认 replay trace 名称统一为 `sharegpt_hotpotqa_session.jsonl` |
+| `h1/out/find_workload/*`、`data/edgekv_traces/h1_workload_sweep/*` | B-3 workload 扫描历史产物；`uf750`/`uf900` 证明真实 unique prefix 可进入有效窗口，现已被正式 trace 替代 |
 
 ---
 
 ## 7. 待办 / 风险
 
-- [ ] **B 步阻塞点**：原两个旋钮没有命中有效窗口；下一轮必须先调 workload，而不是继续扫 batch。
-- [ ] **报告风险**：`find_interval` 目前把失败 summary 写入窗口报告，容易误读为 hit=0；需先修正。
+- [x] **B 步阻塞点**：原两个旋钮没有命中有效窗口；已通过真实 unique prompt prefix workload 扫描造出有效窗口。
+- [x] **报告风险**：`find_interval` 目前把失败 summary 写入窗口报告，容易误读为 hit=0；已在扫描器逻辑中修正。
+- [ ] **B 步下一动作**：使用 `sharegpt_hotpotqa_session.jsonl` 跑三档 budget × 两策略（`h1_lru`/`h1_lpe`），建议 reps>=3，并生成主图/表。
 - [ ] **D2 收尾验收**：B 步多 workload 下确认 reorder 时间不随负载显著上涨。
 - [ ] **C 探针**：异质对象仿真（DDL 07-04）。
 - [ ] **决策建议**：B 大概率「无信号」（同质退化已坐实），按决策树倾向 A（诚实负结论 + 边界讨论）并把火力转 C/H4；LPE 在规划中本就是「支撑性贡献」，非失败。

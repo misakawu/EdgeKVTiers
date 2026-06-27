@@ -15,7 +15,7 @@ VISIBLE_DEVICES="${2:-${H1_VISIBLE_DEVICES:-0,1}}"
 
 CONDA_ENV="${H1_CONDA_ENV:-edgekv-vllm0110}"
 MODEL="${H1_MODEL:-models/Qwen2.5-7B-Instruct}"
-REPLAY_TRACE="${H1_REPLAY_TRACE:-data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl}"
+REPLAY_TRACE="${H1_REPLAY_TRACE:-data/edgekv_traces/sharegpt_hotpotqa_session.jsonl}"
 HOTPOTQA_PATH="${H1_HOTPOTQA_PATH:-data/hotpotqa}"
 NUM_PROMPTS="${H1_BENCH_NUM_PROMPTS:-128}"
 REPLAY_BATCH_SIZE="${H1_REPLAY_BATCH_SIZE:-1}"

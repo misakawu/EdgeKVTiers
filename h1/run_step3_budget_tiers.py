@@ -26,7 +26,7 @@ BUDGETS = ["tight", "mid", "loose"]
 POLICIES = ["h1_lru", "h1_lfu", "vllm_default", "h1_lpe"]
 
 WORKLOAD = "mixed"
-REPLAY_TRACE = Path("data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl")
+REPLAY_TRACE = Path("data/edgekv_traces/sharegpt_hotpotqa_session.jsonl")
 HOTPOTQA_PATH = "data/hotpotqa"
 SHAREGPT_ORDER = "longest"
 MAX_SESSIONS = 200

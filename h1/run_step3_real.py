@@ -36,7 +36,7 @@ REPS = 3
 POLICIES = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
 BUDGETS = ["tight", "mid", "loose"]
 BASE = Path("h1/out/step3_real")
-TRACE = Path("data/edgekv_traces/h0_sharegpt_hotpotqa_200sessions_pressure.jsonl")
+TRACE = Path("data/edgekv_traces/sharegpt_hotpotqa_session.jsonl")
 
 # Repo-local real datasets (== run_h1_vllm0110_real.py defaults).
 SHAREGPT_PATH = "data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
