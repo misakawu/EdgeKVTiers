@@ -1,204 +1,97 @@
-# TODO: 生成 budget-sensitive 的 H0/H1 pressure trace
+# TODO：让 budget–hit 曲线从「台阶」变「平缓斜坡」
 
 ## 目标
+让 `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl` 的 budget–hit 曲线平缓爬升：
+**budget≈0.77 时 hit≈0.5，budget≈0.90 时 hit≈0.9（≈结构天花板）**，中间各档落在 0.6/0.7/0.8 附近。
+当前曲线极陡：0.77 时 hit≈0.42–0.51，到 0.80 直接饱和到 ~0.903，0.80–0.90 全平
+（见 `h1/备份-运行结果/新trace-budget区间0.77-0.90/step3_summary.csv`）。
 
-生成一种 trace，使真实 vLLM GPU prefix-cache hit 满足：
+这是一次 **trace 重标定**（改本目录 `optimize_h0_pressure_trace.py` 的生成参数 + 经验迭代），
+**不改 LPE/LRU 策略代码**，也不改 runner。
 
-- hit 随 `gpu_memory_utilization` / 可用 KV blocks 增加而增加。
-- 最低可启动预算不能也接近满 hit；低预算应有明显 eviction/miss。
-- 在固定 `batch_size=8`、未饱和条件下，至少一个工作点落入 `hit_rate=0.5-0.85`。
+## 根因（已定量验证）
+`optimize_h0_pressure_trace.py` 的 `budget_ladder` 结构：prime N 个 hot 前缀 →
+每轮「扫 cold（约 19k token）→ 复测全部 hot」共 3 轮。每轮 hit 取决于 cold 扫描后有多少 hot 前缀在 LRU 里幸存。
 
-`uf750` / `uf900` 的结论说明：只改 `reuse_key/session_id/rag_reuse_key` 没用；vLLM prefix cache 看 prompt token 前缀。要控制真实 hit，必须控制 prompt 开头的 token 共享关系和复用距离。
+- hot working set ≈ **9.6k** token（summary `estimated_hot_working_set_tokens`）
+- cold 单轮 ≈ **19k** token（`estimated_cold_scan_tokens_per_round`）
+- KV 容量（Qwen2.5-7B / TP=2 / 11GB×2，budget 直接当 gpu_memory_utilization）粗算：
+  **0.77≈17k token，0.80≈30k，0.90≈71k**
 
-## 从 uf750/uf900 得到的判据
+只有两个区间、几乎无过渡：0.77 时 cold(19k) 装不下 → hot 全被挤掉（floor）；
+0.80 时 cold+hot≈29k 全部装下 → hot 全幸存（天花板）。台阶卡在 0.77→0.80。
 
-1. metadata-only 负控无效：只改 reuse metadata 时，`uf250/uf500/uf750/uf900` hit 仍约 `0.952`。
-2. 在 prompt 开头加入 per-request unique marker 后，hit 被拉低：
-   - `uf750`: hit `0.686856`，qwait/p95 `0.000038`，有效窗口。
-   - `uf900`: hit `0.566836`，qwait/p95 `0.000038`，有效窗口。
-3. 因此当前 trace 的高 hit 很大概率来自“所有请求共享相同开头模板/公共前缀块”，而不是 COP 字段里的对象复用。
-4. 想让 hit 随预算增加，trace 需要让 reuse distance 分布跨过不同预算容量：
-   - 一部分 hot prefix 的两次访问之间插入的 distinct KV blocks 要大于最低预算容量，所以低预算会丢。
-   - 同一部分 hot prefix 的复用距离又要小于中/高预算容量，所以更高预算能保住。
-   - 不能让所有请求都共享同一个全局开头模板，否则低预算也会命中公共 blocks，掩盖预算效应。
+**决定 ramp 宽度的唯一关键量：hot working set 的绝对 token 数。**
+ramp 宽度 ≈ hot_working_set_tokens ÷ (每单位 budget 的 KV token 增量)。现在 9.6k 太小 → 压成一个台阶。
+要铺满 0.77→0.90（KV 从 ~17k 到 ~71k，Δ≈54k），需把 hot working set 放大到 **~45–50k token（约 4–5×）**，
+同时保持 cold 扫描大致不变以锚住 0.77 的 floor。hot 前缀数量越多，斜坡颗粒越细。
 
-## 推荐 trace 形状
+## 方案：只调 trace 生成参数（已有 CLI 旋钮，无需改代码）
 
-### A. 不要让所有请求共享同一个 prompt 开头
+第一版参数（v1）：
 
-当前 `build_sharegpt_prompt()` 以固定模板开头：
+| 参数 | 现值 | v1 | 作用 |
+|---|---|---|---|
+| `--scan-hot-objects` | 35 | **70** | hot 前缀更多 → 斜坡颗粒更细、ramp 更宽 |
+| `--hot-context-words` | 300 | **500** | 单个 hot 前缀更大 → 抬高 hot working set |
+| `--sharegpt-groups` | 96 | **200** | 提供足够多 hot/cold 候选对象 |
+| `--hot-ratio` | 0.20 | **0.30** | sharegpt hot≈60 |
+| `--rag-requests` | 128 | **160** | rag hot≈20，凑够 ≥70 hot keys |
+| `--scan-cold-objects` | 24 | **24（保持）** | cold 扫描量不变 → 锚住 0.77 floor≈0.5 |
+| `--cold-context-words` | 800 | **800（保持）** | 同上 |
+| `--scan-probe-rounds` | 3 | **3（保持）** | — |
 
-```text
-Use the following ShareGPT-derived context as the fixed working memory.
-Context:
-...
+预期：hot working set 9.6k → ~45k（70×~650token），把饱和点从 0.80 顶到 ~0.90；cold 不变，0.77 仍 ramp 下段。
+生成约束已核对可满足（hot keys 80≥70；unique cold 220 ≥ scan-cold-objects×rounds=72；hot 前缀 ≤2048 max_model_len）。
+
+> 生成器对短 session 会按实际长度截断，真实 hot working set 可能 < 估算。
+> **生成后必须读 summary 的 `estimated_hot_working_set_tokens` 与 `estimated_cold_scan_tokens_per_round` 核对**，作为下一轮反馈。
+
+## 执行步骤
+
+**Step 0 — 备份现有 trace**（生成器默认会清理旧 trace）
+```bash
+cp data/edgekv_traces/sharegpt_hotpotqa_session.jsonl* data/edgekv_traces/备份-实验数据/
 ```
 
-RAG prompt 也有固定 `Retrieved context:` 结构。vLLM 的 block 级 prefix cache 会优先命中这些公共开头。建议新增一个模式，例如 `--prefix-family-mode object`：
-
-- hot 对象：同一对象的所有 repeat 使用完全相同的对象前缀。
-- cold 对象：每个对象开头加入唯一 family marker，避免与其他 cold/hot 共享开头。
-- 不要把唯一 marker 放在 prompt 末尾；必须放在开头几个 token 内。
-
-建议 prompt 结构：
-
-```text
-[TRACE_OBJECT sharegpt_hot_0007]
-<对象真实 context 或 chunk text>
-
-Task: ...
-Assistant:
-```
-
-cold：
-
-```text
-[TRACE_OBJECT sharegpt_cold_0123]
-<cold context>
-...
-```
-
-这样 hit 主要来自“同一对象 repeat”，而不是全局模板。
-
-### B. 用 scan-resistant 复用距离制造预算敏感性
-
-目标序列不是简单均匀插入 hot copies，而是按 hot 对象分 phase：
-
-```text
-# prime: 先装入一批 hot objects
-H0_0, H1_0, ..., H15_0
-
-# cold scan: 插入足够多 unique/cold prefix，制造 cache pressure
-C0, C1, ..., Ck
-
-# probe: 再访问同一批 hot objects
-H0_1, H1_1, ..., H15_1
-
-# 重复多轮
-C{k+1}, ..., C{2k}
-H0_2, H1_2, ..., H15_2
-```
-
-其中 `C` 必须是真正 unique prompt prefix，不是只改 metadata。`k * avg_cold_tokens` 应该处在不同预算之间：
-
-- 如果最低可启动预算约只能容纳 `B_low` tokens，则让 cold scan tokens `> B_low`。
-- 如果中/高预算可容纳 `B_mid/B_high` tokens，则让 cold scan tokens `< B_mid` 或至少让一部分 hot 对象 `< B_mid`。
-
-这样低预算 miss，中/高预算 hit，hit 才会随预算上升。
-
-### C. 使用对象大小分层，而不是全都很短或全都很长
-
-建议保留三类对象：
-
-| 类别 | 目的 | 生成方式 |
-| --- | --- | --- |
-| hot-small | 产生可保留复用 | 128-256 words，repeat 3-5 次 |
-| hot-medium | 制造预算边界 | 300-600 words，repeat 2-4 次 |
-| cold-large | 施加 eviction pressure | 600-1000 words，repeat 1 次，unique prefix |
-
-如果 hot 太小且 repeats 太近，最低预算也能保住，hit 会饱和。如果 cold 太大或 scan 太长，所有预算都 miss。需要让 hot-medium 的 reuse distance 横跨 low/mid/high 容量。
-
-## `scripts/optimize_h0_pressure_trace.py` 修改建议
-
-### 1. 新增 prompt prefix 模式
-
-增加参数：
-
-```text
---prompt-prefix-mode shared_template|object_marker|unique_cold
-```
-
-推荐默认改成 `object_marker` 或新增实验用 preset：
-
-- `shared_template`: 当前行为，保留兼容。
-- `object_marker`: 每个对象 prompt 第一行放稳定 object marker；同一 hot 对象 repeat 共享 marker。
-- `unique_cold`: cold 对象第一行唯一 marker，hot 对象按 object marker 复用。
-
-实现点：
-
-- 修改 `build_sharegpt_prompt(context, task_index)`，传入 `object_id/object_type`。
-- RAG 的 `build_rag_query_session()` 也要把 marker 放到 `turns[0].user` 最开头，或者把 retrieved context 前的第一行改成对象 marker。
-
-### 2. 修改 hot/cold 排列，不只 evenly_insert_hot_copies
-
-当前 `evenly_insert_hot_copies()` 容易让 repeat 过近或无法明确控制 reuse distance。建议新增：
-
-```text
---reuse-schedule even|scan_resistant|budget_ladder
-```
-
-`budget_ladder` 推荐逻辑：
-
-1. 选 `N_hot` 个 hot objects，先各访问一次。
-2. 插入 `scan_cold_objects` 个 cold unique objects。
-3. 再访问这批 hot objects。
-4. 重复 `probe_rounds` 轮。
-5. 剩余对象追加到尾部。
-
-已有 `scan_resistant_prefix()` 接近这个结构，但要确保 cold/hot 的 prompt 开头真实不同，不能共享全局模板。
-
-### 3. 显式输出 trace 诊断信息
-
-生成 trace 后打印或写 sidecar JSON：
-
-- `total_requests`
-- `unique_prompt_prefix_families`
-- `hot_objects`, `hot_accesses`, `hot_repeats`
-- `cold_objects`, `cold_accesses`
-- `avg_hot_tokens`, `avg_cold_tokens`
-- `scan_rounds`
-- `estimated_cold_scan_tokens_per_round`
-- `estimated_hot_working_set_tokens`
-- `expected_behavior`: low/mid/high 预算下应 hit 或 miss 的对象层判断
-
-这能在跑 vLLM 前先判断 trace 是否可能 budget-sensitive。
-
-### 4. 推荐起始 preset
-
-先实现一个保守 preset，用来替代当前高 hit pressure trace：
-
+**Step 1 — 重生成 trace（异步）**
 ```bash
 python3 scripts/optimize_h0_pressure_trace.py \
   --out data/edgekv_traces/sharegpt_hotpotqa_session.jsonl \
-  --sharegpt-groups 96 \
-  --hot-ratio 0.20 \
-  --hot-repeats 4 \
-  --hot-context-words 300 \
-  --cold-context-words 800 \
-  --rag-requests 128 \
-  --rag-hot-ratio 0.20 \
-  --rag-hot-repeats 4 \
-  --rag-hot-chunk-words 120 \
-  --rag-cold-chunk-words 320 \
-  --rag-hot-chunks-per-query 1 \
-  --rag-cold-chunks-per-query 3 \
-  --scan-hot-objects 16 \
-  --scan-cold-objects 24 \
-  --scan-probe-rounds 3 \
-  --prompt-prefix-mode object_marker \
-  --reuse-schedule budget_ladder
+  --sharegpt-groups 200 --hot-ratio 0.30 --hot-repeats 4 \
+  --hot-context-words 500 --cold-context-words 800 \
+  --scan-hot-objects 70 --scan-cold-objects 24 --scan-probe-rounds 3 \
+  --rag-requests 160 --rag-hot-ratio 0.20 --rag-hot-repeats 4
 ```
+生成后读 `*.summary.json` 确认 hot working set ≈ 40–50k、cold/round ≈ 18–20k。
 
-如果最低预算 hit 仍高：
+**Step 2 — 跑 6 点 LRU 标定曲线（异步，复用现有脚本）**
+```bash
+python3 h1/run_find_interval_2.py --visible-devices 0,1
+```
+默认粗扫 `0.77/0.80/0.83/0.86/0.88/0.90`，每档 LRU+LPE。
+看 `h1/out/find_interval_2/find_interval_2_report.csv` 的 LRU hit 列，画 budget→hit。
 
-- 增大 `scan-cold-objects` 或 `cold-context-words`。
-- 减少 `hot-repeats`，避免 repeat 太密。
-- 确认 cold/hot prompt 第一行没有共享同一模板。
+**Step 3 — 经验迭代（2–4 轮，调参规则）**
+- **饱和太早**（如 0.83 就到 0.9）→ hot working set 不够大：`--scan-hot-objects` ↑ 或 `--hot-context-words` ↑。
+- **饱和不到 0.9**（0.90 仍 <0.85）→ 反向略减 hot working set。
+- **0.77 floor 偏高/偏低**（≠0.5）→ 调 cold：偏高则 `--scan-cold-objects`/`--cold-context-words` ↑，偏低则 ↓。
+- **斜坡有跳变** → `--scan-hot-objects` ↑ 增颗粒度。
+每轮只回 Step 1+2。
 
-如果所有预算 hit 都低：
+## 验收标准
+- LRU hit 随 budget **单调非降**，0.77→0.90 至少 4 个中间档可区分（不是两段平台）。
+- budget≈0.77 → hit≈0.5（±0.05）；budget≈0.90 → hit≈0.9（≈该 trace 结构天花板，±0.05）。
+- queue_wait/p95 比例不显著恶化（report 里 `qwait_ratio` 保持 <~0.55，避免饱和区伪信号）。
 
-- 减小 `scan-cold-objects` 或 `cold-context-words`。
-- 减小 hot object 大小，或增加 hot repeat 轮数。
-- 让一部分 hot-small 的 reuse distance 小于 low budget，保留基础 hit。
+## 风险 / 注意
+- budget→KV-token 斜率只能经验标定（11GB 卡、引擎 floor≈0.72），v1 数值是起点而非终点，需 2–4 轮迭代。
+- 放大 hot 会抬高结构天花板（可命中请求变多），"0.9" 语义随之微移——以「0.90 档≈饱和」为准，而非固定 0.903。
+- 数据可得性：`--scan-hot-objects 70` 需足够多够长的 sharegpt session；若报「only built N objects」则下调对象数或上调 `--sharegpt-groups`。
+- trace 变大 → replay 变慢，可接受；标定一律后台异步、完成再唤醒。
+- 跑 LPE 对比时启动环境须注入 `EDGEKV_H1_GPU_POLICY`（`run_find_interval_2.py` 已封装，无需手动）。
 
-## 直接可用的会话复用方式
-
-不改脚本也可以先按下面方式手工构造 JSONL：
-
-1. 每个 hot object 生成 3-4 个访问，所有访问的 prompt 第一行完全一致：`[TRACE_OBJECT HOT_0007]`。
-2. 每个 cold object 只访问一次，prompt 第一行唯一：`[TRACE_OBJECT COLD_0123]`。
-3. 顺序采用：`hot prime -> cold scan -> hot probe -> cold scan -> hot probe`。
-4. cold scan 的总 token 数要大于最低预算 KV 容量，但不要大到超过最高预算太多。
-5. 所有 prompt 不要共享同一个固定开头；公共说明文本放到 object marker 后面。
-
-这个结构的预期结果是：低预算在 probe 时丢掉部分 hot prefix，中/高预算保留更多 hot prefix，因此 hit 随显存预算增加。
+## 关键文件
+- `scripts/optimize_h0_pressure_trace.py` — trace 生成器（只调 CLI 参数，不改码）
+- `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl(.summary.json)` — 产物 + 反馈信号
+- `h1/run_find_interval_2.py` → `h1/run_step3_budget_tiers.py` → `h1/run_h1_vllm0110_real.py` — 标定运行链（不改）
