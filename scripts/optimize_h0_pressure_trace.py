@@ -463,13 +463,100 @@ def budget_ladder_order(
     return ordered, prefix
 
 
+def split_evenly(values: Sequence[Any], parts: int) -> list[list[Any]]:
+    if parts <= 0:
+        raise ValueError("parts must be > 0")
+    base, extra = divmod(len(values), parts)
+    chunks: list[list[Any]] = []
+    pos = 0
+    for index in range(parts):
+        size = base + (1 if index < extra else 0)
+        chunks.append(list(values[pos:pos + size]))
+        pos += size
+    return chunks
+
+
+def segmented_ladder_order(
+    sessions: list[dict[str, Any]],
+    hot_objects: int,
+    cold_scan_objects: int,
+    probe_rounds: int,
+    segments: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if segments <= 0:
+        raise ValueError("segmented_ladder requires positive ladder-segments")
+    if segments > hot_objects:
+        raise ValueError("--ladder-segments must be <= --scan-hot-objects")
+    if segments > cold_scan_objects:
+        raise ValueError("--ladder-segments must be <= --scan-cold-objects")
+
+    if hot_objects <= 0 or cold_scan_objects <= 0 or probe_rounds <= 0:
+        raise ValueError("segmented_ladder requires positive scan-hot-objects, scan-cold-objects, and scan-probe-rounds")
+
+    hot_by_key: dict[str, list[dict[str, Any]]] = {}
+    cold_once: list[dict[str, Any]] = []
+    cold_seen: set[str] = set()
+    for row in sessions:
+        temp = temperature_of(row)
+        reuse_key = str(row.get("reuse_key", row.get("session_id", "")))
+        if temp == "hot":
+            hot_by_key.setdefault(reuse_key, []).append(row)
+        elif temp == "cold" and reuse_key not in cold_seen:
+            cold_seen.add(reuse_key)
+            cold_once.append(row)
+
+    hot_keys = [key for key, rows in hot_by_key.items() if len(rows) >= probe_rounds + 1]
+    required_cold = cold_scan_objects * probe_rounds
+    if len(hot_keys) < hot_objects:
+        raise RuntimeError(
+            f"segmented_ladder needs {hot_objects} hot objects with at least "
+            f"{probe_rounds + 1} accesses; found {len(hot_keys)}"
+        )
+    if len(cold_once) < required_cold:
+        raise RuntimeError(
+            f"segmented_ladder needs {required_cold} unique cold objects "
+            f"({cold_scan_objects} per round * {probe_rounds} rounds); found {len(cold_once)}"
+        )
+
+    selected_hot_keys = hot_keys[:hot_objects]
+    hot_key_segments = split_evenly(selected_hot_keys, segments)
+    prefix: list[dict[str, Any]] = []
+    used: set[int] = set()
+
+    def add(row: dict[str, Any]) -> None:
+        prefix.append(row)
+        used.add(id(row))
+
+    for key in selected_hot_keys:
+        add(hot_by_key[key][0])
+
+    cold_pos = 0
+    for probe_index in range(probe_rounds):
+        round_cold = cold_once[cold_pos:cold_pos + cold_scan_objects]
+        cold_pos += cold_scan_objects
+        cold_segments = split_evenly(round_cold, segments)
+        for cold_segment, hot_key_segment in zip(cold_segments, hot_key_segments):
+            for row in cold_segment:
+                add(row)
+            for key in hot_key_segment:
+                add(hot_by_key[key][probe_index + 1])
+
+    ordered = prefix + [row for row in sessions if id(row) not in used]
+    return ordered, prefix
+
+
 def validate_args(args: argparse.Namespace) -> None:
-    if args.reuse_schedule != "budget_ladder":
-        raise ValueError("only --reuse-schedule budget_ladder is supported")
+    if args.reuse_schedule not in {"budget_ladder", "segmented_ladder"}:
+        raise ValueError("unsupported --reuse-schedule")
     if args.hot_repeats < args.scan_probe_rounds + 1:
         raise ValueError("--hot-repeats must be >= --scan-probe-rounds + 1")
     if args.rag_hot_repeats < args.scan_probe_rounds + 1:
         raise ValueError("--rag-hot-repeats must be >= --scan-probe-rounds + 1")
+    if args.reuse_schedule == "segmented_ladder":
+        if args.ladder_segments > args.scan_hot_objects:
+            raise ValueError("--ladder-segments must be <= --scan-hot-objects")
+        if args.ladder_segments > args.scan_cold_objects:
+            raise ValueError("--ladder-segments must be <= --scan-cold-objects")
 
 
 def prompt_prefix_families(sessions: Sequence[dict[str, Any]]) -> set[str]:
@@ -545,9 +632,11 @@ def build_summary(args: argparse.Namespace, sessions: Sequence[dict[str, Any]], 
         "estimated_cold_scan_tokens_per_round": cold_scan_tokens_by_round,
         "budget_ladder_prefix_requests": len(prefix),
         "budget_ladder": {
+            "reuse_schedule": args.reuse_schedule,
             "hot_objects": args.scan_hot_objects,
             "cold_scan_objects": args.scan_cold_objects,
             "probe_rounds": args.scan_probe_rounds,
+            "ladder_segments": args.ladder_segments,
         },
         "expected_behavior": (
             "Low KV budgets should evict many primed hot prefixes during each unique cold scan; "
@@ -576,7 +665,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-cold-objects", type=positive_int, default=24)
     parser.add_argument("--scan-probe-rounds", type=positive_int, default=3)
     parser.add_argument("--prompt-prefix-mode", choices=("object_marker", "unique_cold"), default="object_marker")
-    parser.add_argument("--reuse-schedule", choices=("budget_ladder",), default="budget_ladder")
+    parser.add_argument("--reuse-schedule", choices=("budget_ladder", "segmented_ladder"), default="budget_ladder")
+    parser.add_argument("--ladder-segments", type=positive_int, default=3)
     parser.add_argument("--hotpotqa-max-examples", type=positive_int, default=96)
     parser.add_argument("--rag-hot-ratio", type=bounded_ratio, default=0.20)
     parser.add_argument("--rag-hot-repeats", type=positive_int, default=4)
@@ -623,12 +713,22 @@ def main() -> None:
         timeout_s=args.timeout_s,
         prompt_prefix_mode=args.prompt_prefix_mode,
     )
-    sessions, prefix = budget_ladder_order(
-        sharegpt_sessions + rag_sessions,
-        hot_objects=args.scan_hot_objects,
-        cold_scan_objects=args.scan_cold_objects,
-        probe_rounds=args.scan_probe_rounds,
-    )
+    all_sessions = sharegpt_sessions + rag_sessions
+    if args.reuse_schedule == "segmented_ladder":
+        sessions, prefix = segmented_ladder_order(
+            all_sessions,
+            hot_objects=args.scan_hot_objects,
+            cold_scan_objects=args.scan_cold_objects,
+            probe_rounds=args.scan_probe_rounds,
+            segments=args.ladder_segments,
+        )
+    else:
+        sessions, prefix = budget_ladder_order(
+            all_sessions,
+            hot_objects=args.scan_hot_objects,
+            cold_scan_objects=args.scan_cold_objects,
+            probe_rounds=args.scan_probe_rounds,
+        )
     write_replay_trace(args.out.expanduser(), sessions)
     summary = build_summary(args, sessions, prefix)
     summary_path = args.out.expanduser().with_suffix(args.out.expanduser().suffix + ".summary.json")

@@ -1,97 +1,162 @@
-# TODO：让 budget–hit 曲线从「台阶」变「平缓斜坡」
+# TODO: H1 新 trace 参数扫实验
 
 ## 目标
-让 `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl` 的 budget–hit 曲线平缓爬升：
-**budget≈0.77 时 hit≈0.5，budget≈0.90 时 hit≈0.9（≈结构天花板）**，中间各档落在 0.6/0.7/0.8 附近。
-当前曲线极陡：0.77 时 hit≈0.42–0.51，到 0.80 直接饱和到 ~0.903，0.80–0.90 全平
-（见 `h1/备份-运行结果/新trace-budget区间0.77-0.90/step3_summary.csv`）。
 
-这是一次 **trace 重标定**（改本目录 `optimize_h0_pressure_trace.py` 的生成参数 + 经验迭代），
-**不改 LPE/LRU 策略代码**，也不改 runner。
+验证 `scripts/README.md` 的新判断：当前失败不是 hot working set 不够，而是
+`budget_ladder` 的容量压力过于集中；继续放大 hot 只会移动陡崖。
 
-## 根因（已定量验证）
-`optimize_h0_pressure_trace.py` 的 `budget_ladder` 结构：prime N 个 hot 前缀 →
-每轮「扫 cold（约 19k token）→ 复测全部 hot」共 3 轮。每轮 hit 取决于 cold 扫描后有多少 hot 前缀在 LRU 里幸存。
+本轮只做 trace 重标定实验：
 
-- hot working set ≈ **9.6k** token（summary `estimated_hot_working_set_tokens`）
-- cold 单轮 ≈ **19k** token（`estimated_cold_scan_tokens_per_round`）
-- KV 容量（Qwen2.5-7B / TP=2 / 11GB×2，budget 直接当 gpu_memory_utilization）粗算：
-  **0.77≈17k token，0.80≈30k，0.90≈71k**
+- 采用 one-factor-at-a-time：每次 trace 只改一个生成参数。
+- 每个参数最多 3 个取值。
+- 不使用 `h1/备份-运行结果/trace生产参数测试` 的备份数据。
+- 不改 LPE/LRU/runner 代码。
 
-只有两个区间、几乎无过渡：0.77 时 cold(19k) 装不下 → hot 全被挤掉（floor）；
-0.80 时 cold+hot≈29k 全部装下 → hot 全幸存（天花板）。台阶卡在 0.77→0.80。
+## 固定基准 F0
 
-**决定 ramp 宽度的唯一关键量：hot working set 的绝对 token 数。**
-ramp 宽度 ≈ hot_working_set_tokens ÷ (每单位 budget 的 KV token 增量)。现在 9.6k 太小 → 压成一个台阶。
-要铺满 0.77→0.90（KV 从 ~17k 到 ~71k，Δ≈54k），需把 hot working set 放大到 **~45–50k token（约 4–5×）**，
-同时保持 cold 扫描大致不变以锚住 0.77 的 floor。hot 前缀数量越多，斜坡颗粒越细。
+先生成一个新基准 trace `F0`。供给参数一次性放宽，避免后续调整
+`scan-hot-objects` 时还要同步改供给参数。
 
-## 方案：只调 trace 生成参数（已有 CLI 旋钮，无需改代码）
+固定生成参数：
 
-第一版参数（v1）：
+| 参数 | 值 |
+|---|---:|
+| `scan-hot-objects` | 90 |
+| `hot-context-words` | 500 |
+| `scan-cold-objects` | 24 |
+| `cold-context-words` | 800 |
+| `scan-probe-rounds` | 3 |
+| `hot-repeats` | 4 |
+| `rag-hot-repeats` | 4 |
+| `random-seed` | 2026 |
+| `sharegpt-groups` | 360 |
+| `hot-ratio` | 0.34 |
+| `rag-requests` | 260 |
+| `rag-hot-ratio` | 0.20 |
 
-| 参数 | 现值 | v1 | 作用 |
-|---|---|---|---|
-| `--scan-hot-objects` | 35 | **70** | hot 前缀更多 → 斜坡颗粒更细、ramp 更宽 |
-| `--hot-context-words` | 300 | **500** | 单个 hot 前缀更大 → 抬高 hot working set |
-| `--sharegpt-groups` | 96 | **200** | 提供足够多 hot/cold 候选对象 |
-| `--hot-ratio` | 0.20 | **0.30** | sharegpt hot≈60 |
-| `--rag-requests` | 128 | **160** | rag hot≈20，凑够 ≥70 hot keys |
-| `--scan-cold-objects` | 24 | **24（保持）** | cold 扫描量不变 → 锚住 0.77 floor≈0.5 |
-| `--cold-context-words` | 800 | **800（保持）** | 同上 |
-| `--scan-probe-rounds` | 3 | **3（保持）** | — |
+所有 trace 写到独立目录，不覆盖默认 trace：
 
-预期：hot working set 9.6k → ~45k（70×~650token），把饱和点从 0.80 顶到 ~0.90；cold 不变，0.77 仍 ramp 下段。
-生成约束已核对可满足（hot keys 80≥70；unique cold 220 ≥ scan-cold-objects×rounds=72；hot 前缀 ≤2048 max_model_len）。
-
-> 生成器对短 session 会按实际长度截断，真实 hot working set 可能 < 估算。
-> **生成后必须读 summary 的 `estimated_hot_working_set_tokens` 与 `estimated_cold_scan_tokens_per_round` 核对**，作为下一轮反馈。
-
-## 执行步骤
-
-**Step 0 — 备份现有 trace**（生成器默认会清理旧 trace）
 ```bash
-cp data/edgekv_traces/sharegpt_hotpotqa_session.jsonl* data/edgekv_traces/备份-实验数据/
+data/edgekv_traces/h1_param_sweep/F0.jsonl
 ```
 
-**Step 1 — 重生成 trace（异步）**
+生成命令模板：
+
 ```bash
 python3 scripts/optimize_h0_pressure_trace.py \
-  --out data/edgekv_traces/sharegpt_hotpotqa_session.jsonl \
-  --sharegpt-groups 200 --hot-ratio 0.30 --hot-repeats 4 \
+  --out data/edgekv_traces/h1_param_sweep/F0.jsonl \
+  --sharegpt-groups 360 --hot-ratio 0.34 --hot-repeats 4 \
   --hot-context-words 500 --cold-context-words 800 \
-  --scan-hot-objects 70 --scan-cold-objects 24 --scan-probe-rounds 3 \
-  --rag-requests 160 --rag-hot-ratio 0.20 --rag-hot-repeats 4
+  --scan-hot-objects 90 --scan-cold-objects 24 --scan-probe-rounds 3 \
+  --rag-requests 260 --rag-hot-ratio 0.20 --rag-hot-repeats 4 \
+  --random-seed 2026
 ```
-生成后读 `*.summary.json` 确认 hot working set ≈ 40–50k、cold/round ≈ 18–20k。
 
-**Step 2 — 跑 6 点 LRU 标定曲线（异步，复用现有脚本）**
+生成后先检查 summary：
+
+- `estimated_hot_working_set_tokens`
+- `estimated_cold_scan_tokens_per_round`
+- `avg_hot_prompt_est_tokens`
+- `avg_cold_prompt_est_tokens`
+
+LRU 标定命令模板：
+
 ```bash
-python3 h1/run_find_interval_2.py --visible-devices 0,1
+python3 h1/run_step3_budget_tiers.py \
+  --tier F0 \
+  --base-out h1/out/trace_param_sweep \
+  --replay-trace data/edgekv_traces/h1_param_sweep/F0.jsonl \
+  --budgets "0.77 0.80 0.83 0.86 0.87 0.88 0.89 0.90" \
+  --policies h1_lru \
+  --no-finalize --keep-cells --force
 ```
-默认粗扫 `0.77/0.80/0.83/0.86/0.88/0.90`，每档 LRU+LPE。
-看 `h1/out/find_interval_2/find_interval_2_report.csv` 的 LRU hit 列，画 budget→hit。
 
-**Step 3 — 经验迭代（2–4 轮，调参规则）**
-- **饱和太早**（如 0.83 就到 0.9）→ hot working set 不够大：`--scan-hot-objects` ↑ 或 `--hot-context-words` ↑。
-- **饱和不到 0.9**（0.90 仍 <0.85）→ 反向略减 hot working set。
-- **0.77 floor 偏高/偏低**（≠0.5）→ 调 cold：偏高则 `--scan-cold-objects`/`--cold-context-words` ↑，偏低则 ↓。
-- **斜坡有跳变** → `--scan-hot-objects` ↑ 增颗粒度。
-每轮只回 Step 1+2。
+实验只跑LRU策略，同一实验的子实验输出放在一个文件夹下，不同实验建立不同文件夹。所有子实验应有总结summary
 
-## 验收标准
-- LRU hit 随 budget **单调非降**，0.77→0.90 至少 4 个中间档可区分（不是两段平台）。
-- budget≈0.77 → hit≈0.5（±0.05）；budget≈0.90 → hit≈0.9（≈该 trace 结构天花板，±0.05）。
-- queue_wait/p95 比例不显著恶化（report 里 `qwait_ratio` 保持 <~0.55，避免饱和区伪信号）。
+## 实验 2: hot 单对象粒度
 
-## 风险 / 注意
-- budget→KV-token 斜率只能经验标定（11GB 卡、引擎 floor≈0.72），v1 数值是起点而非终点，需 2–4 轮迭代。
-- 放大 hot 会抬高结构天花板（可命中请求变多），"0.9" 语义随之微移——以「0.90 档≈饱和」为准，而非固定 0.903。
-- 数据可得性：`--scan-hot-objects 70` 需足够多够长的 sharegpt session；若报「only built N objects」则下调对象数或上调 `--sharegpt-groups`。
-- trace 变大 → replay 变慢，可接受；标定一律后台异步、完成再唤醒。
-- 跑 LPE 对比时启动环境须注入 `EDGEKV_H1_GPU_POLICY`（`run_find_interval_2.py` 已封装，无需手动）。
+只改 `hot-context-words`，其余参数完全等于 `F0`。
 
-## 关键文件
-- `scripts/optimize_h0_pressure_trace.py` — trace 生成器（只调 CLI 参数，不改码）
-- `data/edgekv_traces/sharegpt_hotpotqa_session.jsonl(.summary.json)` — 产物 + 反馈信号
-- `h1/run_find_interval_2.py` → `h1/run_step3_budget_tiers.py` → `h1/run_h1_vllm0110_real.py` — 标定运行链（不改）
+| trace | `hot-context-words` |
+|---|---:|
+| `H500` | 500 |
+| `H425` | 425 |
+| `H350` | 350 |
+
+评估预算：
+
+```text
+0.77 0.80 0.83 0.86 0.87 0.88 0.89 0.90
+```
+
+选择规则：
+
+- 优先选择 `0.77-0.90` 内 distinct LRU hit 档位最多的设置。
+- 要求 `hit@0.90 >= 0.85`。
+
+## 实验 3: hot working set 补偿
+
+在实验 2 的优胜设置上，只改 `scan-hot-objects`。
+
+| trace | `scan-hot-objects` |
+|---|---:|
+| `S90` | 90 |
+| `S100` | 100 |
+| `S110` | 110 |
+
+目的：验证“更小 hot 对象 + 更多对象”是否比单纯放大 hot 更平缓。
+
+选择规则：
+
+- `hit@0.77` 接近 `0.45-0.55`。
+- `hit@0.90` 接近 `0.85-0.95`。
+- 相邻 budget 最大跳变尽量小。
+
+## 实验 4: cold floor 修正
+
+只在需要时调整 cold floor。一次只改一个 cold 参数，优先改
+`scan-cold-objects`。
+
+- 若 `hit@0.77 > 0.55`：测试 `scan-cold-objects=28`。
+- 若 `hit@0.77 < 0.45`：测试 `scan-cold-objects=20`。
+- 若 `scan-cold-objects` 调整过粗，再测试 `cold-context-words`。
+- `cold-context-words` 最多从 `700/800/900` 中选相关的两个方向值。
+- 不同时调整 `scan-cold-objects` 和 `cold-context-words`。
+
+## LRU 验收标准
+
+- `0.77-0.90` 至少 4 个可区分 hit 档位。
+- `hit@0.77 = 0.50 ± 0.05`。
+- `hit@0.90 = 0.90 ± 0.05`。
+- 最大相邻跳变建议 `< 0.20`。
+- 若仍出现一步跳到高平台，判定该参数只移动陡崖。
+- `qwait_ratio < 0.55`，避免系统排队成为主信号。
+
+## 最终候选
+
+只有 LRU 曲线达标后，才跑最终候选的 LRU/LFU/LPE 对比：
+
+```bash
+python3 h1/run_step3_budget_tiers.py \
+  --tier <candidate> \
+  --base-out h1/out/trace_param_sweep_final \
+  --replay-trace data/edgekv_traces/h1_param_sweep/<candidate>.jsonl \
+  --budgets "0.77 0.80 0.83 0.86 0.88 0.90" \
+  --policies h1_lru h1_lfu h1_lpe \
+  --no-finalize --keep-cells --force
+```
+
+最终再看 LPE 相对 LRU/LFU 的 hit rate 与 p95 TTFT 优势。
+
+## 记录要求
+
+- 所有 trace 生成到 `data/edgekv_traces/h1_param_sweep/`。
+- 所有标定输出写到 `h1/out/trace_param_sweep/`。
+- 长任务按异步方式运行，日志写到对应实验目录。
+- 每组完成后汇总 CSV/JSON，再决定下一组参数。
+
+## 下一轮判断
+
+如果以上 OFAT 实验仍只有陡崖移动，下一轮不要继续加大 hot。
+应改生成器访问结构，例如把当前 `budget_ladder` 拆成分段 ladder：
+`cold 小批 -> probe 子集`，让容量压力分层释放。
