@@ -120,6 +120,15 @@ def patch_edgekv_vllm_request_metrics() -> bool:
 _EDGEKV_GPU_STATS: dict[str, int] = {
     'lookup_hits': 0,
     'lookup_misses': 0,
+    # vLLM-native token-level prefix-cache coverage (queries=prompt tokens,
+    # hits=matched/computed tokens). The block-level lookup_hits/lookup_misses
+    # above only count one miss per request (find_longest_cache_hit breaks at the
+    # first divergence), so their ratio is "prefix-match-length efficiency" and is
+    # pinned high by shared leading prefixes. native_hits/native_queries is the
+    # true cache-coverage hit rate and is what hit_rate now reports.
+    'native_queries': 0,
+    'native_hits': 0,
+    'native_requests': 0,
     'touches': 0,
     'cached_blocks': 0,
     'evictions': 0,
@@ -413,7 +422,19 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
     stats: dict[str, Any] = dict(_EDGEKV_GPU_STATS)
     lookups = stats['lookup_hits'] + stats['lookup_misses']
     stats['lookup_total'] = lookups
-    stats['hit_rate'] = (stats['lookup_hits'] / lookups) if lookups else 0.0
+    # Block-level prefix-match-length efficiency (diagnostic only; pinned high by
+    # shared leading prefixes because find_longest_cache_hit counts one miss/req).
+    stats['block_lookup_hit_rate'] = (stats['lookup_hits'] / lookups) if lookups else 0.0
+    # vLLM-native token-level coverage = the true cache hit rate.
+    native_q = stats.get('native_queries', 0)
+    native_h = stats.get('native_hits', 0)
+    stats['native_hit_rate'] = (native_h / native_q) if native_q else 0.0
+    if native_q:
+        stats['hit_rate'] = stats['native_hit_rate']
+        stats['hit_source'] = 'vllm_native_token_coverage'
+    else:
+        stats['hit_rate'] = stats['block_lookup_hit_rate']
+        stats['hit_source'] = 'gpu_prefix_cache_block_lookup'
     stats['policy'] = _edgekv_gpu_policy()
     stats['policy_time_ms_total'] = _EDGEKV_GPU_POLICY_TIME_NS / 1_000_000.0
     stats['policy_time_us_avg'] = (
@@ -1198,7 +1219,41 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     _edgekv_note_reorder_time(start_ns)
 
 
+def _install_edgekv_native_hit_rate_patch() -> None:
+    """Mirror vLLM's native token-level prefix-cache coverage into edgekv stats.
+
+    vLLM only accumulates queries/hits when KVCacheManager.log_stats is on, so we
+    wrap get_computed_blocks and record unconditionally: native_queries += prompt
+    tokens, native_hits += matched (computed) tokens. This is the true cache hit
+    rate, unlike the block-level lookup_hits/misses which break at first divergence.
+    """
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+    except Exception:
+        return
+    if getattr(KVCacheManager, '_edgekv_h1_native_hit_patch_installed', False):
+        return
+    original_get_computed_blocks = KVCacheManager.get_computed_blocks
+
+    def get_computed_blocks(self: Any, request: Any) -> Any:
+        result = original_get_computed_blocks(self, request)
+        if _EDGEKV_GPU_POLICY_ENABLED and getattr(self, 'enable_caching', False):
+            try:
+                num_tokens = int(getattr(request, 'num_tokens', 0) or 0)
+                _, num_new_computed_tokens = result
+                _edgekv_note_gpu_stat('native_queries', num_tokens)
+                _edgekv_note_gpu_stat('native_hits', int(num_new_computed_tokens or 0))
+                _edgekv_note_gpu_stat('native_requests')
+            except Exception:
+                pass
+        return result
+
+    KVCacheManager.get_computed_blocks = get_computed_blocks
+    KVCacheManager._edgekv_h1_native_hit_patch_installed = True
+
+
 def _install_edgekv_gpu_prefix_cache_patch() -> None:
+    _install_edgekv_native_hit_rate_patch()
     try:
         from vllm.v1.core.block_pool import BlockPool
         from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager

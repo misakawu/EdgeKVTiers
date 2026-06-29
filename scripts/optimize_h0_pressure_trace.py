@@ -34,6 +34,10 @@ from run_h0_vllm import (  # noqa: E402
     write_jsonl,
     write_replay_trace,
 )
+from hotqa_jsonl_generation import (  # noqa: E402
+    build_hotqa_hierarchical_sessions,
+    build_hotqa_hierarchical_summary,
+)
 
 
 DEFAULT_OUT = (
@@ -930,6 +934,27 @@ def main() -> None:
         if not args.keep_other_traces:
             removed_old_trace_files = cleanup_old_trace_files(args.out.expanduser(), summary_path)
         summary["removed_old_trace_files"] = removed_old_trace_files
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+
+    if args.source_mode == "hotpotqa":
+        sessions, meta = build_hotqa_hierarchical_sessions(
+            request_count=args.rag_requests,
+            hotpotqa_path=args.hotpotqa_path.expanduser(),
+            download_hotpotqa=args.download_hotpotqa,
+            random_seed=args.random_seed,
+            chunk_words_count=args.rag_hot_chunk_words,
+            max_examples=args.hotpotqa_max_examples,
+            timeout_s=args.timeout_s,
+        )
+        write_jsonl(args.out.expanduser(), sessions)
+        summary_path = args.out.expanduser().with_suffix(args.out.expanduser().suffix + ".summary.json")
+        summary = build_hotqa_hierarchical_summary(args.out.expanduser(), sessions, meta)
+        summary["source_mode"] = args.source_mode
+        summary["removed_old_trace_files"] = []
+        if not args.keep_other_traces:
+            summary["removed_old_trace_files"] = cleanup_old_trace_files(args.out.expanduser(), summary_path)
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return

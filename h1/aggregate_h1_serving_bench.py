@@ -15,6 +15,9 @@ from typing import Any
 INT_STAT_KEYS = (
     'lookup_hits',
     'lookup_misses',
+    'native_queries',
+    'native_hits',
+    'native_requests',
     'touches',
     'cached_blocks',
     'evictions',
@@ -258,12 +261,19 @@ def merge_stats(stats_dir: Path) -> dict[str, Any]:
             c_recomp_p95s.append(float(row.get('c_recomp_ms_p95', 0.0) or 0.0))
 
     lookups = sums['lookup_hits'] + sums['lookup_misses']
+    native_q = sums['native_queries']
+    native_h = sums['native_hits']
+    native_hit_rate = (native_h / native_q) if native_q else 0.0
+    block_hit_rate = (sums['lookup_hits'] / lookups) if lookups else 0.0
     return {
         **sums,
         **{key: round(value, 6) for key, value in float_sums.items()},
         **strings,
         'lookup_total': lookups,
-        'hit_rate': round(sums['lookup_hits'] / lookups, 6) if lookups else 0.0,
+        'native_hit_rate': round(native_hit_rate, 6),
+        'block_lookup_hit_rate': round(block_hit_rate, 6),
+        'hit_rate': round(native_hit_rate if native_q else block_hit_rate, 6),
+        'hit_source': 'vllm_native_token_coverage' if native_q else 'gpu_prefix_cache_block_lookup',
         'avg_p_reuse': round(weighted_p_reuse / sums['lpe_profile_count'], 6)
         if sums['lpe_profile_count'] else 0.0,
         'avg_score': round(weighted_score / sums['lpe_profile_count'], 9)
@@ -325,7 +335,13 @@ def summarize_cell(cell_dir: Path) -> dict[str, Any]:
         'gpu_prefix_cache_lookup_total': stats['lookup_total'],
         'gpu_prefix_cache_lookup_hits': stats['lookup_hits'],
         'gpu_prefix_cache_lookup_misses': stats['lookup_misses'],
+        'gpu_prefix_cache_native_queries': stats.get('native_queries', 0),
+        'gpu_prefix_cache_native_hits': stats.get('native_hits', 0),
+        'gpu_prefix_cache_native_requests': stats.get('native_requests', 0),
+        'native_hit_rate': stats.get('native_hit_rate', 0.0),
+        'block_lookup_hit_rate': stats.get('block_lookup_hit_rate', 0.0),
         'hit_rate': stats['hit_rate'],
+        'hit_source': stats.get('hit_source', 'gpu_prefix_cache_block_lookup'),
         'gpu_prefix_cache_evictions': stats['evictions'],
         'gpu_prefix_cache_cached_blocks': stats['cached_blocks'],
         'gpu_prefix_cache_touches': stats['touches'],

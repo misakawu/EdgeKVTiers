@@ -879,7 +879,12 @@ def run_cell(
         'd4_metrics_available_count': d4_metrics_available_count,
         'd4_metrics_available_ratio': round(d4_metrics_available_count / max(len(valid), 1), 6),
         'hit_rate': round(gpu_hit_rate, 6),
-        'hit_source': 'gpu_prefix_cache_block_lookup',
+        'hit_source': str(gpu_cache_stats.get('hit_source', 'gpu_prefix_cache_block_lookup')),
+        'native_hit_rate': round(float(gpu_cache_stats.get('native_hit_rate', 0.0) or 0.0), 6),
+        'block_lookup_hit_rate': round(float(gpu_cache_stats.get('block_lookup_hit_rate', 0.0) or 0.0), 6),
+        'gpu_prefix_cache_native_queries': int(gpu_cache_stats.get('native_queries', 0) or 0),
+        'gpu_prefix_cache_native_hits': int(gpu_cache_stats.get('native_hits', 0) or 0),
+        'gpu_prefix_cache_native_requests': int(gpu_cache_stats.get('native_requests', 0) or 0),
         'gpu_prefix_cache_lookup_total': gpu_lookup_total,
         'gpu_prefix_cache_lookup_hits': gpu_lookup_hits,
         'gpu_prefix_cache_lookup_misses': int(gpu_cache_stats.get('lookup_misses', 0) or 0),
@@ -973,6 +978,9 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
     int_keys = {
         'lookup_hits',
         'lookup_misses',
+        'native_queries',
+        'native_hits',
+        'native_requests',
         'touches',
         'cached_blocks',
         'evictions',
@@ -1035,7 +1043,18 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
     result.update(sums)
     result.update(float_sums)
     result['lookup_total'] = lookups
-    result['hit_rate'] = (sums['lookup_hits'] / lookups) if lookups else 0.0
+    # Block-level prefix-match-length efficiency (diagnostic only).
+    result['block_lookup_hit_rate'] = (sums['lookup_hits'] / lookups) if lookups else 0.0
+    # vLLM-native token-level coverage = true cache hit rate (preferred).
+    native_q = sums['native_queries']
+    native_h = sums['native_hits']
+    result['native_hit_rate'] = (native_h / native_q) if native_q else 0.0
+    if native_q:
+        result['hit_rate'] = result['native_hit_rate']
+        result['hit_source'] = 'vllm_native_token_coverage'
+    else:
+        result['hit_rate'] = result['block_lookup_hit_rate']
+        result['hit_source'] = 'gpu_prefix_cache_block_lookup'
     result['avg_p_reuse'] = weighted_p_reuse / sums['lpe_profile_count'] if sums['lpe_profile_count'] else 0.0
     result['avg_score'] = weighted_score / sums['lpe_profile_count'] if sums['lpe_profile_count'] else 0.0
     result['policy_time_us_avg'] = (

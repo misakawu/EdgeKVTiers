@@ -49,7 +49,8 @@ PYTHONPATH = ".:h1:h0"
 
 def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
               replay_batch_size: int, replay_trace: Path, hotpotqa_path: str,
-              visible_devices: str, max_num_batched_tokens: int) -> list[str]:
+              visible_devices: str, max_num_batched_tokens: int,
+              max_model_len: int) -> list[str]:
     return [
         "--out", str(cell_dir),
         "--dtype", "float16",
@@ -67,7 +68,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
         "--rag-query-repeats", str(RAG_QUERY_REPEATS),
         "--sharegpt-order", SHAREGPT_ORDER,
         "--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE),
-        "--max-model-len", str(MAX_MODEL_LEN),
+        "--max-model-len", str(max_model_len),
         "--max-tokens", str(MAX_TOKENS),
         "--replay-batch-size", str(replay_batch_size),
         "--max-num-batched-tokens", str(max_num_batched_tokens),
@@ -79,6 +80,7 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
               num_prompts=MAX_REQUESTS, request_rate=0.0, visible_devices=DEVICES,
               replay_trace=REPLAY_TRACE, replay_batch_size=REPLAY_BATCH_SIZE,
               max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+              max_model_len=MAX_MODEL_LEN,
               hotpotqa_path=HOTPOTQA_PATH, no_finalize=False, force=False,
               keep_cells=False) -> Path:
     """Run one tier's budget x policy matrix on the pressure replay trace."""
@@ -116,7 +118,8 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
                 out_dir,
                 visible_devices,
                 cell_args(out_dir, budget, policy, num_prompts, replay_batch_size,
-                          replay_trace, hotpotqa_path, visible_devices, max_num_batched_tokens),
+                          replay_trace, hotpotqa_path, visible_devices,
+                          max_num_batched_tokens, max_model_len),
                 env_overrides,
                 log_file=log_dir / f"{budget}_{policy}.log",
             )
@@ -149,6 +152,7 @@ def main() -> None:
     ap.add_argument("--replay-trace", default=str(REPLAY_TRACE))
     ap.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
     ap.add_argument("--max-num-batched-tokens", type=int, default=MAX_NUM_BATCHED_TOKENS)
+    ap.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
     ap.add_argument("--no-finalize", action="store_true", help="defer summary/cleanup (for repeat)")
     ap.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
@@ -165,6 +169,7 @@ def main() -> None:
         replay_trace=Path(args.replay_trace),
         replay_batch_size=args.replay_batch_size,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_model_len=args.max_model_len,
         hotpotqa_path=args.hotpotqa_path,
         no_finalize=args.no_finalize,
         force=args.force,
