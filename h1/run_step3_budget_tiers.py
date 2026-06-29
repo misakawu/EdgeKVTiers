@@ -142,6 +142,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--visible-devices", default=DEVICES)
     ap.add_argument("--tier", default=TIER)
+    ap.add_argument("--base-out", default=str(BASE_OUT))
     ap.add_argument("--budgets", default=" ".join(BUDGETS))
     ap.add_argument("--policies", default=" ".join(POLICIES))
     ap.add_argument("--num-prompts", type=int, default=MAX_REQUESTS)
@@ -156,6 +157,7 @@ def main() -> None:
 
     run_step3(
         tier=args.tier,
+        base_out=Path(args.base_out),
         budgets=args.budgets.split(),
         policies=args.policies.split(),
         num_prompts=args.num_prompts,
