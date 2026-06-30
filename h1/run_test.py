@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
-"""HotQA ws2 xLRU quick budget sweep.
+"""Pure ShareGPT xLRU quick budget sweep.
 
 Runs one Step3 tier whose budget axis is the five numeric gpu_memory_utilization
 values 0.75 / 0.80 / 0.85 / 0.90 / 0.95. Each budget runs h1_lru once on the
-frozen HotQA ws2 replay trace. This is the quick 1-rep sweep used by
-hotqa生成fix.md after lowering max_model_len to 1024 so the 0.75/0.80 budgets
-can initialize on the local 2x11GiB GPUs.
+pure ShareGPT hot/cold budget_ladder pressure trace produced by
+scripts/optimize_h0_pressure_trace.py --source-mode sharegpt (256 single-turn
+requests: 32 hot objects re-accessed 4x for token-level prefix reuse + 128
+unique cold objects scanned once). Low budgets evict primed hot prefixes during
+each cold scan; higher budgets retain more, raising the prefix-cache hit rate.
+max_model_len stays at 1024 so the 0.75/0.80 budgets can initialize on the local
+2x11GiB GPUs.
+
+Defaults target the ShareGPT trace; pass --replay-trace / --tier / --num-prompts
+to retarget (e.g. to fall back to the frozen HotQA ws2 trace).
 """
 from __future__ import annotations
 
@@ -17,11 +24,13 @@ import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
 POLICIES = ["h1_lru"]
-TIER = "ws2_lru_budget5_maxlen1024"
+TIER = "sharegpt_lru_budget5_maxlen1024"
 # Numeric budgets (gpu_memory_utilization) resolved via float() in resolve_budget;
 # intentionally NOT the named tight/mid/loose buckets.
 BUDGETS = ["0.75", "0.80", "0.85", "0.90", "0.95"]
-REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/hotqa_ws2.jsonl")
+REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt.jsonl")
+# The pure ShareGPT pressure trace holds exactly 256 single-turn requests.
+NUM_PROMPTS = 256
 REPLAY_BATCH_SIZE = 8
 MAX_MODEL_LEN = 1024
 MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN * REPLAY_BATCH_SIZE
@@ -30,14 +39,16 @@ MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN * REPLAY_BATCH_SIZE
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--visible-devices", default=step3.DEVICES)
-    parser.add_argument("--num-prompts", type=int, default=step3.MAX_REQUESTS)
+    parser.add_argument("--num-prompts", type=int, default=NUM_PROMPTS)
+    parser.add_argument("--tier", default=TIER)
+    parser.add_argument("--replay-trace", type=Path, default=REPLAY_TRACE)
     parser.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
-    parser.add_argument("--out-dir", default="hotqa三级trace_有效窗口/run_test_ws2_lru_budget5_maxlen1024")
+    parser.add_argument("--out-dir", default="/run_test")
     args = parser.parse_args()
 
     base_out = OUT_DIR / args.out_dir
     step3.run_step3(
-        tier=TIER,
+        tier=args.tier,
         base_out=base_out,
         budgets=BUDGETS,
         policies=POLICIES,
@@ -45,7 +56,7 @@ def main() -> None:
         visible_devices=args.visible_devices,
         force=args.force,
         keep_cells=True,
-        replay_trace=REPLAY_TRACE,
+        replay_trace=args.replay_trace,
         replay_batch_size=REPLAY_BATCH_SIZE,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         max_model_len=MAX_MODEL_LEN,

@@ -6,6 +6,10 @@ with an object-level marker, hot objects repeat the same marker, and cold
 objects use unique markers. The request order primes hot objects, scans cold
 objects, then probes the hot objects again so retention improves as KV capacity
 increases.
+
+For --source-mode sharegpt, ShareGPT objects are taken in source file order
+from the first usable sessions; the hot/cold and budget-ladder shaping only
+changes replay access order, not candidate selection.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from run_h0_vllm import (  # noqa: E402
     hotpotqa_high_frequency_group_order,
     load_hotpotqa_chunk_groups,
     load_sharegpt_sessions,
+    message_role,
+    message_text,
     write_jsonl,
     write_replay_trace,
 )
@@ -184,14 +190,11 @@ def build_hot_cold_sharegpt_sessions(
 ) -> list[dict[str, Any]]:
     source_sessions = load_sharegpt_sessions(
         sharegpt_path,
-        max_sessions=max(groups * 4, groups),
-        order="longest",
+        max_sessions=groups,
+        order="file",
     )
-    rng = random.Random(random_seed)
-    rng.shuffle(source_sessions)
 
     candidates: list[dict[str, Any]] = []
-    max_context_words = max(hot_context_words, cold_context_words, min_context_words)
     for source in source_sessions:
         if len(candidates) >= groups:
             break
@@ -199,14 +202,12 @@ def build_hot_cold_sharegpt_sessions(
         if not turns:
             continue
         seed_text = str(turns[0].get("user", "")).strip()
-        max_context = bounded_context(seed_text, max_context_words)
-        if len(max_context.split()) < min_context_words:
+        if not seed_text:
             continue
         candidates.append({**source, "seed_text": seed_text})
     if len(candidates) < groups:
         raise RuntimeError(
-            f"only built {len(candidates)} ShareGPT objects with at least "
-            f"{min_context_words} words; requested {groups}"
+            f"only built {len(candidates)} source-order ShareGPT objects; requested {groups}"
         )
 
     hot_count = choose_hot_count(groups, hot_ratio)
@@ -276,6 +277,37 @@ def build_hot_cold_sharegpt_sessions(
     return sessions
 
 
+def build_bounded_flat_sharegpt_prompt(
+    user_text: str,
+    max_prompt_chars: int = 3000,
+    max_prompt_est_tokens: int = 900,
+) -> tuple[str, bool]:
+    prefix = "User: "
+    suffix = "\nAssistant:"
+    raw_text = str(user_text).strip()
+
+    def make_prompt(text: str) -> str:
+        return f"{prefix}{text}{suffix}"
+
+    prompt = make_prompt(raw_text)
+    if len(prompt) <= max_prompt_chars and estimate_tokens(prompt) <= max_prompt_est_tokens:
+        return prompt, False
+
+    lo = 0
+    hi = len(raw_text)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate_text = raw_text[:mid].rstrip()
+        candidate = make_prompt(candidate_text)
+        if len(candidate) <= max_prompt_chars and estimate_tokens(candidate) <= max_prompt_est_tokens:
+            best = candidate_text
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return make_prompt(best), True
+
+
 def build_original_sharegpt_flat_rows(
     sharegpt_path: Path,
     request_count: int,
@@ -322,6 +354,153 @@ def build_original_sharegpt_flat_rows(
             break
     if len(rows) < request_count:
         raise RuntimeError(f"only built {len(rows)} ShareGPT requests; requested {request_count}")
+    return rows
+
+
+def build_sharegpt_all_human_flat_rows(
+    sharegpt_path: Path,
+    request_count: int,
+    order: str,
+) -> list[dict[str, Any]]:
+    if request_count <= 0:
+        return []
+    with sharegpt_path.open("r", encoding="utf-8") as f:
+        raw_rows = json.load(f)
+    if not isinstance(raw_rows, list):
+        raise RuntimeError(f"expected ShareGPT JSON list in {sharegpt_path}")
+
+    candidates: list[tuple[int, dict[str, Any], list[str]]] = []
+    for raw_idx, row in enumerate(raw_rows):
+        if not isinstance(row, dict):
+            continue
+        conversations = row.get("conversations", [])
+        if not isinstance(conversations, list):
+            continue
+        human_texts = [
+            message_text(msg).strip()
+            for msg in conversations
+            if isinstance(msg, dict) and message_role(msg) in {"human", "user"} and message_text(msg).strip()
+        ]
+        if not human_texts:
+            continue
+        candidates.append((raw_idx, row, human_texts))
+
+    if order == "longest":
+        candidates.sort(key=lambda item: sum(len(text) for text in item[2]), reverse=True)
+    elif order != "file":
+        raise ValueError(f"unsupported ShareGPT order: {order}")
+
+    rows: list[dict[str, Any]] = []
+    for raw_idx, row, human_texts in candidates:
+        session_id = str(row.get("id", f"sharegpt_{raw_idx:06d}"))
+        prompt = "\n".join(f"User: {text}" for text in human_texts) + "\nAssistant:"
+        rows.append(
+            {
+                "request_id": f"{session_id}:all_human",
+                "session_id": session_id,
+                "source": "sharegpt",
+                "workload": "sharegpt_original_file_order",
+                "object_type": "sharegpt_session_all_human_prefix",
+                "reuse_key": f"{session_id}:all_human",
+                "turn_index": 0,
+                "source_index": raw_idx,
+                "sharegpt_order": order,
+                "sharegpt_human_merge": "all",
+                "n_human_turns": len(human_texts),
+                "human_turns_merged": True,
+                "prompt": prompt,
+                "prompt_chars": len(prompt),
+                "prompt_est_tokens": estimate_tokens(prompt),
+                "replay_source": "original_sharegpt_random_rag",
+            }
+        )
+        if len(rows) >= request_count:
+            break
+    if len(rows) < request_count:
+        raise RuntimeError(f"only built {len(rows)} ShareGPT requests; requested {request_count}")
+    return rows
+
+
+def build_sharegpt_dialogue_session_rows(
+    sharegpt_path: Path,
+    request_count: int,
+    order: str,
+) -> list[dict[str, Any]]:
+    if request_count <= 0:
+        return []
+    with sharegpt_path.open("r", encoding="utf-8") as f:
+        raw_rows = json.load(f)
+    if not isinstance(raw_rows, list):
+        raise RuntimeError(f"expected ShareGPT JSON list in {sharegpt_path}")
+
+    candidates: list[tuple[int, dict[str, Any], list[str]]] = []
+    for raw_idx, row in enumerate(raw_rows):
+        if not isinstance(row, dict):
+            continue
+        conversations = row.get("conversations", [])
+        if not isinstance(conversations, list):
+            continue
+
+        human_texts: list[str] = []
+        for msg in conversations:
+            if not isinstance(msg, dict):
+                continue
+            role = message_role(msg)
+            text = message_text(msg).strip()
+            if role in {"human", "user"} and text:
+                human_texts.append(text)
+
+        if human_texts:
+            candidates.append((raw_idx, row, human_texts))
+
+    if order == "longest":
+        candidates.sort(
+            key=lambda item: (
+                sum(len(text) for text in item[2]),
+                len(item[2]),
+            ),
+            reverse=True,
+        )
+    elif order != "file":
+        raise ValueError(f"unsupported ShareGPT order: {order}")
+
+    rows: list[dict[str, Any]] = []
+    built_requests = 0
+    for raw_idx, row, human_texts in candidates:
+        remaining = request_count - built_requests
+        if remaining <= 0:
+            break
+        session_id = str(row.get("id", f"sharegpt_{raw_idx:06d}"))
+        n_human_turns = len(human_texts)
+        for turn_index, user_text in enumerate(human_texts[:remaining]):
+            request_id = f"{session_id}:turn:{turn_index:03d}"
+            prompt, prompt_truncated = build_bounded_flat_sharegpt_prompt(user_text)
+            rows.append(
+                {
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "source": "sharegpt",
+                    "workload": "sharegpt_original_file_order",
+                    "object_type": "sharegpt_dialogue_turn",
+                    "reuse_key": request_id,
+                    "source_index": raw_idx,
+                    "turn_index": turn_index,
+                    "sharegpt_order": order,
+                    "sharegpt_human_merge": "session",
+                    "n_human_turns": n_human_turns,
+                    "human_turns_merged": False,
+                    "history_prefix_preserved": False,
+                    "prompt": prompt,
+                    "prompt_chars": len(prompt),
+                    "prompt_est_tokens": estimate_tokens(prompt),
+                    "prompt_truncated_for_maxlen": prompt_truncated,
+                    "replay_source": "original_sharegpt_random_rag",
+                }
+            )
+            built_requests += 1
+
+    if built_requests < request_count:
+        raise RuntimeError(f"only built {built_requests} ShareGPT turn requests; requested {request_count}")
     return rows
 
 
@@ -803,6 +982,11 @@ def build_original_sharegpt_random_rag_summary(
 ) -> dict[str, Any]:
     sharegpt_rows = [row for row in sessions if row.get("source") == "sharegpt"]
     rag_rows = [row for row in sessions if row.get("source") == "hotpotqa"]
+    sharegpt_requests = len(sharegpt_rows)
+    trace_format = "flat_prompt_jsonl"
+    avg_sharegpt_tokens = round(
+        average([int(row["prompt_est_tokens"]) for row in sharegpt_rows]), 2
+    )
     rag_groups_used = len({row.get("rag_group_index") for row in rag_rows})
     rag_total_group_count = int(rag_rows[0].get("rag_total_group_count", rag_groups_used)) if rag_rows else 0
     rag_hot_group_count = int(rag_rows[0].get("rag_hot_group_count", 0)) if rag_rows else 0
@@ -811,11 +995,17 @@ def build_original_sharegpt_random_rag_summary(
     return {
         "out": str(args.out.expanduser()),
         "reuse_schedule": args.reuse_schedule,
-        "total_requests": len(sessions),
-        "sharegpt_requests": len(sharegpt_rows),
+        "total_requests": sharegpt_requests + len(rag_rows),
+        "sharegpt_sessions": len(sharegpt_rows),
+        "sharegpt_requests": sharegpt_requests,
         "rag_requests": len(rag_rows),
-        "rag_share": round(len(rag_rows) / len(sessions), 6) if sessions else 0.0,
+        "rag_share": round(len(rag_rows) / (sharegpt_requests + len(rag_rows)), 6)
+        if sharegpt_requests + len(rag_rows)
+        else 0.0,
         "sharegpt_order": args.sharegpt_order,
+        "sharegpt_human_merge": args.sharegpt_human_merge,
+        "assistant_text_preserved": args.sharegpt_human_merge not in {"first", "session"},
+        "history_prefix_preserved": args.sharegpt_human_merge == "all",
         "random_seed": args.random_seed,
         "rag_insert_positions": list(rag_positions),
         "rag": {
@@ -830,13 +1020,11 @@ def build_original_sharegpt_random_rag_summary(
             "chunks_per_query": args.rag_chunks_per_query,
             "query_repeats": args.rag_query_repeats,
         },
-        "avg_sharegpt_prompt_est_tokens": round(
-            average([int(row["prompt_est_tokens"]) for row in sharegpt_rows]), 2
-        ),
+        "avg_sharegpt_prompt_est_tokens": avg_sharegpt_tokens,
         "avg_rag_prompt_est_tokens": round(
             average([int(row["prompt_est_tokens"]) for row in rag_rows]), 2
         ),
-        "trace_format": "flat_prompt_jsonl",
+        "trace_format": trace_format,
         "expected_behavior": (
             "ShareGPT follows source file order while HotpotQA/RAG requests are inserted at "
             "deterministic random slots; the first 20% of RAG chunk groups account for about "
@@ -879,6 +1067,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-requests", type=positive_int, default=1024)
     parser.add_argument("--rag-share", type=bounded_ratio, default=0.20)
     parser.add_argument("--sharegpt-order", choices=("file", "longest"), default="file")
+    parser.add_argument("--sharegpt-human-merge", choices=("first", "all", "session"), default="first")
     parser.add_argument("--rag-chunk-words", type=positive_int, default=56)
     parser.add_argument("--rag-chunks-per-query", type=positive_int, default=2)
     parser.add_argument("--rag-query-repeats", type=positive_int, default=4)
@@ -907,7 +1096,13 @@ def main() -> None:
         rag_requests = int(round(args.total_requests * args.rag_share))
         rag_requests = min(args.total_requests, max(0, rag_requests))
         sharegpt_requests = args.total_requests - rag_requests
-        sharegpt_rows = build_original_sharegpt_flat_rows(
+        if args.sharegpt_human_merge == "session":
+            sharegpt_builder = build_sharegpt_dialogue_session_rows
+        elif args.sharegpt_human_merge == "all":
+            sharegpt_builder = build_sharegpt_all_human_flat_rows
+        else:
+            sharegpt_builder = build_original_sharegpt_flat_rows
+        sharegpt_rows = sharegpt_builder(
             args.sharegpt_path.expanduser(),
             sharegpt_requests,
             args.sharegpt_order,
