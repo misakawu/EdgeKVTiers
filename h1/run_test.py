@@ -23,11 +23,13 @@ from pathlib import Path
 import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
-POLICIES = ["h1_lru"]
+# POLICIES = ["h1_lru"]
+POLICIES = ["h1_lpe"]
 TIER = "sharegpt_lru_budget5_maxlen1024"
 # Numeric budgets (gpu_memory_utilization) resolved via float() in resolve_budget;
 # intentionally NOT the named tight/mid/loose buckets.
-BUDGETS = ["0.75", "0.80", "0.85", "0.90", "0.95"]
+# BUDGETS = ["0.75", "0.80", "0.85", "0.90", "0.95"]
+BUDGETS = ["0.75", "0.825", "0.95"]
 REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt.jsonl")
 # The pure ShareGPT pressure trace holds exactly 256 single-turn requests.
 NUM_PROMPTS = 256
