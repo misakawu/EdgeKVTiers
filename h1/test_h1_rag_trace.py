@@ -264,11 +264,17 @@ def test_sitecustomize_infers_prefix_repetition_object_without_extra_args() -> N
         assert n_tokens == 4
 
         profile = sitecustomize._edgekv_profile_from_values(object_id, object_type, n_tokens)
-        assert profile["size_mb"] == 0.0
+        # No vLLM group registered -> logical size falls back to mu_kv * n_tokens
+        # and is used as the (stable) score denominator; resident size is 0.
+        assert profile["logical_size_mb"] == 0.25 * 4
+        assert profile["size_mb"] == profile["logical_size_mb"]
+        assert profile["resident_size_mb"] == 0.0
         assert profile["size_bytes"] == 0
-        assert profile["size_source"] == "not_available_trace_only"
+        assert profile["score_size_source"] == "fallback_theoretical_mu_kv"
         assert profile["c_recomp_ms"] == 0.48
-        assert profile["score"] == 0.0
+        assert profile["score"] == (
+            profile["p_reuse"] * profile["c_recomp_ms"] / profile["logical_size_mb"]
+        )
     finally:
         for key, value in old_env.items():
             if value is None:
@@ -303,14 +309,28 @@ def test_sitecustomize_resident_size_uses_vllm_page_size_bytes() -> None:
     assert profile["resident_block_count"] == 2
     assert profile["resident_block_count_by_group"] == {0: 2}
     assert profile["size_bytes"] == 2 * Spec.page_size_bytes
-    assert profile["size_mb"] == (2 * Spec.page_size_bytes) / 1024 / 1024
-    assert profile["size_source"] == "vllm_kv_cache_spec_page_size_bytes"
-    assert profile["score"] == profile["p_reuse"] * profile["c_recomp_ms"] / profile["size_mb"]
+    # resident_size_mb is diagnostic and tracks resident block bytes.
+    assert profile["resident_size_mb"] == (2 * Spec.page_size_bytes) / 1024 / 1024
+    # logical (score) size is stable: n_tokens * per-token KV bytes from vLLM.
+    bytes_per_token = Spec.page_size_bytes / Spec.block_size
+    assert profile["bytes_per_token"] == bytes_per_token
+    assert profile["logical_size_mb"] == 128 * bytes_per_token / 1024 / 1024
+    assert profile["size_mb"] == profile["logical_size_mb"]
+    assert profile["score_size_source"] == "vllm_kv_cache_spec_bytes_per_token"
+    assert profile["score"] == (
+        profile["p_reuse"] * profile["c_recomp_ms"] / profile["logical_size_mb"]
+    )
+    score_before = profile["score"]
 
     removed = sitecustomize._edgekv_drop_block_object(pool, 0, 7)
     assert removed == "obj-a"
     assert profile["resident_block_count"] == 1
     assert profile["size_bytes"] == Spec.page_size_bytes
+    # resident_size_mb halves with the dropped block, but the logical score is
+    # unchanged -- the score no longer inflates as resident blocks shrink.
+    assert profile["resident_size_mb"] == Spec.page_size_bytes / 1024 / 1024
+    assert profile["logical_size_mb"] == 128 * bytes_per_token / 1024 / 1024
+    assert profile["score"] == score_before
 
 
 def test_sitecustomize_resident_size_updates_incrementally_on_reassign() -> None:
@@ -504,6 +524,213 @@ def test_sitecustomize_reorder_records_candidate_window(monkeypatch) -> None:
     assert stats["free_queue_reorder_blocks"] == 3
     assert stats["free_queue_reorder_window"] == 3
     assert stats["queue_reorders"] == 1
+
+
+def _make_faithful_queue(sitecustomize, block_ids):
+    """Build a faithful mini vLLM FreeKVCacheBlockQueue seeded with block_ids."""
+
+    class Block:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+            self.is_null = False
+            self.prev_free_block = None
+            self.next_free_block = None
+
+    class Queue:
+        def __init__(self) -> None:
+            self.fake_free_list_head = Block(-1)
+            self.fake_free_list_tail = Block(-1)
+            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+            self.num_free_blocks = 0
+            self.append_n([Block(bid) for bid in block_ids])
+
+        def get_all_free_blocks(self):
+            out = []
+            node = self.fake_free_list_head.next_free_block
+            while node is not None and node.next_free_block is not None:
+                out.append(node)
+                node = node.next_free_block
+            return out
+
+        def remove(self, block):
+            block.prev_free_block.next_free_block = block.next_free_block
+            block.next_free_block.prev_free_block = block.prev_free_block
+            block.prev_free_block = block.next_free_block = None
+            self.num_free_blocks -= 1
+
+        def append_n(self, blocks):
+            last = self.fake_free_list_tail.prev_free_block
+            for block in blocks:
+                block.prev_free_block = last
+                last.next_free_block = block
+                last = block
+            last.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = last
+            self.num_free_blocks += len(blocks)
+
+    return Queue()
+
+
+def test_sitecustomize_object_admission_marks_low_score_reject() -> None:
+    sitecustomize = load_h1_sitecustomize()
+    sitecustomize.reset_edgekv_gpu_cache_stats()
+
+    class Spec:
+        block_size = 16
+        page_size_bytes = 1600
+
+    class Pool:
+        pass
+
+    pool = Pool()
+    sitecustomize._edgekv_init_pool_state(pool)
+    sitecustomize._edgekv_register_kv_cache_group(0, Spec())
+
+    high = sitecustomize._edgekv_profile_from_values(
+        "obj-high", "prefix", 16, {"p_reuse": 0.9, "c_recomp_ms": 100.0}
+    )
+    sitecustomize._edgekv_set_block_object(pool, 0, 1, "obj-high")
+    # Empty cache -> the first resident object is admitted.
+    assert sitecustomize._edgekv_evaluate_object_admission(high, False) == "accept"
+
+    low = sitecustomize._edgekv_profile_from_values(
+        "obj-low", "prefix", 16, {"p_reuse": 0.1, "c_recomp_ms": 1.0}
+    )
+    sitecustomize._edgekv_set_block_object(pool, 0, 2, "obj-low")
+    assert low["score"] < high["score"]
+
+    decision = sitecustomize._edgekv_evaluate_object_admission(low, False)
+    assert decision == "reject"
+    assert low["admission_decision"] == "reject"
+    assert low["admission_rejected"] is True
+    assert low["admission_seq"] >= 1
+    assert low["admission_min_resident_score"] == high["score"]
+
+    # Diagnostic reject must NOT drop the object's cached blocks.
+    assert low["resident_block_count"] == 1
+    assert sitecustomize._edgekv_block_profile(pool, 2) is low
+
+    # A second decision on the same object is a no-op (decided once).
+    assert sitecustomize._edgekv_evaluate_object_admission(low, False) is None
+
+    stats = sitecustomize.get_edgekv_gpu_cache_stats()
+    assert stats["admission_rejection_count"] == 1
+    assert stats["admission_accept_count"] == 1
+    assert stats["admission_mode"] == "diagnostic"
+
+
+def test_sitecustomize_pinned_object_never_ranked_as_victim(monkeypatch) -> None:
+    sitecustomize = load_h1_sitecustomize()
+    sitecustomize.reset_edgekv_gpu_cache_stats()
+    monkeypatch.setattr(sitecustomize, "_EDGEKV_GPU_POLICY_VALUE", "h1_lpe")
+
+    class Spec:
+        block_size = 16
+        page_size_bytes = 1600
+
+    class Pool:
+        pass
+
+    pool = Pool()
+    sitecustomize._edgekv_init_pool_state(pool)
+    sitecustomize._edgekv_register_kv_cache_group(0, Spec())
+    sitecustomize._edgekv_profile_from_values(
+        "obj-a", "prefix", 16, {"p_reuse": 0.1, "c_recomp_ms": 1.0}
+    )
+    sitecustomize._edgekv_set_block_object(pool, 0, 5, "obj-a")
+
+    normal_rank = sitecustomize._edgekv_rank_tuple(pool, 5)
+    assert normal_rank[0] != float("inf")
+
+    pool._edgekv_h1_pinned.add(5)
+    pinned_rank = sitecustomize._edgekv_rank_tuple(pool, 5)
+    assert pinned_rank[0] == float("inf")
+    # A pinned block ranks strictly after any finite-score block, so the
+    # lowest-first eviction reorder never selects it as a victim.
+    assert pinned_rank > normal_rank
+
+
+def test_sitecustomize_object_rank_evicts_rejected_before_accepted(monkeypatch) -> None:
+    sitecustomize = load_h1_sitecustomize()
+    sitecustomize.reset_edgekv_gpu_cache_stats()
+    monkeypatch.setattr(sitecustomize, "_EDGEKV_GPU_POLICY_VALUE", "h1_lpe")
+
+    class Spec:
+        block_size = 16
+        page_size_bytes = 1600
+
+    class Pool:
+        pass
+
+    pool = Pool()
+    sitecustomize._edgekv_init_pool_state(pool)
+    sitecustomize._edgekv_register_kv_cache_group(0, Spec())
+
+    meta = {"p_reuse": 0.5, "c_recomp_ms": 10.0}
+    accepted = sitecustomize._edgekv_profile_from_values("obj-acc", "prefix", 16, meta)
+    rejected = sitecustomize._edgekv_profile_from_values("obj-rej", "prefix", 16, meta)
+    sitecustomize._edgekv_set_block_object(pool, 0, 10, "obj-acc")
+    sitecustomize._edgekv_set_block_object(pool, 0, 11, "obj-rej")
+
+    # Same score, but one object is logically rejected.
+    assert accepted["score"] == rejected["score"]
+    rejected["admission_rejected"] = True
+
+    rank_accepted = sitecustomize._edgekv_rank_tuple(pool, 10)
+    rank_rejected = sitecustomize._edgekv_rank_tuple(pool, 11)
+    assert rank_accepted[0] == rank_rejected[0]
+    # At equal score the rejected object sorts first (evicted first).
+    assert rank_rejected < rank_accepted
+    assert rank_rejected[1] == 0
+    assert rank_accepted[1] == 1
+
+
+def test_sitecustomize_object_level_reorder_groups_blocks(monkeypatch) -> None:
+    sitecustomize = load_h1_sitecustomize()
+    sitecustomize.reset_edgekv_gpu_cache_stats()
+    monkeypatch.setattr(sitecustomize, "_EDGEKV_GPU_POLICY_ENABLED", True)
+    monkeypatch.setattr(sitecustomize, "_EDGEKV_GPU_POLICY_VALUE", "h1_lpe")
+    monkeypatch.setattr(sitecustomize, "_EDGEKV_GPU_POLICY_IS_LPE", True)
+    monkeypatch.setenv("H1_LPE_LIGHT_PATH", "0")
+    monkeypatch.setenv("H1_LPE_REORDER_MODE", "window")
+    monkeypatch.setenv("H1_LPE_REORDER_WINDOW", "16")
+
+    class Spec:
+        block_size = 16
+        page_size_bytes = 1600
+
+    class Pool:
+        enable_caching = True
+
+    pool = Pool()
+    sitecustomize._edgekv_init_pool_state(pool)
+    sitecustomize._edgekv_register_kv_cache_group(0, Spec())
+
+    # Interleave two objects' blocks in the free queue: A owns {1,3}, B {2,4}.
+    # A has the lower object score, so both A blocks must move to the front as a
+    # contiguous group, ahead of B's contiguous group.
+    pool.free_block_queue = _make_faithful_queue(sitecustomize, [1, 2, 3, 4])
+    sitecustomize._edgekv_profile_from_values(
+        "obj-a", "prefix", 16, {"p_reuse": 0.1, "c_recomp_ms": 1.0}
+    )
+    sitecustomize._edgekv_profile_from_values(
+        "obj-b", "prefix", 16, {"p_reuse": 0.9, "c_recomp_ms": 100.0}
+    )
+    sitecustomize._edgekv_set_block_object(pool, 0, 1, "obj-a")
+    sitecustomize._edgekv_set_block_object(pool, 0, 3, "obj-a")
+    sitecustomize._edgekv_set_block_object(pool, 0, 2, "obj-b")
+    sitecustomize._edgekv_set_block_object(pool, 0, 4, "obj-b")
+
+    sitecustomize._edgekv_reorder_free_queue(pool, num_blocks=1)
+
+    order = [block.block_id for block in pool.free_block_queue.get_all_free_blocks()]
+    pos = {bid: idx for idx, bid in enumerate(order)}
+    # Each object's blocks are contiguous...
+    assert abs(pos[1] - pos[3]) == 1
+    assert abs(pos[2] - pos[4]) == 1
+    # ...and the low-score object A is ranked ahead of B.
+    assert max(pos[1], pos[3]) < min(pos[2], pos[4])
 
 
 def test_cop_profiler_updates_reuse_and_score() -> None:

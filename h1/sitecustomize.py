@@ -138,7 +138,12 @@ _EDGEKV_GPU_STATS: dict[str, int] = {
     'free_queue_reorder_skipped': 0,
     'free_queue_reorder_window': 0,
     'admissions': 0,
+    # Object-level diagnostic admission (first version): a logical accept/reject
+    # decision that does NOT block vLLM's native caching. admission_rejections
+    # counts objects whose first-touch score was <= the lowest resident object
+    # score; admission_accepts counts the rest.
     'admission_rejections': 0,
+    'admission_accepts': 0,
     'evict_high_reuse': 0,
     'evict_drop': 0,
     'evicted_score_count': 0,
@@ -176,6 +181,7 @@ _EDGEKV_GPU_POLICY_TIME_NS = 0
 _EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
 _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
 _EDGEKV_LPE_MONITOR_SEQ = 0
+_EDGEKV_LPE_ADMISSION_SEQ = 0
 _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
 _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
 _EDGEKV_ENV_FLOAT_CACHE: dict[tuple[str, float], tuple[str | None, float]] = {}
@@ -277,6 +283,11 @@ def _edgekv_record_lpe_monitor(
             'p_reuse': float(profile.get('p_reuse', 0.0) or 0.0),
             'score': float(profile.get('score', 0.0) or 0.0),
             'size_mb': float(profile.get('size_mb', 0.0) or 0.0),
+            'logical_size_mb': float(profile.get('logical_size_mb', 0.0) or 0.0),
+            'resident_size_mb': float(profile.get('resident_size_mb', 0.0) or 0.0),
+            'score_size_source': str(profile.get('score_size_source', 'unknown')),
+            'admission_decision': str(profile.get('admission_decision', '') or ''),
+            'admission_rejected': bool(profile.get('admission_rejected', False)),
             'resident_block_count': int(profile.get('resident_block_count', 0) or 0),
             'access_count': int(profile.get('access_count', 0) or 0),
             'hit_count': int(profile.get('hit_count', 0) or 0),
@@ -349,7 +360,7 @@ def _edgekv_note_reorder_time(start_ns: int) -> None:
 
 def reset_edgekv_gpu_cache_stats() -> None:
     global _EDGEKV_GPU_STATS_UPDATES, _EDGEKV_GPU_POLICY_TIME_NS, _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
-    global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS, _EDGEKV_LPE_MONITOR_SEQ
+    global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS, _EDGEKV_LPE_MONITOR_SEQ, _EDGEKV_LPE_ADMISSION_SEQ
     global _EDGEKV_GPU_EVICTED_SCORE_TOTAL, _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL
     for key in _EDGEKV_GPU_STATS:
         _EDGEKV_GPU_STATS[key] = 0
@@ -363,6 +374,7 @@ def reset_edgekv_gpu_cache_stats() -> None:
     _EDGEKV_GPU_EVICTION_DECISION_TIME_NS = 0
     _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
     _EDGEKV_LPE_MONITOR_SEQ = 0
+    _EDGEKV_LPE_ADMISSION_SEQ = 0
     _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
     _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
     _EDGEKV_ENV_FLOAT_CACHE.clear()
@@ -500,6 +512,27 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
         stats['cop_resident_size_mb_total'] / len(profiles) if profiles else 0.0
     )
     stats['cop_resident_block_count_total'] = resident_blocks
+    # Logical (score-denominator) vs resident (diagnostic) size aggregates, so a
+    # reader can confirm the score is no longer inflated by residual blocks.
+    logical_sizes = [float(profile.get('logical_size_mb', 0.0) or 0.0) for profile in profiles]
+    resident_sizes = [float(profile.get('resident_size_mb', 0.0) or 0.0) for profile in profiles]
+    stats['cop_logical_size_mb_total'] = sum(logical_sizes)
+    stats['cop_logical_size_mb_avg'] = (sum(logical_sizes) / len(profiles)) if profiles else 0.0
+    stats['cop_resident_size_mb_from_profiles_total'] = sum(resident_sizes)
+    score_size_source_counts: dict[str, int] = {}
+    for profile in profiles:
+        source = str(profile.get('score_size_source', 'unknown') or 'unknown')
+        score_size_source_counts[source] = score_size_source_counts.get(source, 0) + 1
+    stats['score_size_source_counts'] = dict(sorted(score_size_source_counts.items()))
+    # Object-level diagnostic admission summary (first version).
+    stats['admission_mode'] = _edgekv_admission_mode()
+    stats['admission_accept_count'] = int(stats.get('admission_accepts', 0) or 0)
+    stats['admission_rejection_count'] = int(stats.get('admission_rejections', 0) or 0)
+    admission_decisions = int(stats['admission_accept_count'] + stats['admission_rejection_count'])
+    stats['admission_decision_count'] = admission_decisions
+    stats['admission_rejection_rate'] = (
+        stats['admission_rejection_count'] / admission_decisions if admission_decisions else 0.0
+    )
     stats['kv_cache_group_count'] = len(_EDGEKV_GPU_GROUP_PAGE_BYTES)
     stats['kv_cache_page_size_bytes_min'] = min(page_sizes) if page_sizes else 0
     stats['kv_cache_page_size_bytes_max'] = max(page_sizes) if page_sizes else 0
@@ -515,9 +548,16 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
                 'c_recomp_ms': float(profile.get('c_recomp_ms', 0.0) or 0.0),
                 'size_bytes': int(profile.get('size_bytes', 0) or 0),
                 'size_mb': float(profile.get('size_mb', 0.0) or 0.0),
+                'logical_size_mb': float(profile.get('logical_size_mb', 0.0) or 0.0),
+                'resident_size_mb': float(profile.get('resident_size_mb', 0.0) or 0.0),
+                'bytes_per_token': float(profile.get('bytes_per_token', 0.0) or 0.0),
                 'resident_block_count': int(profile.get('resident_block_count', 0) or 0),
                 'resident_block_count_by_group': dict(profile.get('resident_block_count_by_group', {}) or {}),
                 'size_source': str(profile.get('size_source', 'unknown')),
+                'score_size_source': str(profile.get('score_size_source', 'unknown')),
+                'admission_decision': str(profile.get('admission_decision', '') or ''),
+                'admission_rejected': bool(profile.get('admission_rejected', False)),
+                'admission_min_resident_score': profile.get('admission_min_resident_score', ''),
             }
             for object_id, profile in _EDGEKV_GPU_LPE_PROFILES.items()
         }
@@ -569,13 +609,40 @@ def _edgekv_block_key(kv_cache_group_id: int, block_id: int) -> tuple[int, int]:
     return (int(kv_cache_group_id), int(block_id))
 
 
-def _edgekv_rank_tuple(pool: Any, block_id: int) -> tuple[float, int, int]:
+def _edgekv_object_sort_key(object_id: str) -> int:
+    """Stable per-object integer key so an object's blocks sort contiguously.
+
+    Object-level eviction (h1_lpe) ranks every block by its owning object's
+    score. Two distinct objects can share the same score; without a per-object
+    tiebreaker their blocks would interleave by block_id and never form a
+    contiguous eviction group. Hashing the object_id gives a deterministic,
+    object-stable key that keeps each object's blocks adjacent in rank order.
+    """
+    digest = hashlib.sha1(str(object_id).encode('utf-8')).hexdigest()[:12]
+    return int(digest, 16)
+
+
+def _edgekv_rank_tuple(pool: Any, block_id: int) -> tuple[float, ...]:
     policy = _EDGEKV_GPU_POLICY_VALUE
     recency = int(getattr(pool, '_edgekv_h1_recency', {}).get(block_id, 0))
     if policy == 'h1_lfu':
         return (float(getattr(pool, '_edgekv_h1_freq', {}).get(block_id, 0)), recency, block_id)
     if policy == 'h1_lpe':
-        return (float(getattr(pool, '_edgekv_h1_scores', {}).get(block_id, 0.0)), recency, block_id)
+        # Object-level rank: a block inherits its owning object's score so an
+        # entire object evicts as one contiguous group. Lower score sorts first
+        # (evicted first); at equal score a logically-rejected object sorts
+        # before an accepted one; pinned objects sink to the back and are never
+        # chosen as a victim.
+        if block_id in getattr(pool, '_edgekv_h1_pinned', set()):
+            return (float('inf'), 1, 0)
+        profile = _edgekv_block_profile(pool, block_id)
+        if profile is None:
+            score = float(getattr(pool, '_edgekv_h1_scores', {}).get(block_id, 0.0) or 0.0)
+            return (score, 1, block_id)
+        score = float(profile.get('score', 0.0) or 0.0)
+        rejected_order = 0 if profile.get('admission_rejected') else 1
+        object_key = int(profile.get('object_sort_key') or _edgekv_object_sort_key(profile.get('object_id', '')))
+        return (score, rejected_order, object_key)
     return (float(recency), 0, block_id)
 
 
@@ -587,7 +654,13 @@ def _edgekv_heap_touch_block(pool: Any, block: Any) -> None:
     pool._edgekv_h1_blocks[block_id] = block
     version = int(pool._edgekv_h1_rank_version.get(block_id, 0) or 0) + 1
     pool._edgekv_h1_rank_version[block_id] = version
-    heapq.heappush(pool._edgekv_h1_rank_heap, (*_edgekv_rank_tuple(pool, block_id), version))
+    # Heap item = (rank_tuple, version, block_id). rank_tuple is opaque and may
+    # vary in length by policy (LPE is object-level); keeping block_id out of the
+    # rank tuple lets it be the final identity/tiebreak field uniformly.
+    heapq.heappush(
+        pool._edgekv_h1_rank_heap,
+        (_edgekv_rank_tuple(pool, block_id), version, block_id),
+    )
     pool._edgekv_h1_queue_dirty = True
 
 
@@ -598,8 +671,8 @@ def _edgekv_heap_drop_block(pool: Any, block_id: int) -> None:
     pool._edgekv_h1_blocks.pop(int(block_id), None)
 
 
-def _edgekv_heap_valid_block(pool: Any, item: tuple[float, int, int, int]) -> Any | None:
-    _score, _recency, block_id, version = item
+def _edgekv_heap_valid_block(pool: Any, item: tuple[Any, int, int]) -> Any | None:
+    _rank_tuple, version, block_id = item
     if int(getattr(pool, '_edgekv_h1_rank_version', {}).get(block_id, -1)) != int(version):
         return None
     block = getattr(pool, '_edgekv_h1_blocks', {}).get(block_id)
@@ -745,21 +818,31 @@ def _edgekv_profile_from_values(
         {
             'object_id': object_id,
             'object_type': object_type or 'unknown',
+            'object_sort_key': _edgekv_object_sort_key(object_id),
             'n_tokens': n_tokens,
             'p_reuse': initial_p_reuse,
             'p_reuse_prior': p_reuse_prior if p_reuse_prior is not None else '',
             'c_recomp_ms': c_recomp_ms,
             'c_restore_ms': c_restore_ms,
             'risk_exp': risk_exp,
+            'bytes_per_token': 0.0,
             'size_bytes': 0,
             'size_mb': 0.0,
             'size_source': 'not_available_trace_only',
+            'logical_size_mb': 0.0,
+            'resident_size_mb': 0.0,
+            'resident_size_source': 'not_available_trace_only',
+            'score_size_source': 'fallback_theoretical_mu_kv',
             'resident_block_count': 0,
             'resident_block_count_by_group': {},
             'score': 0.0,
             'access_count': 0,
             'hit_count': 0,
             'score_update_seq': 0,
+            'admission_decision': '',
+            'admission_rejected': False,
+            'admission_seq': 0,
+            'admission_min_resident_score': '',
         },
     )
     profile.update(
@@ -794,24 +877,50 @@ def _edgekv_profile_from_meta(meta: dict[str, Any], block_size: int) -> dict[str
     )
 
 
+def _edgekv_group_bytes_per_token(group_id: int) -> float:
+    page = int(_EDGEKV_GPU_GROUP_PAGE_BYTES.get(int(group_id), 0) or 0)
+    block_size = int(_EDGEKV_GPU_GROUP_BLOCK_SIZE.get(int(group_id), 0) or 0)
+    if page > 0 and block_size > 0:
+        return float(page) / float(block_size)
+    return 0.0
+
+
 def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
-    size_mb = float(profile.get('size_mb', 0.0) or 0.0)
-    if size_mb <= 0.0:
-        n_tokens = max(float(profile.get('n_tokens', 1) or 1), 1.0)
-        size_mb = _edgekv_env_float('EDGEKV_MU_KV_MB_PER_TOKEN', 0.12) * n_tokens
-        profile['size_mb'] = size_mb
-        profile['size_source'] = 'fallback_theoretical'
+    """Recompute the LPE score using the object's *logical* KV size.
+
+    The score denominator is the object's logical size (a stable quantity
+    derived from its token count), NOT the current resident block bytes. Using
+    resident bytes let a low resident_block_count (e.g. 1 leftover block after
+    partial eviction) shrink the denominator and inflate the score by orders of
+    magnitude. resident_size_mb is kept for diagnostics and to size object-level
+    eviction groups, but never divides the score.
+    """
+    n_tokens = max(float(profile.get('n_tokens', 1) or 1), 1.0)
+    bytes_per_token = float(profile.get('bytes_per_token', 0.0) or 0.0)
+    if bytes_per_token > 0.0:
+        logical_size_mb = (n_tokens * bytes_per_token) / 1024.0 / 1024.0
+        score_size_source = 'vllm_kv_cache_spec_bytes_per_token'
     else:
-        profile['size_source'] = str(
-            profile.get('size_source') or 'vllm_kv_cache_spec_page_size_bytes'
-        )
-    if size_mb <= 0.0:
+        logical_size_mb = _edgekv_env_float('EDGEKV_MU_KV_MB_PER_TOKEN', 0.12) * n_tokens
+        score_size_source = 'fallback_theoretical_mu_kv'
+    profile['logical_size_mb'] = logical_size_mb
+    profile['score_size_source'] = score_size_source
+
+    resident_bytes = int(profile.get('size_bytes', 0) or 0)
+    profile['resident_size_mb'] = float(resident_bytes) / 1024.0 / 1024.0
+
+    # size_mb / size_source now mirror the logical (score) size so any legacy
+    # reader of size_mb sees the value that actually divides the score.
+    profile['size_mb'] = logical_size_mb
+    profile['size_source'] = score_size_source
+
+    if logical_size_mb <= 0.0:
         profile['score'] = 0.0
         return
     profile['score'] = (
         float(profile.get('p_reuse', 0.5))
         * float(profile.get('c_recomp_ms', 0.0))
-        / max(size_mb, 1e-9)
+        / max(logical_size_mb, 1e-9)
     )
 
 
@@ -932,11 +1041,18 @@ def _edgekv_refresh_object_resident_profile(object_id: str) -> None:
     profile['resident_block_count'] = sum(group_counts.values())
     profile['resident_block_count_by_group'] = dict(sorted(group_counts.items()))
     profile['size_bytes'] = int(size_bytes)
-    profile['size_mb'] = float(size_bytes) / 1024.0 / 1024.0
-    profile['size_source'] = (
+    profile['resident_size_source'] = (
         'vllm_kv_cache_spec_page_size_bytes'
         if size_bytes > 0 else 'vllm_kv_cache_spec_page_size_bytes_empty'
     )
+    # Ground the logical size in vLLM's real per-token KV bytes once we know a
+    # group the object lives in; falls back to the theoretical mu_kv otherwise.
+    if float(profile.get('bytes_per_token', 0.0) or 0.0) <= 0.0:
+        for gid in group_counts:
+            bytes_per_token = _edgekv_group_bytes_per_token(gid)
+            if bytes_per_token > 0.0:
+                profile['bytes_per_token'] = bytes_per_token
+                break
     _edgekv_recompute_profile_score(profile)
 
 
@@ -1011,6 +1127,73 @@ def _edgekv_block_profile(
     if object_id is None:
         object_id = _EDGEKV_GPU_BLOCK_ID_OBJECT_HINTS.get(int(block_id))
     return _EDGEKV_GPU_LPE_PROFILES.get(str(object_id)) if object_id is not None else None
+
+
+def _edgekv_admission_mode() -> str:
+    """Object-level admission mode. First version only implements 'diagnostic'.
+
+    diagnostic: compute accept/reject but never block vLLM's native caching.
+    strict: reserved for the second version (skip/shorten native caching for
+    rejected objects); treated as diagnostic here so the flag is inert until the
+    strict path is deliberately built and gated on its own.
+    """
+    value = os.environ.get('H1_LPE_ADMISSION_MODE', 'diagnostic').strip().lower() or 'diagnostic'
+    return 'strict' if value == 'strict' else 'diagnostic'
+
+
+def _edgekv_min_resident_object_score(exclude_object_id: str | None = None) -> float | None:
+    """Lowest score among currently-resident objects (blocks still in cache).
+
+    Excludes ``exclude_object_id`` (the admission candidate) so a new object is
+    compared against the other residents rather than against itself. Returns
+    None when the cache holds no other resident object.
+    """
+    min_score: float | None = None
+    for object_id, profile in _EDGEKV_GPU_LPE_PROFILES.items():
+        if exclude_object_id is not None and object_id == exclude_object_id:
+            continue
+        if int(profile.get('resident_block_count', 0) or 0) <= 0:
+            continue
+        score = float(profile.get('score', 0.0) or 0.0)
+        if min_score is None or score < min_score:
+            min_score = score
+    return min_score
+
+
+def _edgekv_evaluate_object_admission(
+    profile: dict[str, Any],
+    pinned: bool,
+) -> str | None:
+    """Object-level diagnostic admission decision (first version).
+
+    Decides once per object on its first admission: accept if the new object's
+    score exceeds the lowest resident object score (or the cache is empty, or
+    the object is pinned), otherwise reject. The decision is purely diagnostic —
+    it never prevents vLLM from caching the blocks; it only tags the profile and
+    biases object-level eviction (rejected objects evict first at equal score).
+    """
+    if profile is None or profile.get('admission_decision'):
+        return None
+    global _EDGEKV_LPE_ADMISSION_SEQ
+    _EDGEKV_LPE_ADMISSION_SEQ += 1
+    object_id = str(profile.get('object_id', ''))
+    new_score = float(profile.get('score', 0.0) or 0.0)
+    min_resident = _edgekv_min_resident_object_score(exclude_object_id=object_id)
+    if pinned or min_resident is None or new_score > min_resident:
+        decision = 'accept'
+    else:
+        decision = 'reject'
+    profile['admission_decision'] = decision
+    profile['admission_seq'] = _EDGEKV_LPE_ADMISSION_SEQ
+    profile['admission_min_resident_score'] = (
+        float(min_resident) if min_resident is not None else ''
+    )
+    profile['admission_rejected'] = (decision == 'reject')
+    if decision == 'reject':
+        _edgekv_note_gpu_stat('admission_rejections')
+    else:
+        _edgekv_note_gpu_stat('admission_accepts')
+    return decision
 
 
 def _edgekv_free_queue_length(queue: Any) -> int:
@@ -1112,12 +1295,12 @@ def _edgekv_compact_rank_heap(pool: Any) -> None:
     """
     versions = getattr(pool, '_edgekv_h1_rank_version', {})
     blocks = getattr(pool, '_edgekv_h1_blocks', {})
-    new_heap: list[tuple[float, int, int, int]] = []
+    new_heap: list[tuple[Any, int, int]] = []
     for block_id, version in versions.items():
         block = blocks.get(block_id)
         if block is None or getattr(block, 'is_null', False):
             continue
-        new_heap.append((*_edgekv_rank_tuple(pool, block_id), int(version)))
+        new_heap.append((_edgekv_rank_tuple(pool, block_id), int(version), int(block_id)))
     heapq.heapify(new_heap)
     pool._edgekv_h1_rank_heap = new_heap
 
@@ -1376,6 +1559,9 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         _edgekv_init_pool_state(self)
         meta = _edgekv_request_meta(request)
         pinned = bool(meta.get('is_pinned', False))
+        # object_id -> blocks admitted in this call, used after the loop to run
+        # the object-level diagnostic admission decision once per new object.
+        admission_object_blocks: dict[str, list[Any]] = {}
         cached_lpe_prefix_profile: dict[str, Any] | None = None
         cached_lpe_prefix_id = ''
         prefix_len = _edgekv_env_int('H1_PREFIX_REPETITION_PREFIX_LEN', 0) if _EDGEKV_GPU_POLICY_IS_LPE else 0
@@ -1414,6 +1600,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                 if object_id:
                     _edgekv_set_block_object(self, kv_cache_group_id, block_id, object_id)
                 if profile is not None:
+                    admission_object_blocks.setdefault(object_id, []).append(block)
                     score = float(profile.get('score', score) or score)
                     p_reuse = float(profile.get('p_reuse', p_reuse) or p_reuse)
                     self._edgekv_h1_p_reuse[block_id] = p_reuse
@@ -1441,6 +1628,33 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                 score=score,
                 p_reuse=p_reuse,
             )
+        # Object-level diagnostic admission: decide once per newly admitted
+        # object. Never blocks vLLM caching (first version); a reject only tags
+        # the profile and re-touches the object's blocks so the rejected object
+        # sinks ahead of equal-score accepted objects in the eviction order.
+        if _EDGEKV_GPU_POLICY_IS_LPE and admission_object_blocks:
+            for object_id, object_blocks in admission_object_blocks.items():
+                profile = _EDGEKV_GPU_LPE_PROFILES.get(object_id)
+                if profile is None:
+                    continue
+                decision = _edgekv_evaluate_object_admission(profile, pinned)
+                if decision is None:
+                    continue
+                if decision == 'reject':
+                    for block in object_blocks:
+                        if not getattr(block, 'is_null', False):
+                            _edgekv_heap_touch_block(self, block)
+                _edgekv_record_lpe_monitor(
+                    'admit_accept' if decision == 'accept' else 'admit_reject',
+                    profile=profile,
+                    hit=False,
+                    admission_mode=_edgekv_admission_mode(),
+                    admission_decision=decision,
+                    admission_seq=int(profile.get('admission_seq', 0) or 0),
+                    admission_min_resident_score=profile.get('admission_min_resident_score', ''),
+                    admission_block_count=len(object_blocks),
+                    pinned=pinned,
+                )
         _edgekv_note_policy_time(start_ns)
 
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:

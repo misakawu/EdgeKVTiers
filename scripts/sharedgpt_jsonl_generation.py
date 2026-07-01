@@ -45,11 +45,11 @@ DEFAULT_OUT = (
     / "source_ablation"
     / "sharedgpt.jsonl"
 )
-DEFAULT_REQUESTS = 768
+DEFAULT_REQUESTS = 1536
 DEFAULT_RANDOM_SEED = 2026
 DEFAULT_HOT_POOL_SIZE = 1
-DEFAULT_WARM_POOL_SIZE = 200
-DEFAULT_ZIPF_S = 1.0
+DEFAULT_WARM_POOL_SIZE = 300
+DEFAULT_ZIPF_S = 0.8
 DEFAULT_TAIL_WORDS = 8
 DEFAULT_CHUNK_WORDS = 240
 DEFAULT_MIN_CHUNK_WORDS = 240
@@ -98,6 +98,13 @@ def percentile(values: Sequence[int], pct: float) -> float:
         return float(data[lo])
     weight = pos - lo
     return data[lo] * (1.0 - weight) + data[hi] * weight
+
+
+def coverage_at_counts(counts: Sequence[int], top_n: int) -> float:
+    total = sum(counts)
+    if total <= 0:
+        return 0.0
+    return sum(sorted(counts, reverse=True)[:top_n]) / total
 
 
 def normalize_text(text: str) -> str:
@@ -346,6 +353,24 @@ def build_sharegpt_hierarchical_summary(
     for rank in warm_ranks:
         key = str(rank)
         warm_rank_histogram[key] = warm_rank_histogram.get(key, 0) + 1
+    warm_counts_by_id: dict[str, int] = {}
+    warm_reuse_distances: list[int] = []
+    last_seen_warm: dict[str, int] = {}
+    for index, row in enumerate(sessions):
+        for warm_id in row.get("warm_prefix_ids", []):
+            warm_key = str(warm_id)
+            warm_counts_by_id[warm_key] = warm_counts_by_id.get(warm_key, 0) + 1
+            previous_index = last_seen_warm.get(warm_key)
+            if previous_index is not None:
+                warm_reuse_distances.append(index - previous_index)
+            last_seen_warm[warm_key] = index
+    warm_counts = list(warm_counts_by_id.values())
+    estimated_hot_warm_words = 0
+    if sessions:
+        first_prefixes = sessions[0].get("prefixes", [])
+        estimated_hot_warm_words = sum(
+            int(prefix.get("context_words", 0)) for prefix in first_prefixes[:2]
+        )
     return {
         "out": str(out_path),
         "source": "sharegpt",
@@ -367,6 +392,13 @@ def build_sharegpt_hierarchical_summary(
             "warm": len({cid for row in sessions for cid in row.get("warm_prefix_ids", [])}),
         },
         "warm_unique_used": len({cid for row in sessions for cid in row.get("warm_prefix_ids", [])}),
+        "warm_top32_coverage": round(coverage_at_counts(warm_counts, 32), 6),
+        "warm_top48_coverage": round(coverage_at_counts(warm_counts, 48), 6),
+        "warm_top64_coverage": round(coverage_at_counts(warm_counts, 64), 6),
+        "warm_reuse_distance_p50": round(percentile(warm_reuse_distances, 50), 2),
+        "warm_reuse_distance_p90": round(percentile(warm_reuse_distances, 90), 2),
+        "warm_reuse_distance_p95": round(percentile(warm_reuse_distances, 95), 2),
+        "estimated_hot_warm_words": estimated_hot_warm_words,
         "warm_zipf_rank_top10": {
             str(rank): warm_rank_histogram.get(str(rank), 0) for rank in range(10)
         },
