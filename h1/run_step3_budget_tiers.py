@@ -13,6 +13,7 @@ All configuration lives in the CONFIG block below; no env vars are required.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import _runner as R
@@ -125,6 +126,14 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
             )
             if rc != 0:
                 raise RuntimeError(f"real replay cell failed (rc={rc}): {out_dir}")
+            if summary_json.exists():
+                try:
+                    summary = json.loads(summary_json.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(f"cannot read real replay summary: {summary_json}") from exc
+                if summary.get("ok") is False:
+                    err = summary.get("error", "summary marked ok=false")
+                    raise RuntimeError(f"real replay cell failed: {out_dir}: {err}")
     R.log(f"[step3] done tier={tier}")
 
     if no_finalize:
