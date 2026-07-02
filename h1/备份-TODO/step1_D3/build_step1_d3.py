@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Build Step1 D3 artifacts from object-level COP records (path A).
+"""根据对象级 COP 记录构建 Step1 D3 产物（路径 A）。
 
-Data source = ``run_h1_vllm0110_real.py`` per-request CSV rows whose
-``score_source == 'object_level_cop'``. Those rows carry ``c_recomp_ms /
-p_reuse / score / size_mb`` computed by the COP module (``edgekv_cop.py``,
-``COPProfiler.update_from_item`` -> ``ObjectProfile.recompute`` /
-``estimate_reuse``), NOT the in-process block-level sitecustomize profiles.
+数据源是 ``run_h1_vllm0110_real.py`` 请求级 CSV 中
+``score_source == 'object_level_cop'`` 的行。这些行携带由 COP 模块
+（``edgekv_cop.py``，``COPProfiler.update_from_item`` ->
+``ObjectProfile.recompute`` / ``estimate_reuse``）计算出的 ``c_recomp_ms /
+p_reuse / score / size_mb``，而不是进程内 sitecustomize 的块级 profile。
 
-This makes the three D3 deliverables (c_recomp vs n, score histogram, p_reuse
-histogram) reflect the designed COP Algorithm 1 (00_预实验提取 §6.2), object
-granularity. Engine eviction itself is still vLLM prefix-cache block level; that
-fact is reported from the run summary, not recomputed here.
+这使三个 D3 产物（c_recomp vs n、score 直方图、p_reuse 直方图）反映设计中的
+对象粒度 COP Algorithm 1（00_预实验提取 §6.2）。Engine 驱逐本身仍是 vLLM
+前缀缓存块级；该事实来自 run summary，而不是在这里重新计算。
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STEP_DIR = ROOT / "h1" / "step1_D3"
 DEFAULT_RUNTIME = STEP_DIR / "runtime"
 OUT = STEP_DIR / "out"
-# (bucket label, gpu_memory_utilization) — run_h1_vllm0110_real named budgets.
+# (bucket 标签, gpu_memory_utilization) — run_h1_vllm0110_real 命名预算。
 BUCKETS = [("tight", "0.720"), ("mid", "0.735")]
 COP_CSV_GLOB = "*_h1_lpe_requests.csv"
 COP_SUMMARY_GLOB = "*_h1_lpe_summary.json"

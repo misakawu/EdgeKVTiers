@@ -1,4 +1,4 @@
-"""Local runtime patches for EdgeKVTiers experiment processes."""
+"""EdgeKVTiers 实验进程的本地运行时补丁。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,11 @@ _ORIGINAL_LOGGER_ERROR = logging.Logger.error
 
 
 def _edgekv_logger_error(self: logging.Logger, msg: object, *args: object, **kwargs: object) -> None:
-    """Downgrade vLLM FA2 probing noise on pre-Ampere GPUs.
+    """降低 pre-Ampere GPU 上 vLLM FA2 探测噪声的日志级别。
 
-    RTX 2080 Ti (SM 7.5) cannot use FlashAttention-2, but vLLM still probes it
-    before selecting the configured Triton backend. The probe logs at ERROR even
-    when execution can continue, which trips the H1 runner's fail-fast monitor.
+    RTX 2080 Ti（SM 7.5）不能使用 FlashAttention-2，但 vLLM 在选择已配置的
+    Triton backend 之前仍会探测它。即使执行可以继续，该探测也会写 ERROR 日志，
+    从而触发 H1 runner 的 fail-fast 监控。
     """
     if (
         self.name == 'vllm.attention.utils.fa_utils'
@@ -66,12 +66,11 @@ except Exception:
 
 
 def patch_edgekv_vllm_request_metrics() -> bool:
-    """Expose vLLM v1 per-request timing stats on RequestOutput.metrics.
+    """把 vLLM v1 请求级时间统计暴露到 RequestOutput.metrics。
 
-    vLLM 0.11 keeps RequestStateStats for logging/tracing, but the offline
-    LLMEngine path does not pass those stats into RequestOutput. The experiment
-    runner reads RequestOutput.metrics, so attach a compatible RequestMetrics
-    object after vLLM builds each output.
+    vLLM 0.11 会为日志/追踪保留 RequestStateStats，但 offline LLMEngine 路径不会
+    把这些统计传入 RequestOutput。实验 runner 读取 RequestOutput.metrics，因此在
+    vLLM 构造每个输出后挂上兼容的 RequestMetrics 对象。
     """
     try:
         from vllm.sequence import RequestMetrics
@@ -120,12 +119,11 @@ def patch_edgekv_vllm_request_metrics() -> bool:
 _EDGEKV_GPU_STATS: dict[str, int] = {
     'lookup_hits': 0,
     'lookup_misses': 0,
-    # vLLM-native token-level prefix-cache coverage (queries=prompt tokens,
-    # hits=matched/computed tokens). The block-level lookup_hits/lookup_misses
-    # above only count one miss per request (find_longest_cache_hit breaks at the
-    # first divergence), so their ratio is "prefix-match-length efficiency" and is
-    # pinned high by shared leading prefixes. native_hits/native_queries is the
-    # true cache-coverage hit rate and is what hit_rate now reports.
+    # vLLM 原生 token 级前缀缓存覆盖率（queries=prompt tokens，
+    # hits=已匹配/已计算 tokens）。上面的块级 lookup_hits/lookup_misses
+    # 每个请求只计一次 miss（find_longest_cache_hit 在首次分叉处停止），因此其比值是
+    # “前缀匹配长度效率”，会被共享前导前缀推高。native_hits/native_queries 才是真实
+    # 缓存覆盖命中率，也是现在 hit_rate 报告的值。
     'native_queries': 0,
     'native_hits': 0,
     'native_requests': 0,
@@ -138,10 +136,9 @@ _EDGEKV_GPU_STATS: dict[str, int] = {
     'free_queue_reorder_skipped': 0,
     'free_queue_reorder_window': 0,
     'admissions': 0,
-    # Object-level diagnostic admission (first version): a logical accept/reject
-    # decision that does NOT block vLLM's native caching. admission_rejections
-    # counts objects whose first-touch score was <= the lowest resident object
-    # score; admission_accepts counts the rest.
+    # 对象级诊断准入（第一版）：逻辑上的接受/拒绝决策，不会阻止 vLLM 原生缓存。
+    # admission_rejections 统计首次触碰 score <= 最低驻留对象 score 的对象；
+    # admission_accepts 统计其余对象。
     'admission_rejections': 0,
     'admission_accepts': 0,
     'evict_high_reuse': 0,
@@ -166,9 +163,9 @@ _EDGEKV_GPU_POLICY_VALUE = os.environ.get('EDGEKV_H1_GPU_POLICY', 'vllm_default'
 _EDGEKV_GPU_POLICY_ENABLED = _EDGEKV_GPU_POLICY_VALUE in {'h1_lru', 'h1_lfu', 'h1_lpe'}
 _EDGEKV_GPU_POLICY_IS_LPE = _EDGEKV_GPU_POLICY_VALUE == 'h1_lpe'
 _EDGEKV_GPU_POLICY_IS_LRU = _EDGEKV_GPU_POLICY_VALUE == 'h1_lru'
-# Only LFU/LPE need per-block ranking state (freq/recency/scores) and free-queue
-# reordering. Native vLLM free-queue order already equals LRU eviction order, so
-# h1_lru keeps only the diagnostic counters and skips the per-access bookkeeping.
+# 只有 LFU/LPE 需要块级排序状态（freq/recency/scores）和 free-queue 重排。
+# vLLM 原生 free-queue 顺序已经等价于 LRU 驱逐顺序，因此 h1_lru 只保留诊断计数器，
+# 跳过每次访问的状态维护。
 _EDGEKV_GPU_POLICY_NEEDS_RANK_STATE = _EDGEKV_GPU_POLICY_VALUE in {'h1_lfu', 'h1_lpe'}
 _EDGEKV_GPU_PROFILE_POLICY_TIME = os.environ.get('EDGEKV_H1_PROFILE_POLICY_TIME', '1').strip().lower() not in {
     '',
@@ -434,10 +431,10 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
     stats: dict[str, Any] = dict(_EDGEKV_GPU_STATS)
     lookups = stats['lookup_hits'] + stats['lookup_misses']
     stats['lookup_total'] = lookups
-    # Block-level prefix-match-length efficiency (diagnostic only; pinned high by
-    # shared leading prefixes because find_longest_cache_hit counts one miss/req).
+    # 块级前缀匹配长度效率（仅诊断；由于 find_longest_cache_hit 每请求只记一次 miss，
+    # 该值会被共享前导前缀推高）。
     stats['block_lookup_hit_rate'] = (stats['lookup_hits'] / lookups) if lookups else 0.0
-    # vLLM-native token-level coverage = the true cache hit rate.
+    # vLLM 原生 token 级覆盖率 = 真实缓存命中率。
     native_q = stats.get('native_queries', 0)
     native_h = stats.get('native_hits', 0)
     stats['native_hit_rate'] = (native_h / native_q) if native_q else 0.0
@@ -512,8 +509,8 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
         stats['cop_resident_size_mb_total'] / len(profiles) if profiles else 0.0
     )
     stats['cop_resident_block_count_total'] = resident_blocks
-    # Logical (score-denominator) vs resident (diagnostic) size aggregates, so a
-    # reader can confirm the score is no longer inflated by residual blocks.
+    # 逻辑大小（score 分母）与驻留大小（诊断用途）的聚合值，方便读者确认 score 不再
+    # 被残留块虚高。
     logical_sizes = [float(profile.get('logical_size_mb', 0.0) or 0.0) for profile in profiles]
     resident_sizes = [float(profile.get('resident_size_mb', 0.0) or 0.0) for profile in profiles]
     stats['cop_logical_size_mb_total'] = sum(logical_sizes)
@@ -524,7 +521,7 @@ def get_edgekv_gpu_cache_stats() -> dict[str, Any]:
         source = str(profile.get('score_size_source', 'unknown') or 'unknown')
         score_size_source_counts[source] = score_size_source_counts.get(source, 0) + 1
     stats['score_size_source_counts'] = dict(sorted(score_size_source_counts.items()))
-    # Object-level diagnostic admission summary (first version).
+    # 对象级诊断准入摘要（第一版）。
     stats['admission_mode'] = _edgekv_admission_mode()
     stats['admission_accept_count'] = int(stats.get('admission_accepts', 0) or 0)
     stats['admission_rejection_count'] = int(stats.get('admission_rejections', 0) or 0)
@@ -610,13 +607,12 @@ def _edgekv_block_key(kv_cache_group_id: int, block_id: int) -> tuple[int, int]:
 
 
 def _edgekv_object_sort_key(object_id: str) -> int:
-    """Stable per-object integer key so an object's blocks sort contiguously.
+    """生成稳定的对象级整数 key，使同一对象的块在排序中保持连续。
 
-    Object-level eviction (h1_lpe) ranks every block by its owning object's
-    score. Two distinct objects can share the same score; without a per-object
-    tiebreaker their blocks would interleave by block_id and never form a
-    contiguous eviction group. Hashing the object_id gives a deterministic,
-    object-stable key that keeps each object's blocks adjacent in rank order.
+    对象级驱逐（h1_lpe）按所属对象的 score 给每个块排序。两个不同对象可能拥有相同
+    score；如果没有对象级 tie-breaker，它们的块会按 block_id 交错，无法形成连续的
+    驱逐组。对 object_id 做 hash 可得到确定且对象稳定的 key，使同一对象的块在
+    rank 顺序中相邻。
     """
     digest = hashlib.sha1(str(object_id).encode('utf-8')).hexdigest()[:12]
     return int(digest, 16)
@@ -628,11 +624,9 @@ def _edgekv_rank_tuple(pool: Any, block_id: int) -> tuple[float, ...]:
     if policy == 'h1_lfu':
         return (float(getattr(pool, '_edgekv_h1_freq', {}).get(block_id, 0)), recency, block_id)
     if policy == 'h1_lpe':
-        # Object-level rank: a block inherits its owning object's score so an
-        # entire object evicts as one contiguous group. Lower score sorts first
-        # (evicted first); at equal score a logically-rejected object sorts
-        # before an accepted one; pinned objects sink to the back and are never
-        # chosen as a victim.
+        # 对象级 rank：块继承所属对象的 score，使整个对象作为连续组被驱逐。
+        # score 越低排序越靠前（越先驱逐）；score 相等时，逻辑拒绝对象排在已接受对象前；
+        # pinned 对象沉到末尾，永不作为 victim。
         if block_id in getattr(pool, '_edgekv_h1_pinned', set()):
             return (float('inf'), 1, 0)
         profile = _edgekv_block_profile(pool, block_id)
@@ -654,9 +648,9 @@ def _edgekv_heap_touch_block(pool: Any, block: Any) -> None:
     pool._edgekv_h1_blocks[block_id] = block
     version = int(pool._edgekv_h1_rank_version.get(block_id, 0) or 0) + 1
     pool._edgekv_h1_rank_version[block_id] = version
-    # Heap item = (rank_tuple, version, block_id). rank_tuple is opaque and may
-    # vary in length by policy (LPE is object-level); keeping block_id out of the
-    # rank tuple lets it be the final identity/tiebreak field uniformly.
+    # 堆元素 = (rank_tuple, version, block_id)。rank_tuple 不透明，长度可能随策略变化
+    # （LPE 是对象级）；将 block_id 放在 rank tuple 外，可统一作为最终身份/tie-break
+    # 字段。
     heapq.heappush(
         pool._edgekv_h1_rank_heap,
         (_edgekv_rank_tuple(pool, block_id), version, block_id),
@@ -886,14 +880,12 @@ def _edgekv_group_bytes_per_token(group_id: int) -> float:
 
 
 def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
-    """Recompute the LPE score using the object's *logical* KV size.
+    """使用对象的 *逻辑* KV 大小重新计算 LPE score。
 
-    The score denominator is the object's logical size (a stable quantity
-    derived from its token count), NOT the current resident block bytes. Using
-    resident bytes let a low resident_block_count (e.g. 1 leftover block after
-    partial eviction) shrink the denominator and inflate the score by orders of
-    magnitude. resident_size_mb is kept for diagnostics and to size object-level
-    eviction groups, but never divides the score.
+    score 分母是对象的逻辑大小（由 token 数派生的稳定量），不是当前驻留 block 字节数。
+    使用驻留字节会让较低的 resident_block_count（例如部分驱逐后剩下 1 个 block）
+    缩小分母，并让 score 被数量级地放大。resident_size_mb 只保留作诊断和对象级驱逐组
+    尺寸统计，永不参与 score 除法。
     """
     n_tokens = max(float(profile.get('n_tokens', 1) or 1), 1.0)
     bytes_per_token = float(profile.get('bytes_per_token', 0.0) or 0.0)
@@ -909,8 +901,8 @@ def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
     resident_bytes = int(profile.get('size_bytes', 0) or 0)
     profile['resident_size_mb'] = float(resident_bytes) / 1024.0 / 1024.0
 
-    # size_mb / size_source now mirror the logical (score) size so any legacy
-    # reader of size_mb sees the value that actually divides the score.
+    # size_mb / size_source 现在镜像逻辑（score）大小，使任何旧版 size_mb 读取方都能
+    # 看到真正作为 score 分母的值。
     profile['size_mb'] = logical_size_mb
     profile['size_source'] = score_size_source
 
@@ -1045,8 +1037,8 @@ def _edgekv_refresh_object_resident_profile(object_id: str) -> None:
         'vllm_kv_cache_spec_page_size_bytes'
         if size_bytes > 0 else 'vllm_kv_cache_spec_page_size_bytes_empty'
     )
-    # Ground the logical size in vLLM's real per-token KV bytes once we know a
-    # group the object lives in; falls back to the theoretical mu_kv otherwise.
+    # 一旦知道对象所在 group，就用 vLLM 真实的每 token KV 字节数确定逻辑大小；
+    # 否则回退到理论 mu_kv。
     if float(profile.get('bytes_per_token', 0.0) or 0.0) <= 0.0:
         for gid in group_counts:
             bytes_per_token = _edgekv_group_bytes_per_token(gid)
@@ -1130,23 +1122,21 @@ def _edgekv_block_profile(
 
 
 def _edgekv_admission_mode() -> str:
-    """Object-level admission mode. First version only implements 'diagnostic'.
+    """对象级准入模式。第一版只实现 'diagnostic'。
 
-    diagnostic: compute accept/reject but never block vLLM's native caching.
-    strict: reserved for the second version (skip/shorten native caching for
-    rejected objects); treated as diagnostic here so the flag is inert until the
-    strict path is deliberately built and gated on its own.
+    diagnostic：计算接受/拒绝，但永不阻止 vLLM 原生缓存。
+    strict：预留给第二版（对拒绝对象跳过/缩短原生缓存）；这里按 diagnostic 处理，
+    因此在 strict 路径被明确构建并单独加门控之前，该标志不会产生效果。
     """
     value = os.environ.get('H1_LPE_ADMISSION_MODE', 'diagnostic').strip().lower() or 'diagnostic'
     return 'strict' if value == 'strict' else 'diagnostic'
 
 
 def _edgekv_min_resident_object_score(exclude_object_id: str | None = None) -> float | None:
-    """Lowest score among currently-resident objects (blocks still in cache).
+    """当前驻留对象（仍有块在缓存中）的最低 score。
 
-    Excludes ``exclude_object_id`` (the admission candidate) so a new object is
-    compared against the other residents rather than against itself. Returns
-    None when the cache holds no other resident object.
+    排除 ``exclude_object_id``（准入候选），使新对象与其他驻留对象比较，而不是与
+    自己比较。当缓存中没有其他驻留对象时返回 None。
     """
     min_score: float | None = None
     for object_id, profile in _EDGEKV_GPU_LPE_PROFILES.items():
@@ -1164,13 +1154,12 @@ def _edgekv_evaluate_object_admission(
     profile: dict[str, Any],
     pinned: bool,
 ) -> str | None:
-    """Object-level diagnostic admission decision (first version).
+    """对象级诊断准入决策（第一版）。
 
-    Decides once per object on its first admission: accept if the new object's
-    score exceeds the lowest resident object score (or the cache is empty, or
-    the object is pinned), otherwise reject. The decision is purely diagnostic —
-    it never prevents vLLM from caching the blocks; it only tags the profile and
-    biases object-level eviction (rejected objects evict first at equal score).
+    每个对象首次准入时只决策一次：如果新对象 score 高于最低驻留对象 score
+    （或缓存为空，或对象被 pinned）则接受，否则拒绝。该决策纯诊断用途，不会阻止
+    vLLM 缓存 block；它只标记 profile，并影响对象级驱逐排序（相同 score 下拒绝对象
+    先驱逐）。
     """
     if profile is None or profile.get('admission_decision'):
         return None
@@ -1253,12 +1242,11 @@ def _edgekv_queue_pressure(pool: Any, queue: Any, num_blocks: int | None = None)
 
 
 def _edgekv_block_in_free_queue(block: Any) -> bool:
-    """O(1) membership test for vLLM's free-block linked list.
+    """vLLM free-block 链表的 O(1) 成员测试。
 
-    vLLM nulls both link pointers on popleft_n()/remove() and re-links them on
-    append()/append_n(), so a non-null prev+next pair uniquely marks a block as
-    currently resident in the free queue. This lets the reorder validate heap
-    candidates without materializing the whole queue.
+    vLLM 在 popleft_n()/remove() 时清空两个链表指针，并在 append()/append_n() 时
+    重新链接，因此非空的 prev+next 指针对唯一标记一个 block 当前驻留在 free queue
+    中。这让 reorder 能在不物化整个队列的情况下验证 heap 候选。
     """
     return (
         getattr(block, 'prev_free_block', None) is not None
@@ -1267,11 +1255,11 @@ def _edgekv_block_in_free_queue(block: Any) -> bool:
 
 
 def _edgekv_free_queue_head_window(queue: Any, limit: int) -> list[Any]:
-    """Return up to ``limit`` real blocks from the head of the free queue.
+    """从 free queue 头部返回最多 ``limit`` 个真实 block。
 
-    Walks at most ``limit`` nodes (the fake tail has next_free_block=None), so
-    cost is O(limit) regardless of how many blocks are free. Used both to seed
-    still-untracked head blocks into the rank heap and to detect a no-op move.
+    最多遍历 ``limit`` 个节点（fake tail 的 next_free_block=None），因此无论 free block
+    总数多少，成本都是 O(limit)。它既用于把尚未追踪的头部 block 放入 rank heap，
+    也用于检测 no-op move。
     """
     head = getattr(queue, 'fake_free_list_head', None)
     if head is None or limit <= 0:
@@ -1286,12 +1274,11 @@ def _edgekv_free_queue_head_window(queue: Any, limit: int) -> list[Any]:
 
 
 def _edgekv_compact_rank_heap(pool: Any) -> None:
-    """Rebuild the rank heap from live versions, dropping stale lazy entries.
+    """用 live version 重建 rank heap，丢弃陈旧的 lazy entry。
 
-    Every touch/cache/free pushes a fresh heap entry without removing the old
-    one, so the heap grows with access count. Periodic compaction keeps heappop
-    cost bounded by the number of tracked (resident) blocks rather than by total
-    load, which is what keeps reorder latency flat as throughput rises.
+    每次 touch/cache/free 都会推入新的 heap entry，而不会删除旧 entry，因此 heap 会随
+    访问次数增长。周期性压缩将 heappop 成本限制在被追踪（驻留）block 数量内，而不是
+    总负载内，从而在吞吐上升时保持 reorder 延迟平稳。
     """
     versions = getattr(pool, '_edgekv_h1_rank_version', {})
     blocks = getattr(pool, '_edgekv_h1_blocks', {})
@@ -1325,13 +1312,12 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     window_size = max(base_window, requested * 4)
     select_count = free_count if mode == 'full' else min(window_size, free_count)
 
-    # Incremental selection (D2): the rank heap is kept up to date on every
-    # cache/touch/free/evict, so the reorder never scans the whole free queue.
-    # We read only the O(select_count) head window -- to seed any head blocks
-    # not yet in the heap (e.g. pristine blocks never touched) and to detect a
-    # no-op -- then pop the lowest-rank candidates straight from the heap.
-    # Total cost is O(select_count + stale_pops) per call, independent of how
-    # many blocks are free, replacing the previous O(num_free) full re-scan.
+    # 增量选择（D2）：rank heap 会在每次 cache/touch/free/evict 时保持更新，因此
+    # reorder 不再扫描整个 free queue。这里只读取 O(select_count) 的头部窗口，用于把
+    # 尚未进入 heap 的头部 block（例如从未触碰的原始 block）放入 heap，并检测 no-op；
+    # 随后直接从 heap 弹出最低 rank 候选。每次调用总成本为
+    # O(select_count + stale_pops)，与 free block 总数无关，替代之前的 O(num_free)
+    # 全量重扫。
     head_window = _edgekv_free_queue_head_window(queue, select_count)
     for block in head_window:
         block_id = _edgekv_block_id(block)
@@ -1339,7 +1325,7 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
         if block_id not in pool._edgekv_h1_rank_version:
             _edgekv_heap_touch_block(pool, block)
 
-    # Keep the lazy-deletion heap from bloating with stale entries as load rises.
+    # 随负载上升，避免 lazy-deletion heap 被陈旧 entry 膨胀。
     compact_floor = max(_edgekv_env_int('H1_LPE_HEAP_COMPACT_MIN', 1024), 2)
     if len(pool._edgekv_h1_rank_heap) > max(compact_floor, 4 * len(pool._edgekv_h1_rank_version)):
         _edgekv_compact_rank_heap(pool)
@@ -1371,8 +1357,7 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
                 hit=None,
             )
     if len(selected) < 2:
-        # Heap held no usable free candidates; re-push what we popped and bail
-        # without falling back to a full-queue scan.
+        # Heap 没有可用 free 候选；把已弹出的元素推回后直接返回，不回退到全队列扫描。
         for block in selected:
             _edgekv_heap_touch_block(pool, block)
         _edgekv_note_gpu_stat('free_queue_reorder_skipped')
@@ -1403,12 +1388,12 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
 
 
 def _install_edgekv_native_hit_rate_patch() -> None:
-    """Mirror vLLM's native token-level prefix-cache coverage into edgekv stats.
+    """把 vLLM 原生 token 级前缀缓存覆盖率镜像到 edgekv stats。
 
-    vLLM only accumulates queries/hits when KVCacheManager.log_stats is on, so we
-    wrap get_computed_blocks and record unconditionally: native_queries += prompt
-    tokens, native_hits += matched (computed) tokens. This is the true cache hit
-    rate, unlike the block-level lookup_hits/misses which break at first divergence.
+    vLLM 只在 KVCacheManager.log_stats 开启时累积 queries/hits，因此这里包装
+    get_computed_blocks 并无条件记录：native_queries += prompt tokens，
+    native_hits += matched（computed）tokens。这是真实缓存命中率，不同于在首次分叉处
+    停止的块级 lookup_hits/misses。
     """
     try:
         from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -1547,8 +1532,8 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         )
         start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
         if not _edgekv_gpu_policy_needs_rank_state():
-            # h1_lru: native free-queue order already encodes LRU; only keep the
-            # admission/cached_blocks diagnostics, skip per-block ranking state.
+            # h1_lru：原生 free-queue 顺序已经编码 LRU；只保留
+            # admission/cached_blocks 诊断，跳过块级 rank 状态。
             for block in new_full_blocks:
                 if getattr(block, 'is_null', False):
                     continue
@@ -1559,8 +1544,8 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         _edgekv_init_pool_state(self)
         meta = _edgekv_request_meta(request)
         pinned = bool(meta.get('is_pinned', False))
-        # object_id -> blocks admitted in this call, used after the loop to run
-        # the object-level diagnostic admission decision once per new object.
+        # object_id -> 本次调用准入的 block；循环后用于对每个新对象运行一次对象级诊断
+        # 准入决策。
         admission_object_blocks: dict[str, list[Any]] = {}
         cached_lpe_prefix_profile: dict[str, Any] | None = None
         cached_lpe_prefix_id = ''
@@ -1628,10 +1613,9 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                 score=score,
                 p_reuse=p_reuse,
             )
-        # Object-level diagnostic admission: decide once per newly admitted
-        # object. Never blocks vLLM caching (first version); a reject only tags
-        # the profile and re-touches the object's blocks so the rejected object
-        # sinks ahead of equal-score accepted objects in the eviction order.
+        # 对象级诊断准入：每个新准入对象只决策一次。第一版永不阻止 vLLM 缓存；
+        # reject 只标记 profile 并重新 touch 该对象的 block，使被拒绝对象在相同 score
+        # 下排在已接受对象前面。
         if _EDGEKV_GPU_POLICY_IS_LPE and admission_object_blocks:
             for object_id, object_blocks in admission_object_blocks.items():
                 profile = _EDGEKV_GPU_LPE_PROFILES.get(object_id)
@@ -1671,7 +1655,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
         start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
         _edgekv_note_gpu_stat('evictions')
         if not _edgekv_gpu_policy_needs_rank_state():
-            # h1_lru: only the eviction counter is needed for diagnostics.
+            # h1_lru：诊断只需要 eviction 计数器。
             _edgekv_note_policy_time(start_ns)
             return evicted
         _edgekv_init_pool_state(self)
@@ -1765,9 +1749,8 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
     def free_blocks(self: Any, ordered_blocks: Any) -> None:
         needs_state = _edgekv_gpu_policy_needs_rank_state()
         if needs_state:
-            # ordered_blocks may be a one-shot iterator (e.g. reversed(...));
-            # materialize it so both the original call and our touch loop see
-            # the full block list.
+            # ordered_blocks 可能是一次性迭代器（例如 reversed(...)）；先物化，确保原始调用
+            # 和我们的 touch 循环都能看到完整 block 列表。
             ordered_blocks = list(ordered_blocks)
         original_free_blocks(self, ordered_blocks)
         if needs_state:

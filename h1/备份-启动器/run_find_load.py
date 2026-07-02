@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
 """H1 第二步「旋钮2：去饱和」负载扫描器（接续 run_find_interval 的发现）。
 
 背景：在 3× RTX 2080 Ti（11GB）上，Qwen2.5-7B + TP=2 的低 budget 档无法启动，budget
@@ -37,7 +37,7 @@ from run_find_interval import (
     _read_cell_metrics,
 )
 
-# ----------------------------------------------------------------------------- CONFIG
+# ----------------------------------------------------------------------------- 配置
 BASE_OUT = Path("h1/out/find_load")
 BUDGET = "0.735"                          # 固定在引擎可启动的档；最新实测 hit 仍偏高，需要后续调 workload
 POLICIES = ["h1_lru", "h1_lpe"]          # 每档跑这两个；lru 为窗口判定参考

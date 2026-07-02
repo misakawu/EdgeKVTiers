@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Validate H1 D3 diagnostics from EdgeKV GPU stats JSON files.
+"""根据 EdgeKV GPU stats JSON 文件验证 H1 D3 诊断。
 
-Checks the three D3 questions from H1_复盘与重跑配置单:
-1. c_recomp is linear in n_tokens.
-2. eviction granularity is vLLM prefix-cache block level.
-3. score and p_reuse distributions/correlation show the expected degeneration.
+检查 H1_复盘与重跑配置单 中的三个 D3 问题：
+1. c_recomp 是否与 n_tokens 线性相关。
+2. 驱逐粒度是否为 vLLM 前缀缓存块级别。
+3. score 与 p_reuse 的分布/相关性是否呈现预期退化。
 """
 from __future__ import annotations
 

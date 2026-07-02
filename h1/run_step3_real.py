@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Step3 on the real ShareGPT+HotpotQA mixed workload (real replay harness).
+"""在真实 ShareGPT+HotpotQA 混合工作负载上运行第三步（真实回放执行器）。
 
-Mirrors run_step3_repeat.py on the real mixed pressure replay
-(``h1/run_h1_vllm0110_real.py``): 4 policies x 3 GPU
-memory budgets x N reps, cross-rep median, 4-panel visualization. The two real
-datasets are frozen once into a replay trace (h0/build_h0_replay_trace.py) and reused
-by every cell so the large ShareGPT JSON is parsed only once.
+在真实混合压力回放（``h1/run_h1_vllm0110_real.py``）上对齐
+run_step3_repeat.py：4 种策略 x 3 档 GPU 显存预算 x N 个重复轮次，跨轮次取中位数，
+并生成 4 面板可视化。两个真实数据集会先冻结成一条回放轨迹
+（h0/build_h0_replay_trace.py），供所有实验单元复用，避免反复解析大型 ShareGPT JSON。
 
   budgets: tight/mid/loose -> gpu_memory_utilization 0.710/0.735/0.774
   policies: vllm_default / h1_lru / h1_lfu / h1_lpe
 
-Each cell runs as one isolated conda process (single policy+budget) for clean GPU
-memory between cells, like the per-cell isolation of the serving-bench path.
+每个实验单元都作为隔离 conda 进程运行（单策略 + 单预算），从而在实验单元之间清理 GPU
+显存状态，类似服务压测路径的逐单元隔离。
 
     python h1/run_step3_real.py --batch-sweep 8 16 32 64 --visible-devices 0,1
     python h1/run_step3_real.py --visible-devices 0,1 --replay-batch-size 32
     python h1/run_step3_real.py --reps 1 --budgets tight --policies h1_lru h1_lpe --max-requests 64
-    EDGEKV_DRY_RUN=1 python h1/run_step3_real.py   # print commands only
+    EDGEKV_DRY_RUN=1 python h1/run_step3_real.py   # 只打印命令
 
-All configuration lives in the CONFIG block below; no env vars are required.
+所有配置都在下方 CONFIG 块内，无需环境变量。
 """
 from __future__ import annotations
 
@@ -30,19 +29,19 @@ from pathlib import Path
 
 import _runner as R
 
-# ----------------------------------------------------------------------------- CONFIG
-DEVICES = "0,1"  # real harness requires exactly two GPUs (tensor_parallel_size=2)
+# ----------------------------------------------------------------------------- 配置
+DEVICES = "0,1"  # 真实回放执行器需要正好两张 GPU（tensor_parallel_size=2）
 REPS = 3
 POLICIES = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
 BUDGETS = ["tight", "mid", "loose"]
 BASE = Path("h1/out/step3_real")
 TRACE = Path("data/edgekv_traces/sharegpt_hotpotqa_session.jsonl")
 
-# Repo-local real datasets (== run_h1_vllm0110_real.py defaults).
+# 仓库内真实数据集路径（等于 run_h1_vllm0110_real.py 默认值）。
 SHAREGPT_PATH = "data/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"
 HOTPOTQA_PATH = "data/hotpotqa"
 
-# Replay / workload knobs (aligned with h1/run_h1_vllm_real.sh).
+# 回放/工作负载开关（与 h1/run_h1_vllm_real.sh 对齐）。
 WORKLOAD = "mixed"
 SHAREGPT_ORDER = "longest"
 MAX_SESSIONS = 200
@@ -54,23 +53,23 @@ RAG_CHUNKS_PER_QUERY = 2
 RAG_QUERY_REPEATS = 4
 MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
-# Default to a conservative pressure point. Use --batch-sweep 8 16 32 64 to
-# choose the final point from queue_wait_p95_ms / ttft_proxy_p95_ms and policy
-# separation instead of making batch size 64 the main conclusion by default.
+# 默认使用保守压力点。可用 --batch-sweep 8 16 32 64 根据 queue_wait_p95_ms /
+# ttft_proxy_p95_ms 和策略区分度选择最终工作点，避免默认把批大小 64
+# 作为主要结论。
 REPLAY_BATCH_SIZE = 32
 DEFAULT_BATCH_SWEEP = [8, 16, 32, 64]
 DEFAULT_BATCH_ORDER = "original"
 DEFAULT_WARMUP_BATCHES = 0
 TENSOR_PARALLEL_SIZE = 2
 
-# run_h1_vllm0110_real.py imports edgekv_cop from the repo root, so "." must be on
-# PYTHONPATH (run_real_cell hardcodes only "h1:h0"; env_overrides override it).
+# run_h1_vllm0110_real.py 会从仓库根目录导入 edgekv_cop，因此 PYTHONPATH 必须
+# 包含 "."（run_real_cell 默认只写死 "h1:h0"；这里通过 env_overrides 覆盖）。
 PYTHONPATH = ".:h1:h0"
 # --------------------------------------------------------------------------------------
 
 
 def build_trace(args: argparse.Namespace) -> None:
-    """Freeze the mixed ShareGPT+HotpotQA replay trace once from the two JSON inputs."""
+    """从两个 JSON 输入一次性冻结混合 ShareGPT+HotpotQA replay trace。"""
     trace_path = Path(args.replay_trace)
     if trace_path.exists() and not args.force:
         R.log(f"[trace] reuse existing {trace_path}")
@@ -176,9 +175,9 @@ def main() -> None:
     if args.recommended_batch_sweep:
         args.batch_sweep = DEFAULT_BATCH_SWEEP
 
-    # Default mode: full budget x policy matrix at a single concurrency. Sweep mode
-    # (--batch-sweep): fix one budget (first of --budgets, default tight) and add the
-    # batch size as the swept dimension so we can locate where the budget starts to bite.
+    # 默认模式：在单一并发下运行完整 budget x policy 矩阵。扫描模式
+    # (--batch-sweep)：固定一个 budget（--budgets 的第一个值，默认 tight），并把
+    # 批大小作为扫描维度，以定位预算压力开始显现的位置。
     sweeping = bool(args.batch_sweep)
     batch_sizes = args.batch_sweep if sweeping else [args.replay_batch_size]
     budgets = [args.budgets[0]] if sweeping else args.budgets
@@ -204,7 +203,7 @@ def main() -> None:
                         if sweeping else f"{budget}_{policy}{cell_suffix}"
                     )
                     cell_dir = BASE / f"rep{rep}" / cell_name
-                    # harness writes {budget}_{policy}_summary.json (prefix is budget+policy only)
+                    # 执行器写出 {budget}_{policy}_summary.json（前缀只包含 budget+policy）
                     summary_json = cell_dir / f"{budget}_{policy}_summary.json"
                     R.log(f"[protocol {idx}/{total}] rep={rep} budget={budget} policy={policy} bs={bs}")
                     if (
@@ -219,11 +218,11 @@ def main() -> None:
                     rc = R.run_real_cell(
                         cell_dir, args.visible_devices,
                         cell_args(cell_dir, budget, policy, bs, args),
-                        # Inject the GPU policy from the LAUNCH environment so every vLLM
-                        # subprocess (EngineCore/Workers) sees it when sitecustomize is
-                        # imported. build_llm's late os.environ assignment is racy and
-                        # leaves some workers on vllm_default (lookup_total=0). Mirrors
-                        # run_h1_policy_serving_bench.sh which exports EDGEKV_H1_GPU_POLICY.
+                        # 从启动环境注入 GPU 策略，确保每个 vLLM 子进程
+                        # （EngineCore/Workers）导入 sitecustomize 时都能看到。build_llm
+                        # 中较晚的 os.environ 赋值存在竞态，可能让部分 worker 留在
+                        # vllm_default（lookup_total=0）。这里对齐导出
+                        # EDGEKV_H1_GPU_POLICY 的 run_h1_policy_serving_bench.sh。
                         {"PYTHONPATH": PYTHONPATH, "EDGEKV_H1_GPU_POLICY": policy},
                         log_file=cell_dir / "cell.log",
                     )

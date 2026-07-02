@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Visualize one or more Step3 policy-matrix summaries.
+"""可视化一个或多个第三步策略矩阵汇总。
 
-Input summaries are produced by h1/run_test.py under:
+输入汇总由 h1/run_test.py 生成，路径形如：
   h1/out/<out-dir>/<tier>/step3_summary.csv
 
-The figure layout is one row per dataset/tier and one column per metric. Each
-panel shows the three budget tiers grouped by four policies.
+图形布局为每个数据集/档位一行、每个指标一列。每个面板展示三档预算，并按
+四种策略分组。
 """
 from __future__ import annotations
 

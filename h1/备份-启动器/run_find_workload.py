@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
 """H1 第二步「旋钮3：调 workload 复用率」扫描器。
 
 在 budget 下扫受启动下限限制、batch 下扫只能去饱和后，本脚本固定已去饱和的
@@ -86,7 +86,7 @@ def _prepend_unique_prompt_prefix(item: dict[str, Any], marker: str) -> bool:
 
 def derive_trace(source: Path, out_dir: Path, unique_fraction: float, max_requests: int,
                  rewrite_prompt_prefix: bool = True) -> Path:
-    """Create a deterministic low-reuse trace by uniquifying evenly-spaced rows."""
+    """通过均匀抽样行并唯一化，创建确定性的低复用 trace。"""
     rows = _load_jsonl(source)[:max_requests]
     if not rows:
         raise RuntimeError(f"source trace is empty: {source}")

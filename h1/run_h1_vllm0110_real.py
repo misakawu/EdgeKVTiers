@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Run H1 0.5.1 on real vLLM 0.11.0 GPU prefix cache.
+"""在真实 vLLM 0.11.0 GPU 前缀缓存上运行 H1 0.5.1 实验。
 
-Experiment shape from 00_预实验提取 0.5.1:
-- four policies: LRU, LFU, vLLM default, LPE-score
-- three memory budgets
-- the same H0 ShareGPT + HotpotQA RAG mixed replay trace by default
-- record p95 TTFT proxy, hit rate, and GPU memory peak
+实验形态来自 00_预实验提取 0.5.1：
+- 四种策略：LRU、LFU、vLLM 默认、LPE-score。
+- 三档显存预算。
+- 默认使用同一条 H0 ShareGPT + HotpotQA RAG 混合 replay trace。
+- 记录 p95 TTFT 代理指标、命中率和 GPU 显存峰值。
 
-Notes:
-- H1 policies are applied to vLLM v1 GPU prefix-cache block eviction through
-  the repo-local ``h1/sitecustomize.py`` runtime patch. The experiment uses GPU
-  KV cache only and does not configure vLLM CPU KV offload.
-- vLLM offline ``LLM.generate`` records per-request scheduler metrics when
-  available. ``ttft_proxy_ms`` uses per-request first-token timing from
-  ``RequestOutput.metrics`` when available, falling back to the batch wall-clock
-  latency proxy on older builds. ``queue_wait_ms`` and ``prefill_ms`` are also
-  derived from ``RequestOutput.metrics``.
-- hit rate in the summary is measured from real GPU prefix-cache block lookup
-  statistics. Per-request rows still carry the H0 trace-side reuse proxy.
+说明：
+- H1 策略通过仓库内的 ``h1/sitecustomize.py`` 运行时补丁接入 vLLM v1
+  GPU 前缀缓存块驱逐流程。实验只使用 GPU KV cache，不配置 vLLM CPU KV
+  offload。
+- vLLM offline ``LLM.generate`` 在可用时记录请求级调度指标。
+  ``ttft_proxy_ms`` 优先使用 ``RequestOutput.metrics`` 中的请求级首 token
+  时间；旧版本不可用时退回到批次 wall-clock 延迟代理。``queue_wait_ms``
+  和 ``prefill_ms`` 也来自 ``RequestOutput.metrics``。
+- summary 中的命中率来自真实 GPU 前缀缓存块 lookup 统计。请求级行仍保留
+  H0 trace 侧的复用代理字段。
 """
 
 from __future__ import annotations
@@ -68,7 +67,7 @@ from vllm import LLM, SamplingParams
 
 POLICIES = ('vllm_default', 'h1_lru', 'h1_lfu', 'h1_lpe')
 BUDGET_GPU_MEMORY_UTILIZATION = {
-    'super_tight': 0.710,  # extreme/saturation budget (== old tight value)
+    'super_tight': 0.710,  # 极端/饱和预算（等于旧 tight 值）
     'tight': 0.720,
     'mid': 0.735,
     'loose': 0.774,
@@ -92,13 +91,12 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def request_output_timing_ms(output: Any) -> dict[str, float | str | bool]:
-    """Extract vLLM RequestMetrics timing fields, falling back to zeros.
+    """提取 vLLM RequestMetrics 时间字段，缺失时回退为 0。
 
-    vLLM stores timestamps/durations in seconds. vLLM 0.11 uses
-    ``first_scheduled_time`` and ``time_in_queue`` on ``RequestMetrics``; the
-    repo-local sitecustomize patch may also expose v1 internal
-    ``queued_ts/scheduled_ts`` values. Keep this defensive so older/newer builds
-    still produce CSV columns instead of failing a run.
+    vLLM 以秒保存时间戳/耗时。vLLM 0.11 在 ``RequestMetrics`` 上使用
+    ``first_scheduled_time`` 和 ``time_in_queue``；仓库内 sitecustomize 补丁
+    也可能暴露 v1 内部的 ``queued_ts/scheduled_ts``。这里保持防御式解析，
+    让新旧版本都能输出 CSV 列，而不是中断实验。
     """
     metrics = getattr(output, 'metrics', None)
     if metrics is None:
@@ -452,7 +450,7 @@ def item_token_count(item: dict[str, Any]) -> int:
 
 
 def length_bucket_id(n_tokens: int) -> int:
-    """Coarse token-length bucket, using power-of-two ranges."""
+    """按 2 的幂范围生成粗粒度 token 长度桶。"""
     return max(1, int(n_tokens)).bit_length() - 1
 
 
@@ -1043,9 +1041,9 @@ def merge_gpu_cache_stats(parent_stats: dict[str, Any], stats_dir: Path) -> dict
     result.update(sums)
     result.update(float_sums)
     result['lookup_total'] = lookups
-    # Block-level prefix-match-length efficiency (diagnostic only).
+    # 块级前缀匹配长度效率（仅诊断）。
     result['block_lookup_hit_rate'] = (sums['lookup_hits'] / lookups) if lookups else 0.0
-    # vLLM-native token-level coverage = true cache hit rate (preferred).
+    # vLLM 原生 token 级覆盖率 = 真实缓存命中率（优先使用）。
     native_q = sums['native_queries']
     native_h = sums['native_hits']
     result['native_hit_rate'] = (native_h / native_q) if native_q else 0.0

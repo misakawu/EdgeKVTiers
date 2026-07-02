@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
 """H1 第二步「寻找有效区间」扫描器（H1_复盘与重跑配置单.md §4）。
 
 把缓存预算 gpu_memory_utilization **往下扫**，回读每档命中率与排队占比，自动判定哪些
@@ -29,7 +29,7 @@ from pathlib import Path
 import _runner as R
 import run_step3_budget_tiers as step3
 
-# ----------------------------------------------------------------------------- CONFIG
+# ----------------------------------------------------------------------------- 配置
 BASE_OUT = Path("h1/out/find_interval")
 TIER = "sweep"                                    # 两轮都写到同一 tier 下，按 budget 子目录区分
 POLICIES = ["h1_lru", "h1_lpe"]                   # 搜索阶段每档跑这两个策略
@@ -277,7 +277,7 @@ def main() -> None:
 
     tier_dir = BASE_OUT / TIER
 
-    # ---- Round 1: 粗扫 ----
+    # ---- 第 1 轮：粗扫 ----
     R.log(f"[find_interval] Round1 coarse budgets={args.coarse_budgets} policies={args.policies}")
     for budget in args.coarse_budgets:
         _run_budget(budget, args.policies, args.visible_devices,
@@ -285,7 +285,7 @@ def main() -> None:
     by_budget = _collect(tier_dir)
     _report(by_budget, args.reference_policy, BASE_OUT)
 
-    # ---- Round 2: 细扫（在夹住窗口的相邻粗扫档之间）----
+    # ---- 第 2 轮：细扫（在夹住窗口的相邻粗扫档之间）----
     if not args.no_fine:
         span = _pick_refine_span(by_budget, args.reference_policy)
         if span is None:

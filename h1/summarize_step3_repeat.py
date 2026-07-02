@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Summarize the Step3 repeat protocol: median across reps per point/budget/policy.
+"""汇总 Step3 repeat 协议：按 point/budget/policy 对多个 rep 取中位数。
 
-Supports both the legacy serving-bench aggregate.csv layout and the pressure-replay
-summary JSON layout emitted by h1/run_h1_vllm0110_real.py.
+同时支持旧 serving-bench aggregate.csv 布局，以及
+h1/run_h1_vllm0110_real.py 输出的 pressure-replay summary JSON 布局。
 """
 
 from __future__ import annotations

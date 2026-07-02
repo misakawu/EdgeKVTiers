@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate vLLM serving benchmark results with EdgeKV GPU cache stats."""
+"""聚合 vLLM serving benchmark 结果和 EdgeKV GPU 缓存统计。"""
 
 from __future__ import annotations
 

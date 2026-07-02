@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize H1 step3 budget-tier experiment outputs (one tier dir).
+"""汇总 H1 第三步预算档实验输出（单个档目录）。
 
-Supports both the legacy serving-bench layout (<budget>/<policy>/aggregate.csv)
-and the pressure-replay layout (<budget>/<policy>/<budget>_<policy>_summary.json).
-Writes one concise CSV with core TTFT/cache-policy metrics plus LPE-vs-LRU gains.
+同时支持旧服务压测布局（<budget>/<policy>/aggregate.csv）和
+压力回放布局（<budget>/<policy>/<budget>_<policy>_summary.json）。
+写出一份紧凑 CSV，包含核心 TTFT/缓存策略指标以及 LPE 相对 LRU 的收益。
 """
 
 from __future__ import annotations

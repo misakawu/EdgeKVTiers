@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Visualize the real Step3 (ShareGPT+HotpotQA) 4-policy x 3-budget comparison.
+"""可视化真实 Step3（ShareGPT+HotpotQA）4 策略 x 3 预算对比。
 
-Reads the cross-rep median summary produced by run_step3_real.py /
-summarize_step3_real.py and draws a 4-policy comparison (vLLM / LRU / LFU / LPE)
-across the three GPU memory budgets:
+读取 run_step3_real.py / summarize_step3_real.py 生成的跨重复轮次中位数汇总，并在三档
+GPU 显存预算下绘制 4 策略对比（vLLM / LRU / LFU / LPE）：
 
     tight  gpu_memory_utilization=0.710
     mid    gpu_memory_utilization=0.735
     loose  gpu_memory_utilization=0.774
 
-Usage (no env vars required):
+用法（无需环境变量）：
     python h1/visualize_step3_real.py
     python h1/visualize_step3_real.py --summary <path> --out <png_stem>
 
-Saves <out>.png and <out>.pdf next to the summary CSV by default. Only depends on
-matplotlib + numpy (stdlib csv for reading; no pandas). Adapted from
-visualize_lpe_scenarios.py.
+默认在 summary CSV 旁保存 <out>.png 和 <out>.pdf。仅依赖 matplotlib + numpy
+（stdlib csv 负责读取；不依赖 pandas）。改写自 visualize_lpe_scenarios.py。
 """
 from __future__ import annotations
 
@@ -24,20 +22,20 @@ import csv
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # 无头渲染
 import matplotlib.pyplot as plt
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
 
-# fixed ordering: budgets tight,mid,loose and policies vLLM,LRU,LFU,LPE
+# 固定顺序：预算 tight,mid,loose；策略 vLLM,LRU,LFU,LPE
 BUDGET_KEYS = ["tight", "mid", "loose"]
 BUDGET_LABELS = ["tight\n0.710", "mid\n0.735", "loose\n0.774"]
 POL_KEYS = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
 POL_LABELS = ["vLLM", "LRU", "LFU", "LPE"]
-POL_COLORS = ["#4c72b0", "#55a868", "#c4a000", "#d95319"]  # LPE = orange-red
+POL_COLORS = ["#4c72b0", "#55a868", "#c4a000", "#d95319"]  # LPE = 橙红色
 
-# metrics to plot: (column, panel title, y-label, value format)
+# 待绘制指标：(列名, 面板标题, y 轴标签, 数值格式)
 METRICS = [
     ("p95_ttft_ms", "p95 TTFT proxy (batch-latency proxy, not real TTFT)", "p95 batch-latency proxy (ms)", "{:.0f}"),
     ("hit_rate", "GPU prefix-cache hit rate", "hit rate", "{:.3f}"),
@@ -47,7 +45,7 @@ METRICS = [
 
 
 def load(summary: Path) -> dict[tuple[str, str], dict[str, float]]:
-    """(budget, policy) -> {column: float}."""
+    """(budget, policy) -> {column: float}。"""
     table: dict[tuple[str, str], dict[str, float]] = {}
     with summary.open(encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):

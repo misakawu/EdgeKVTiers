@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Step3 budget-tier calibration / policy comparison on the pressure replay trace.
+"""在 pressure replay trace 上运行 Step3 预算档校准/策略对比。
 
-Runs the H1 real replay harness instead of vLLM's built-in benchmark datasets. The
-workload is the frozen H0 ShareGPT+HotpotQA pressure trace by default, so Step3
-uses the same skewed, high-frequency HotpotQA chunk reuse as the rest of H1.
+运行 H1 real replay harness，而不是 vLLM 内置 benchmark 数据集。workload 默认
+使用冻结的 H0 ShareGPT+HotpotQA pressure trace，因此 Step3 与 H1 其他部分使用
+同样偏斜、高频的 HotpotQA chunk 复用。
 
     python h1/run_step3_budget_tiers.py
     python h1/run_step3_budget_tiers.py --budgets tight mid --policies h1_lru h1_lpe
 
-All configuration lives in the CONFIG block below; no env vars are required.
+所有配置都在下方 CONFIG 块内，无需环境变量。
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import _runner as R
 
-# ----------------------------------------------------------------------------- CONFIG
+# ----------------------------------------------------------------------------- 配置
 DEVICES = "0,1"
 TIER = "tight"
 BASE_OUT = Path("h1/out/step3")
@@ -84,7 +84,7 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
               max_model_len=MAX_MODEL_LEN,
               hotpotqa_path=HOTPOTQA_PATH, no_finalize=False, force=False,
               keep_cells=False) -> Path:
-    """Run one tier's budget x policy matrix on the pressure replay trace."""
+    """在 pressure replay trace 上运行单个 tier 的 budget x policy 矩阵。"""
     base_out = Path(base_out)
     replay_trace = Path(replay_trace)
     tier_dir = base_out / tier

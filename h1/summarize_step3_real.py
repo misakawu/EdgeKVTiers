@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Summarize the real Step3 (ShareGPT+HotpotQA) matrix: median across reps.
+"""汇总真实 Step3（ShareGPT+HotpotQA）矩阵：对多个 rep 取中位数。
 
-Reads <base>/rep*/<budget>_<policy>/<budget>_<policy>_summary.json (written by
-h1/run_h1_vllm0110_real.py) and writes one concise CSV with the median of each core
-metric across reps per (budget, policy). request_throughput is not emitted by the
-real harness, so it is derived per rep as requests / elapsed_s and then medianed.
-No path columns. Mirrors summarize_step3_repeat.py.
+读取 <base>/rep*/<budget>_<policy>/<budget>_<policy>_summary.json（由
+h1/run_h1_vllm0110_real.py 写出），并为每个 (budget, policy) 写出核心指标
+跨 rep 中位数的紧凑 CSV。real harness 不直接输出 request_throughput，因此按
+每个 rep 的 requests / elapsed_s 派生后再取中位数。不输出路径列。与
+summarize_step3_repeat.py 保持一致。
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-# (csv_column, source_summary.json_key)
+# (CSV 列名, 源 summary.json 键名)
 METRICS = [
     ('p95_ttft_ms', 'ttft_proxy_p95_ms'),
     ('p50_ttft_ms', 'ttft_proxy_p50_ms'),
@@ -58,9 +58,9 @@ def main() -> None:
 
     base = Path(args.base)
     # (budget, policy, replay_batch_size, batch_order, warmup_batches) ->
-    # column -> [values across reps].
-    # replay_batch_size is a key so a --batch-sweep run keeps each concurrency separate;
-    # a normal (single-concurrency) run just yields one batch value per (budget, policy).
+    # column -> [跨 rep 的取值]。
+    # replay_batch_size 作为 key，保证 --batch-sweep 运行能区分不同并发；
+    # 普通单并发运行只会为每个 (budget, policy) 产生一个 batch 值。
     collected: dict[tuple[str, str, str, str, str], dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )

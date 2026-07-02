@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
 """H1 第二步「定档」扫描器 v2 —— 在 0.77–0.90 区间用 LRU hit 粗网格最近点定三档。
 
 背景（见 plan h1-trace-0-77hit0-5-budget-compare-step-resilient-snowflake）：新 trace
@@ -30,7 +30,7 @@ from pathlib import Path
 import _runner as R
 import run_step3_budget_tiers as step3
 
-# ----------------------------------------------------------------------------- CONFIG
+# ----------------------------------------------------------------------------- 配置
 BASE_OUT = Path("h1/out/find_interval_2")
 TIER = "sweep"                                    # 粗扫各档写到同一 tier 下，按 budget 子目录区分
 POLICIES = ["h1_lru", "h1_lpe"]                   # 每档跑这两个策略

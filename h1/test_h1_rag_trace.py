@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
-"""Smoke tests for H1 reuse of the H0 mixed RAG replay trace."""
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
+"""H1 复用 H0 混合 RAG replay trace 的冒烟测试。"""
 
 from __future__ import annotations
 
@@ -264,8 +264,8 @@ def test_sitecustomize_infers_prefix_repetition_object_without_extra_args() -> N
         assert n_tokens == 4
 
         profile = sitecustomize._edgekv_profile_from_values(object_id, object_type, n_tokens)
-        # No vLLM group registered -> logical size falls back to mu_kv * n_tokens
-        # and is used as the (stable) score denominator; resident size is 0.
+        # 未注册 vLLM group -> 逻辑大小回退为 mu_kv * n_tokens，并作为稳定的 score
+        # 分母；驻留大小为 0。
         assert profile["logical_size_mb"] == 0.25 * 4
         assert profile["size_mb"] == profile["logical_size_mb"]
         assert profile["resident_size_mb"] == 0.0
@@ -309,9 +309,9 @@ def test_sitecustomize_resident_size_uses_vllm_page_size_bytes() -> None:
     assert profile["resident_block_count"] == 2
     assert profile["resident_block_count_by_group"] == {0: 2}
     assert profile["size_bytes"] == 2 * Spec.page_size_bytes
-    # resident_size_mb is diagnostic and tracks resident block bytes.
+    # resident_size_mb 是诊断字段，用于跟踪驻留 block 字节数。
     assert profile["resident_size_mb"] == (2 * Spec.page_size_bytes) / 1024 / 1024
-    # logical (score) size is stable: n_tokens * per-token KV bytes from vLLM.
+    # 逻辑（score）大小保持稳定：n_tokens * vLLM 每 token KV 字节数。
     bytes_per_token = Spec.page_size_bytes / Spec.block_size
     assert profile["bytes_per_token"] == bytes_per_token
     assert profile["logical_size_mb"] == 128 * bytes_per_token / 1024 / 1024
@@ -326,8 +326,8 @@ def test_sitecustomize_resident_size_uses_vllm_page_size_bytes() -> None:
     assert removed == "obj-a"
     assert profile["resident_block_count"] == 1
     assert profile["size_bytes"] == Spec.page_size_bytes
-    # resident_size_mb halves with the dropped block, but the logical score is
-    # unchanged -- the score no longer inflates as resident blocks shrink.
+    # resident_size_mb 会随被删除 block 减半，但逻辑 score 不变，score 不再因驻留 block
+    # 缩小而虚高。
     assert profile["resident_size_mb"] == Spec.page_size_bytes / 1024 / 1024
     assert profile["logical_size_mb"] == 128 * bytes_per_token / 1024 / 1024
     assert profile["score"] == score_before
@@ -469,12 +469,11 @@ def test_sitecustomize_reorder_records_candidate_window(monkeypatch) -> None:
             self.next_free_block = None
 
     class Queue:
-        """Faithful mini vLLM FreeKVCacheBlockQueue.
+        """忠实模拟的迷你 vLLM FreeKVCacheBlockQueue。
 
-        The incremental reorder reads the head window and uses the prev/next
-        link pointers as the O(1) free-queue membership signal, so the fake must
-        model the doubly-linked list (fake head/tail, nulling pointers on
-        remove, relinking on append_n) rather than just a Python list.
+        增量 reorder 读取头部窗口，并使用 prev/next 链表指针作为 O(1) free-queue
+        成员信号，因此 fake 必须模拟双向链表（fake head/tail、remove 时清空指针、
+        append_n 时重新链接），而不能只是一个 Python list。
         """
 
         def __init__(self) -> None:
@@ -527,7 +526,7 @@ def test_sitecustomize_reorder_records_candidate_window(monkeypatch) -> None:
 
 
 def _make_faithful_queue(sitecustomize, block_ids):
-    """Build a faithful mini vLLM FreeKVCacheBlockQueue seeded with block_ids."""
+    """用 block_ids 构建忠实模拟的迷你 vLLM FreeKVCacheBlockQueue。"""
 
     class Block:
         def __init__(self, block_id: int) -> None:
@@ -591,7 +590,7 @@ def test_sitecustomize_object_admission_marks_low_score_reject() -> None:
         "obj-high", "prefix", 16, {"p_reuse": 0.9, "c_recomp_ms": 100.0}
     )
     sitecustomize._edgekv_set_block_object(pool, 0, 1, "obj-high")
-    # Empty cache -> the first resident object is admitted.
+    # 空缓存 -> 第一个驻留对象被准入。
     assert sitecustomize._edgekv_evaluate_object_admission(high, False) == "accept"
 
     low = sitecustomize._edgekv_profile_from_values(
@@ -607,11 +606,11 @@ def test_sitecustomize_object_admission_marks_low_score_reject() -> None:
     assert low["admission_seq"] >= 1
     assert low["admission_min_resident_score"] == high["score"]
 
-    # Diagnostic reject must NOT drop the object's cached blocks.
+    # 诊断性 reject 不能删除对象已缓存的 block。
     assert low["resident_block_count"] == 1
     assert sitecustomize._edgekv_block_profile(pool, 2) is low
 
-    # A second decision on the same object is a no-op (decided once).
+    # 对同一对象的第二次决策是 no-op（只决策一次）。
     assert sitecustomize._edgekv_evaluate_object_admission(low, False) is None
 
     stats = sitecustomize.get_edgekv_gpu_cache_stats()
@@ -646,8 +645,8 @@ def test_sitecustomize_pinned_object_never_ranked_as_victim(monkeypatch) -> None
     pool._edgekv_h1_pinned.add(5)
     pinned_rank = sitecustomize._edgekv_rank_tuple(pool, 5)
     assert pinned_rank[0] == float("inf")
-    # A pinned block ranks strictly after any finite-score block, so the
-    # lowest-first eviction reorder never selects it as a victim.
+    # pinned block 严格排在任何有限 score block 之后，因此 lowest-first 驱逐重排永远
+    # 不会把它选为 victim。
     assert pinned_rank > normal_rank
 
 
@@ -673,14 +672,14 @@ def test_sitecustomize_object_rank_evicts_rejected_before_accepted(monkeypatch) 
     sitecustomize._edgekv_set_block_object(pool, 0, 10, "obj-acc")
     sitecustomize._edgekv_set_block_object(pool, 0, 11, "obj-rej")
 
-    # Same score, but one object is logically rejected.
+    # score 相同，但其中一个对象被逻辑拒绝。
     assert accepted["score"] == rejected["score"]
     rejected["admission_rejected"] = True
 
     rank_accepted = sitecustomize._edgekv_rank_tuple(pool, 10)
     rank_rejected = sitecustomize._edgekv_rank_tuple(pool, 11)
     assert rank_accepted[0] == rank_rejected[0]
-    # At equal score the rejected object sorts first (evicted first).
+    # score 相等时，被拒绝对象排序更靠前（更早驱逐）。
     assert rank_rejected < rank_accepted
     assert rank_rejected[1] == 0
     assert rank_accepted[1] == 1
@@ -707,9 +706,8 @@ def test_sitecustomize_object_level_reorder_groups_blocks(monkeypatch) -> None:
     sitecustomize._edgekv_init_pool_state(pool)
     sitecustomize._edgekv_register_kv_cache_group(0, Spec())
 
-    # Interleave two objects' blocks in the free queue: A owns {1,3}, B {2,4}.
-    # A has the lower object score, so both A blocks must move to the front as a
-    # contiguous group, ahead of B's contiguous group.
+    # 在 free queue 中交错放置两个对象的 block：A 拥有 {1,3}，B 拥有 {2,4}。
+    # A 的对象 score 更低，因此两个 A block 必须作为连续组移动到前面，排在 B 的连续组前。
     pool.free_block_queue = _make_faithful_queue(sitecustomize, [1, 2, 3, 4])
     sitecustomize._edgekv_profile_from_values(
         "obj-a", "prefix", 16, {"p_reuse": 0.1, "c_recomp_ms": 1.0}
@@ -726,10 +724,10 @@ def test_sitecustomize_object_level_reorder_groups_blocks(monkeypatch) -> None:
 
     order = [block.block_id for block in pool.free_block_queue.get_all_free_blocks()]
     pos = {bid: idx for idx, bid in enumerate(order)}
-    # Each object's blocks are contiguous...
+    # 每个对象的 block 都保持连续...
     assert abs(pos[1] - pos[3]) == 1
     assert abs(pos[2] - pos[4]) == 1
-    # ...and the low-score object A is ranked ahead of B.
+    # ...且低 score 对象 A 排在 B 前面。
     assert max(pos[1], pos[3]) < min(pos[2], pos[4])
 
 

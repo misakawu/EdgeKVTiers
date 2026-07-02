@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
-"""Generate H1 trace candidates, run LRU hit sweeps, and archive results.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
+"""生成 H1 trace 候选，运行 LRU hit 扫描，并归档结果。
 
-Default workflow:
+默认流程：
 
     python h1/run_find_hit.py
 
-This runs parameter groups A-E. For each group it:
-  1. generates data/edgekv_traces/sharegpt_hotpotqa_session.jsonl,
-  2. runs h1_lru over budgets 0.77, 0.80, 0.83, 0.86, 0.88, 0.90,
-  3. writes find_hit_report.csv/json with trace summary and curve judgement,
-  4. backs up the trace and run outputs under a shared backup name.
+这会运行参数组 A-E。对每个组：
+  1. 生成 data/edgekv_traces/sharegpt_hotpotqa_session.jsonl；
+  2. 在预算 0.77、0.80、0.83、0.86、0.88、0.90 上运行 h1_lru；
+  3. 写出包含 trace 摘要和曲线判断的 find_hit_report.csv/json；
+  4. 用共享备份名备份 trace 和运行输出。
 
-Use --groups E --policies h1_lru h1_lpe for the final candidate comparison.
+最终候选对比可使用 --groups E --policies h1_lru h1_lpe。
 """
 from __future__ import annotations
 

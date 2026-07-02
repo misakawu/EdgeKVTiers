@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Validate H1 D4 saturation without relying on vLLM RequestOutput.metrics.
+"""在不依赖 vLLM RequestOutput.metrics 的情况下验证 H1 D4 饱和度。
 
-Offline ``LLM.generate`` may leave request timing metrics at zero. This script
-uses the run summary plus per-request token counts to estimate whether measured
-throughput is far below an ideal prefill-only throughput, which is the useful D4
-signal for queue-dominated saturation.
+Offline ``LLM.generate`` 可能让请求时间指标保持为 0。本脚本使用 run summary
+和请求级 token 计数，估计实测吞吐是否显著低于理想的仅 prefill 吞吐；这是
+队列等待主导型饱和的有效 D4 信号。
 """
 from __future__ import annotations
 

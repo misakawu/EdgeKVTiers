@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Step3 repeatable multi-measurement protocol on the pressure replay trace.
+"""在 pressure replay trace 上运行 Step3 可重复多次测量协议。
 
-Each work point is a 4-policy comparison (h1_lru / h1_lfu / vllm_default / h1_lpe)
-repeated N times so a median removes single-run variance. The cells reuse
-run_step3() from run_step3_budget_tiers, which now drives the real H0 pressure
-replay instead of vLLM's built-in benchmark datasets.
+每个工作点都是 4 策略对比（h1_lru / h1_lfu / vllm_default / h1_lpe），重复 N 次
+后用中位数削弱单次运行波动。cell 复用 run_step3_budget_tiers 中的 run_step3()，
+该函数现在驱动真实 H0 pressure replay，而不是 vLLM 内置 benchmark 数据集。
 
     python h1/run_step3_repeat.py
     python h1/run_step3_repeat.py --reps 5 --force
 
-All configuration lives in the CONFIG block below; no env vars are required.
+所有配置都在下方 CONFIG 块内，无需环境变量。
 """
 from __future__ import annotations
 
@@ -19,13 +18,13 @@ from pathlib import Path
 import _runner as R
 import run_step3_budget_tiers as step3
 
-# ----------------------------------------------------------------------------- CONFIG
+# ----------------------------------------------------------------------------- 配置
 DEVICES = "0,1"
 REPS = 3
 POLICIES = ["h1_lru", "h1_lfu", "vllm_default", "h1_lpe"]
 BASE = Path("h1/out/step3_repeat")
 
-# Work points: (label, budget tier, max replay requests) on the pressure trace.
+# pressure trace 上的工作点：(标签, 预算档, 最大 replay 请求数)。
 WORK_POINTS = [
     ("pressure_tight_n400", "tight", 400),
     ("pressure_mid_n400", "mid", 400),
