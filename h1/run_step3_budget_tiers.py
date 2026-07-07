@@ -109,12 +109,6 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
                 "EDGEKV_H1_GPU_POLICY": policy,
                 "EDGEKV_H1_PROFILE_POLICY_TIME": "1",
             }
-            if policy == "h1_lpe":
-                env_overrides.update({
-                    "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
-                    "EDGEKV_H1_RUNTIME_MONITOR": "1",
-                    "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
-                })
             rc = R.run_real_cell(
                 out_dir,
                 visible_devices,

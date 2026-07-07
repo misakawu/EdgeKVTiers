@@ -19,7 +19,8 @@ from pathlib import Path
 import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
-POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
+# POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
+POLICIES = ["h1_lpe"]
 TIER = "sharedgpt_v5"
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
@@ -35,7 +36,7 @@ MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN * REPLAY_BATCH_SIZE
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--visible-devices", default=step3.DEVICES)
+    parser.add_argument("--visible-devices", default="1,2")
     parser.add_argument("--num-prompts", type=int, default=NUM_PROMPTS)
     parser.add_argument("--tier", default=TIER)
     parser.add_argument("--replay-trace", type=Path, default=REPLAY_TRACE)

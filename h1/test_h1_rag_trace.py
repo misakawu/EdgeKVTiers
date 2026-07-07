@@ -163,6 +163,35 @@ def test_h1_loads_session_turns_jsonl_replay_trace(tmp_path: Path, monkeypatch) 
     assert rows[0]["prompt"] == "User: first user input\nAssistant:"
     assert rows[1]["prompt"] == "User: first user input\nAssistant: first answer\nUser: second user input\nAssistant:"
     assert all(row["replay_source"] == "frozen_replay_trace" for row in rows)
+    assert rows[1]["history_format"] == "cumulative_user"
+    assert rows[1]["history_turns"] == 2
+    assert rows[1]["history_prompt_chars"] == len(rows[1]["prompt"])
+    assert rows[1]["replay_trace_format"] == "session_cumulative_user"
+
+
+def test_h1_cumulative_replay_batches_split_same_session() -> None:
+    trace = [
+        {"session_id": "sg0", "history_format": "cumulative_user", "turn_index": 0},
+        {"session_id": "sg0", "history_format": "cumulative_user", "turn_index": 1},
+        {"session_id": "sg1", "history_format": "cumulative_user", "turn_index": 0},
+        {"session_id": "sg1", "history_format": "cumulative_user", "turn_index": 1},
+    ]
+    batches = h1.replay_batches(trace, replay_batch_size=2)
+    assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
+
+
+def test_h1_generate_helper_disables_tqdm_when_supported() -> None:
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.use_tqdm = None
+
+        def generate(self, prompts, sampling, use_tqdm=True):
+            self.use_tqdm = use_tqdm
+            return []
+
+    fake = FakeLLM()
+    assert h1.llm_generate_no_tqdm(fake, ["p"], []) == []
+    assert fake.use_tqdm is False
 
 
 def test_h1_trace_side_fields_include_lpe_score() -> None:

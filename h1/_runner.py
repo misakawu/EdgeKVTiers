@@ -37,6 +37,29 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _strip_vllm_batch_tqdm(line: str) -> str:
+    """Drop vLLM per-generate tqdm noise while preserving real log records."""
+    if "Adding requests:" not in line and "Processed prompts:" not in line:
+        return line
+    for marker in ("INFO ", "WARNING ", "ERROR "):
+        pos = line.find(marker)
+        if pos >= 0:
+            return line[pos:]
+    return ""
+
+
+def lpe_runtime_env_overrides(policy: str, out_dir: Path) -> dict[str, str]:
+    """Return LPE-only runtime diagnostics env overrides for one cell."""
+    if str(policy) != "h1_lpe":
+        return {}
+    out_dir = Path(out_dir)
+    return {
+        "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
+        "EDGEKV_H1_RUNTIME_MONITOR": "1",
+        "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
+    }
+
+
 def _run_streaming(cmd: list[str], *, env: dict[str, str] | None,
                    log_file: Path | None, echo: bool) -> int:
     """从 ROOT 运行 cmd，并流式转发合并后的 stdout/stderr。
@@ -71,6 +94,9 @@ def _run_streaming(cmd: list[str], *, env: dict[str, str] | None,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
+            line = _strip_vllm_batch_tqdm(line)
+            if not line:
+                continue
             if echo:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -99,12 +125,7 @@ def run_bench_cell(out_dir: Path, visible_devices: str, env_overrides: dict[str,
 
     env_defaults = {"EDGEKV_H1_PROFILE_POLICY_TIME": "1"}
     policy = str(env_overrides.get("EDGEKV_H1_GPU_POLICY", os.environ.get("H1_GPU_POLICY", "")))
-    if policy == "h1_lpe":
-        env_defaults.update({
-            "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
-            "EDGEKV_H1_RUNTIME_MONITOR": "1",
-            "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
-        })
+    env_defaults.update(lpe_runtime_env_overrides(policy, out_dir))
     env = {**os.environ, **env_defaults, **{k: str(v) for k, v in env_overrides.items()}}
     cmd = ["bash", SERVING_BENCH, str(out_dir), visible_devices]
     rc = _run_streaming(cmd, env=env, log_file=log_file, echo=echo)
@@ -125,12 +146,7 @@ def run_real_cell(out_dir: Path, visible_devices: str, cli_args: list[str],
     out_dir = Path(out_dir)
     env_defaults = {"EDGEKV_H1_PROFILE_POLICY_TIME": "1"}
     policy = str(env_overrides.get("EDGEKV_H1_GPU_POLICY", ""))
-    if policy == "h1_lpe":
-        env_defaults.update({
-            "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
-            "EDGEKV_H1_RUNTIME_MONITOR": "1",
-            "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
-        })
+    env_defaults.update(lpe_runtime_env_overrides(policy, out_dir))
     env = {
         **os.environ,
         "PYTHONPATH": "h1:h0",

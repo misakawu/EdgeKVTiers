@@ -32,6 +32,7 @@ if str(H0_DIR) not in sys.path:
 
 from run_h0_vllm import (  # noqa: E402
     DEFAULT_SHAREGPT_TRACE_PATH,
+    build_sharegpt_cumulative_sessions,
     estimate_tokens,
     load_sharegpt_sessions,
     write_jsonl,
@@ -54,6 +55,7 @@ DEFAULT_TAIL_WORDS = 8
 DEFAULT_CHUNK_WORDS = 240
 DEFAULT_MIN_CHUNK_WORDS = 240
 DEFAULT_MAX_SOURCE_SESSIONS = 4096
+DEFAULT_MIN_HUMAN_TURNS = 2
 
 # Single constant task, kept in the SHARED prefix (before the unique tail) so it
 # never breaks prefix-cache matching. Per-request task rotation would inflate the
@@ -438,7 +440,7 @@ def build_sharegpt_hierarchical_summary(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a prefix-cache-friendly ShareGPT replay trace."
+        description="Generate a cumulative-context ShareGPT replay trace."
     )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--requests", type=positive_int, default=DEFAULT_REQUESTS)
@@ -469,26 +471,50 @@ def parse_args() -> argparse.Namespace:
         help="Compatibility alias for --min-chunk-words.",
     )
     parser.add_argument("--max-source-sessions", type=positive_int, default=DEFAULT_MAX_SOURCE_SESSIONS)
+    parser.add_argument("--min-human-turns", type=positive_int, default=DEFAULT_MIN_HUMAN_TURNS)
+    parser.add_argument("--sharegpt-order", choices=("file", "longest"), default="file")
+    parser.add_argument(
+        "--max-prompt-est-tokens",
+        type=int,
+        default=0,
+        help="Drop the rest of a session once a cumulative prompt exceeds this estimate; 0 disables.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     out_path = args.out.expanduser()
-    sessions, meta = build_sharegpt_hierarchical_sessions(
-        request_count=args.num_prompts or args.requests,
-        sharegpt_path=args.sharegpt_path.expanduser(),
-        random_seed=args.random_seed,
-        hot_pool_size=args.hot_pool_size,
-        warm_pool_size=args.warm_pool_size,
-        zipf_s=args.zipf_s,
-        tail_words=args.tail_words,
-        chunk_word_count=args.context_words or args.chunk_words,
-        min_chunk_words=args.min_context_words or args.min_chunk_words,
-        max_source_sessions=args.max_source_sessions,
+    sessions, summary = build_sharegpt_cumulative_sessions(
+        args.sharegpt_path.expanduser(),
+        max_turns=args.num_prompts or args.requests,
+        min_human_turns=args.min_human_turns,
+        order=args.sharegpt_order,
+        max_prompt_est_tokens=args.max_prompt_est_tokens,
     )
     write_jsonl(out_path, sessions)
-    summary = build_sharegpt_hierarchical_summary(out_path, sessions, meta)
+    summary.update(
+        {
+            "out": str(out_path),
+            "out_path": str(out_path),
+            "workload": "conversation_prefix_reuse",
+            "prefix_layout": "original_conversation_cumulative",
+            "trace_format": "session_cumulative_user",
+            "total_requests": summary.get("written_requests", 0),
+            "sharegpt_cumulative_sessions": len(sessions),
+            "sharegpt_cumulative_turns": summary.get("written_requests", 0),
+            "ignored_for_cumulative_sharegpt": {
+                "random_seed": args.random_seed,
+                "hot_pool_size": args.hot_pool_size,
+                "warm_pool_size": args.warm_pool_size,
+                "zipf_s": args.zipf_s,
+                "tail_words": args.tail_words,
+                "chunk_words": args.context_words or args.chunk_words,
+                "min_chunk_words": args.min_context_words or args.min_chunk_words,
+                "max_source_sessions": args.max_source_sessions,
+            },
+        }
+    )
     summary_path = out_path.with_suffix(out_path.suffix + ".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))

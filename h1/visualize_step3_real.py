@@ -4,10 +4,6 @@
 读取 run_step3_real.py / summarize_step3_real.py 生成的跨重复轮次中位数汇总，并在三档
 GPU 显存预算下绘制 4 策略对比（vLLM / LRU / LFU / LPE）：
 
-    tight  gpu_memory_utilization=0.710
-    mid    gpu_memory_utilization=0.735
-    loose  gpu_memory_utilization=0.774
-
 用法（无需环境变量）：
     python h1/visualize_step3_real.py
     python h1/visualize_step3_real.py --summary <path> --out <png_stem>
@@ -30,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 
 # 固定顺序：预算 tight,mid,loose；策略 vLLM,LRU,LFU,LPE
 BUDGET_KEYS = ["tight", "mid", "loose"]
-BUDGET_LABELS = ["tight\n0.710", "mid\n0.735", "loose\n0.774"]
+BUDGET_LABELS = ["tight\n", "mid\n", "loose\n"]
 POL_KEYS = ["vllm_default", "h1_lru", "h1_lfu", "h1_lpe"]
 POL_LABELS = ["vLLM", "LRU", "LFU", "LPE"]
 POL_COLORS = ["#4c72b0", "#55a868", "#c4a000", "#d95319"]  # LPE = 橙红色

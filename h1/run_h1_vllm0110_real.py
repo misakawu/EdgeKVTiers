@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import inspect
 import json
 import os
 import shutil
@@ -470,6 +471,46 @@ def order_trace_for_batches(
     return [item for _, _, item in indexed]
 
 
+def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[tuple[int, list[dict[str, Any]]]]:
+    batches: list[tuple[int, list[dict[str, Any]]]] = []
+    current: list[dict[str, Any]] = []
+    current_start = 0
+    current_sessions: set[str] = set()
+    for index, item in enumerate(trace):
+        session_id = str(item.get('session_id', ''))
+        must_split = (
+            item.get('history_format') == 'cumulative_user'
+            and session_id
+            and session_id in current_sessions
+        )
+        if current and (len(current) >= replay_batch_size or must_split):
+            batches.append((current_start, current))
+            current = []
+            current_sessions = set()
+            current_start = index
+        if not current:
+            current_start = index
+        current.append(item)
+        if item.get('history_format') == 'cumulative_user' and session_id:
+            current_sessions.add(session_id)
+    if current:
+        batches.append((current_start, current))
+    return batches
+
+
+def llm_generate_no_tqdm(llm: LLM, prompts: list[str], sampling: list[SamplingParams]) -> Any:
+    generate = llm.generate
+    try:
+        if 'use_tqdm' in inspect.signature(generate).parameters:
+            return generate(prompts, sampling, use_tqdm=False)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return generate(prompts, sampling, use_tqdm=False)
+    except TypeError:
+        return generate(prompts, sampling)
+
+
 def trace_side_reuse(
     item: dict[str, Any], reuse_seen: set[str]
 ) -> tuple[str, bool, str, bool]:
@@ -658,6 +699,12 @@ def run_cell(
         monitor.start()
         llm = build_llm(args, policy, gpu_memory_utilization)
         replay_trace = order_trace_for_batches(trace, args.batch_order)
+        batches = replay_batches(replay_trace, args.replay_batch_size)
+        print(
+            f"[cell] policy={policy} budget={budget_name} requests={len(replay_trace)} "
+            f"batch_size={args.replay_batch_size} batches={len(batches)} trace={args.replay_trace}",
+            flush=True,
+        )
         if args.warmup_batches > 0 and replay_trace:
             warmup_count = min(len(replay_trace), args.replay_batch_size, 8)
             warmup_prompts = [
@@ -669,10 +716,16 @@ def run_cell(
                 for _ in warmup_prompts
             ]
             for _ in range(args.warmup_batches):
-                llm.generate(warmup_prompts, warmup_sampling)
+                llm_generate_no_tqdm(llm, warmup_prompts, warmup_sampling)
             reset_after_warmup(llm, stats_dir)
-        for batch_start in range(0, len(replay_trace), args.replay_batch_size):
-            batch = replay_trace[batch_start:batch_start + args.replay_batch_size]
+        progress_every = max(1, len(batches) // 10) if batches else 1
+        for batch_number, (batch_start, batch) in enumerate(batches, start=1):
+            if batch_number == 1 or batch_number == len(batches) or batch_number % progress_every == 0:
+                print(
+                    f"[replay] policy={policy} budget={budget_name} "
+                    f"batch={batch_number}/{len(batches)} done_requests={len(rows)}",
+                    flush=True,
+                )
             prompts = [str(item['prompt']) for item in batch]
             trace_reuse = [trace_side_reuse(item, reuse_seen) for item in batch]
             trace_fields_batch = [
@@ -714,7 +767,7 @@ def run_cell(
                 for trace_fields in trace_fields_batch
             ]
             t0 = time.perf_counter()
-            outputs = llm.generate(prompts, sampling)
+            outputs = llm_generate_no_tqdm(llm, prompts, sampling)
             latency_ms = (time.perf_counter() - t0) * 1000.0
             batch_rows: list[dict[str, Any]] = []
             for offset, (item, output, reuse_info, trace_fields) in enumerate(
@@ -827,6 +880,14 @@ def run_cell(
     gpu_hit_rate = float(gpu_cache_stats.get('hit_rate', 0.0) or 0.0)
     workload_counts: dict[str, int] = {}
     workload_hit_counts: dict[str, int] = {}
+    replay_trace_formats = sorted({str(row.get('replay_trace_format', 'legacy_or_complete_prompt')) for row in valid})
+    history_formats = sorted({str(row.get('history_format', '')) for row in valid if row.get('history_format')})
+    cumulative_sessions = len({
+        str(row.get('session_id', ''))
+        for row in valid
+        if row.get('history_format') == 'cumulative_user'
+    })
+    cumulative_turns = sum(1 for row in valid if row.get('history_format') == 'cumulative_user')
     for row in valid:
         workload = str(row.get('workload', 'unknown'))
         workload_counts[workload] = workload_counts.get(workload, 0) + 1
@@ -855,6 +916,12 @@ def run_cell(
         'rag_requests_requested': args.rag_requests,
         'trace_requests_available': len(trace),
         'replay_trace': args.replay_trace,
+        'replay_trace_format': ",".join(replay_trace_formats) if replay_trace_formats else "unknown",
+        'history_format': ",".join(history_formats) if history_formats else "",
+        'cumulative_sessions': cumulative_sessions,
+        'cumulative_turns': cumulative_turns,
+        'vllm_generate_tqdm': False,
+        'replay_progress_log': 'task_level',
         'workload': args.workload,
         'hotpotqa_source': str(args.hotpotqa_path),
         'rag_chunk_words': args.rag_chunk_words,
@@ -941,6 +1008,15 @@ def run_cell(
         'max_num_batched_tokens': resolved_max_num_batched_tokens(args),
         'ttft_note': 'ttft_proxy_ms uses per-request RequestOutput.metrics first-token timing when available; if metrics are unavailable or non-positive it falls back to offline LLM.generate batch latency',
     }
+    if valid:
+        print(
+            f"[cell-done] policy={policy} budget={budget_name} requests={len(valid)} "
+            f"elapsed_s={summary['elapsed_s']} native_hit_rate={summary['native_hit_rate']} "
+            f"trace_side_hit_rate={summary['trace_side_hit_rate']} "
+            f"ttft_p95_ms={summary['ttft_proxy_p95_ms']} "
+            f"gpu_memory_peak_mib={summary['gpu_memory_peak_mib']}",
+            flush=True,
+        )
     return rows, summary, monitor.samples
 
 
@@ -1191,6 +1267,8 @@ def main() -> None:
                 'trace_size': len(trace),
                 'policies': args.policies,
                 'trace_builder': 'h0.load_replay_prompts',
+                'vllm_generate_tqdm': False,
+                'replay_progress_log': 'task_level',
             },
             ensure_ascii=False,
             indent=2,

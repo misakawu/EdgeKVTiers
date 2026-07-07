@@ -2,8 +2,7 @@
 """Generate a prefix-cache-friendly HotpotQA replay trace.
 
 Layout per request (strictly position-stable so vLLM block-level prefix cache
-can reuse), mirrored from ``sharedgpt_jsonl_generation.py`` but sourced from
-HotpotQA chunks:
+can reuse):
 
     HOT  (constant for every request, sets the floor)
     WARM (exactly one chunk, chosen by Zipf popularity, drives the climb)
@@ -11,7 +10,7 @@ HotpotQA chunks:
 
 Only "which warm chunk" is random; the warm chunk always sits immediately
 after the identical HOT region, so two requests that pick the same warm chunk
-share the entire ``HOT + WARM`` token prefix and reuse its blocks. The unique
+share the entire `HOT + WARM` token prefix and reuse its blocks. The unique
 tail is the only never-reused region, so it sets the ceiling gap.
 """
 

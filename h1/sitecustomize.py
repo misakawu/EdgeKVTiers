@@ -13,6 +13,30 @@ import time
 from pathlib import Path
 from typing import Any
 
+try:
+    from h1.policies.base import AccessInfo, AdmitInfo, EvictInfo
+    from h1.policies.factory import create_policy
+    from h1.policies.lpe import object_sort_key as _policy_object_sort_key
+    from h1.policies.lpe import DefaultLPEScorer as _DefaultLPEScorer
+    from h1.runtime.config import RuntimeConfig
+except Exception:
+    try:
+        from policies.base import AccessInfo, AdmitInfo, EvictInfo
+        from policies.factory import create_policy
+        from policies.lpe import object_sort_key as _policy_object_sort_key
+        from policies.lpe import DefaultLPEScorer as _DefaultLPEScorer
+        from runtime.config import RuntimeConfig
+    except Exception:
+        AccessInfo = None
+        AdmitInfo = None
+        EvictInfo = None
+        create_policy = None
+        _policy_object_sort_key = None
+        _DefaultLPEScorer = None
+        RuntimeConfig = None
+
+_EDGEKV_DEFAULT_LPE_SCORER = None
+
 _ORIGINAL_LOGGER_ERROR = logging.Logger.error
 
 
@@ -159,14 +183,35 @@ _EDGEKV_GPU_OBJECT_SIZE_BYTES: dict[str, int] = {}
 _EDGEKV_GPU_GROUP_PAGE_BYTES: dict[int, int] = {}
 _EDGEKV_GPU_GROUP_BLOCK_SIZE: dict[int, int] = {}
 _EDGEKV_GPU_STATS_UPDATES = 0
-_EDGEKV_GPU_POLICY_VALUE = os.environ.get('EDGEKV_H1_GPU_POLICY', 'vllm_default').strip() or 'vllm_default'
-_EDGEKV_GPU_POLICY_ENABLED = _EDGEKV_GPU_POLICY_VALUE in {'h1_lru', 'h1_lfu', 'h1_lpe'}
-_EDGEKV_GPU_POLICY_IS_LPE = _EDGEKV_GPU_POLICY_VALUE == 'h1_lpe'
-_EDGEKV_GPU_POLICY_IS_LRU = _EDGEKV_GPU_POLICY_VALUE == 'h1_lru'
+_EDGEKV_RUNTIME_CONFIG = RuntimeConfig.from_env() if RuntimeConfig is not None else None
+_EDGEKV_GPU_POLICY_VALUE = (
+    _EDGEKV_RUNTIME_CONFIG.gpu_policy
+    if _EDGEKV_RUNTIME_CONFIG is not None
+    else (os.environ.get('EDGEKV_H1_GPU_POLICY', 'vllm_default').strip() or 'vllm_default')
+)
+_EDGEKV_GPU_POLICY_ENABLED = (
+    _EDGEKV_RUNTIME_CONFIG.policy_enabled
+    if _EDGEKV_RUNTIME_CONFIG is not None
+    else _EDGEKV_GPU_POLICY_VALUE in {'h1_lru', 'h1_lfu', 'h1_lpe'}
+)
+_EDGEKV_GPU_POLICY_IS_LPE = (
+    _EDGEKV_RUNTIME_CONFIG.policy_is_lpe
+    if _EDGEKV_RUNTIME_CONFIG is not None
+    else _EDGEKV_GPU_POLICY_VALUE == 'h1_lpe'
+)
+_EDGEKV_GPU_POLICY_IS_LRU = (
+    _EDGEKV_RUNTIME_CONFIG.policy_is_lru
+    if _EDGEKV_RUNTIME_CONFIG is not None
+    else _EDGEKV_GPU_POLICY_VALUE == 'h1_lru'
+)
 # 只有 LFU/LPE 需要块级排序状态（freq/recency/scores）和 free-queue 重排。
 # vLLM 原生 free-queue 顺序已经等价于 LRU 驱逐顺序，因此 h1_lru 只保留诊断计数器，
 # 跳过每次访问的状态维护。
-_EDGEKV_GPU_POLICY_NEEDS_RANK_STATE = _EDGEKV_GPU_POLICY_VALUE in {'h1_lfu', 'h1_lpe'}
+_EDGEKV_GPU_POLICY_NEEDS_RANK_STATE = (
+    _EDGEKV_RUNTIME_CONFIG.policy_needs_rank_state
+    if _EDGEKV_RUNTIME_CONFIG is not None
+    else _EDGEKV_GPU_POLICY_VALUE in {'h1_lfu', 'h1_lpe'}
+)
 _EDGEKV_GPU_PROFILE_POLICY_TIME = os.environ.get('EDGEKV_H1_PROFILE_POLICY_TIME', '1').strip().lower() not in {
     '',
     '0',
@@ -614,30 +659,109 @@ def _edgekv_object_sort_key(object_id: str) -> int:
     驱逐组。对 object_id 做 hash 可得到确定且对象稳定的 key，使同一对象的块在
     rank 顺序中相邻。
     """
+    if _policy_object_sort_key is not None:
+        return int(_policy_object_sort_key(object_id))
     digest = hashlib.sha1(str(object_id).encode('utf-8')).hexdigest()[:12]
     return int(digest, 16)
 
 
+_EDGEKV_POLICY_INSTANCE: Any = None
+_EDGEKV_POLICY_INSTANCE_READY = False
+
+
+def _edgekv_policy_instance() -> Any:
+    """惰性获取并缓存本进程的策略实例（工厂只调用一次）。
+
+    rank_tuple 位于驱逐热路径（heap push / compact / reorder），每次调用都新建
+    策略实例会带来无谓的对象/闭包分配，并污染 policy_time 计时。进程内策略由
+    EDGEKV_H1_GPU_POLICY 固定不变，因此缓存单例即可；block_profile 直接传函数
+    引用（与旧 lambda 等价）。
+    """
+    global _EDGEKV_POLICY_INSTANCE, _EDGEKV_POLICY_INSTANCE_READY
+    if not _EDGEKV_POLICY_INSTANCE_READY:
+        _EDGEKV_POLICY_INSTANCE = (
+            create_policy(_EDGEKV_GPU_POLICY_VALUE, block_profile=_edgekv_block_profile)
+            if create_policy is not None
+            else None
+        )
+        _EDGEKV_POLICY_INSTANCE_READY = True
+    return _EDGEKV_POLICY_INSTANCE
+
+
 def _edgekv_rank_tuple(pool: Any, block_id: int) -> tuple[float, ...]:
-    policy = _EDGEKV_GPU_POLICY_VALUE
+    policy = _edgekv_policy_instance()
+    if policy is not None:
+        return policy.rank_tuple(pool, int(block_id))
     recency = int(getattr(pool, '_edgekv_h1_recency', {}).get(block_id, 0))
-    if policy == 'h1_lfu':
-        return (float(getattr(pool, '_edgekv_h1_freq', {}).get(block_id, 0)), recency, block_id)
-    if policy == 'h1_lpe':
-        # 对象级 rank：块继承所属对象的 score，使整个对象作为连续组被驱逐。
-        # score 越低排序越靠前（越先驱逐）；score 相等时，逻辑拒绝对象排在已接受对象前；
-        # pinned 对象沉到末尾，永不作为 victim。
-        if block_id in getattr(pool, '_edgekv_h1_pinned', set()):
-            return (float('inf'), 1, 0)
-        profile = _edgekv_block_profile(pool, block_id)
-        if profile is None:
-            score = float(getattr(pool, '_edgekv_h1_scores', {}).get(block_id, 0.0) or 0.0)
-            return (score, 1, block_id)
-        score = float(profile.get('score', 0.0) or 0.0)
-        rejected_order = 0 if profile.get('admission_rejected') else 1
-        object_key = int(profile.get('object_sort_key') or _edgekv_object_sort_key(profile.get('object_id', '')))
-        return (score, rejected_order, object_key)
     return (float(recency), 0, block_id)
+
+
+def _edgekv_policy_on_admit(
+    pool: Any,
+    block_id: int,
+    *,
+    score: float = 0.0,
+    p_reuse: float = 0.5,
+    pinned: bool = False,
+    profile: dict[str, Any] | None = None,
+) -> None:
+    policy = _edgekv_policy_instance()
+    if policy is not None and AdmitInfo is not None:
+        policy.on_admit(pool, int(block_id), AdmitInfo(score=score, p_reuse=p_reuse, pinned=pinned, profile=profile))
+        return
+    pool._edgekv_h1_seq += 1
+    pool._edgekv_h1_scores[int(block_id)] = float(score)
+    pool._edgekv_h1_freq[int(block_id)] = max(int(pool._edgekv_h1_freq.get(int(block_id), 0)), 1)
+    pool._edgekv_h1_recency[int(block_id)] = pool._edgekv_h1_seq
+    if pinned:
+        pool._edgekv_h1_pinned.add(int(block_id))
+
+
+def _edgekv_policy_on_access(
+    pool: Any,
+    block_id: int,
+    *,
+    profile: dict[str, Any] | None = None,
+    refreshed: bool = False,
+) -> None:
+    policy = _edgekv_policy_instance()
+    if policy is not None and AccessInfo is not None:
+        policy.on_access(pool, int(block_id), AccessInfo(profile=profile, refreshed=refreshed))
+        return
+    pool._edgekv_h1_seq += 1
+    pool._edgekv_h1_freq[int(block_id)] = int(pool._edgekv_h1_freq.get(int(block_id), 0)) + 1
+    pool._edgekv_h1_recency[int(block_id)] = pool._edgekv_h1_seq
+
+
+def _edgekv_policy_refresh_block_score(pool: Any, block_id: int, profile: dict[str, Any]) -> None:
+    policy = _edgekv_policy_instance()
+    if policy is not None:
+        policy.refresh_block_score(pool, int(block_id), profile)
+        return
+    pool._edgekv_h1_p_reuse[int(block_id)] = float(profile.get('p_reuse', 0.5))
+    pool._edgekv_h1_scores[int(block_id)] = float(profile.get('score', 0.0))
+    pool._edgekv_h1_score_update_seq[int(block_id)] = int(profile.get('score_update_seq', 0) or 0)
+
+
+def _edgekv_policy_on_evict(
+    pool: Any,
+    block_id: int,
+    *,
+    profile: dict[str, Any] | None = None,
+    score: float = 0.0,
+    p_reuse: float = 0.0,
+) -> None:
+    policy = _edgekv_policy_instance()
+    if policy is not None and EvictInfo is not None:
+        policy.on_evict(pool, int(block_id), EvictInfo(profile=profile, score=score, p_reuse=p_reuse))
+        return
+    pool._edgekv_h1_scores.pop(int(block_id), None)
+    pool._edgekv_h1_p_reuse.pop(int(block_id), None)
+    pool._edgekv_h1_score_update_seq.pop(int(block_id), None)
+    pool._edgekv_h1_freq.pop(int(block_id), None)
+    pool._edgekv_h1_recency.pop(int(block_id), None)
+    pool._edgekv_h1_access_history.pop(int(block_id), None)
+    pool._edgekv_h1_pinned.discard(int(block_id))
 
 
 def _edgekv_heap_touch_block(pool: Any, block: Any) -> None:
@@ -879,14 +1003,27 @@ def _edgekv_group_bytes_per_token(group_id: int) -> float:
     return 0.0
 
 
-def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
-    """使用对象的 *逻辑* KV 大小重新计算 LPE score。
+def _edgekv_lpe_scorer():
+    """返回当前生效的 LPE 打分器：LPE 模式用策略实例的 scorer，否则用模块级默认。"""
+    global _EDGEKV_DEFAULT_LPE_SCORER
+    policy = _edgekv_policy_instance()
+    scorer = getattr(policy, 'scorer', None) if policy is not None else None
+    if scorer is not None:
+        return scorer
+    if _DefaultLPEScorer is None:
+        return None
+    if _EDGEKV_DEFAULT_LPE_SCORER is None:
+        _EDGEKV_DEFAULT_LPE_SCORER = _DefaultLPEScorer()
+    return _EDGEKV_DEFAULT_LPE_SCORER
 
-    score 分母是对象的逻辑大小（由 token 数派生的稳定量），不是当前驻留 block 字节数。
-    使用驻留字节会让较低的 resident_block_count（例如部分驱逐后剩下 1 个 block）
-    缩小分母，并让 score 被数量级地放大。resident_size_mb 只保留作诊断和对象级驱逐组
-    尺寸统计，永不参与 score 除法。
-    """
+
+def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
+    """重算 LPE score（委托打分器；算式见 policies/lpe.py DefaultLPEScorer）。"""
+    scorer = _edgekv_lpe_scorer()
+    if scorer is not None:
+        scorer.recompute_score(profile)
+        return
+    # 兜底：policies 导入失败时的原始内联实现（与 DefaultLPEScorer 逐字一致）。
     n_tokens = max(float(profile.get('n_tokens', 1) or 1), 1.0)
     bytes_per_token = float(profile.get('bytes_per_token', 0.0) or 0.0)
     if bytes_per_token > 0.0:
@@ -901,8 +1038,6 @@ def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
     resident_bytes = int(profile.get('size_bytes', 0) or 0)
     profile['resident_size_mb'] = float(resident_bytes) / 1024.0 / 1024.0
 
-    # size_mb / size_source 现在镜像逻辑（score）大小，使任何旧版 size_mb 读取方都能
-    # 看到真正作为 score 分母的值。
     profile['size_mb'] = logical_size_mb
     profile['size_source'] = score_size_source
 
@@ -1491,11 +1626,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                                 score_refreshed=refreshed,
                             )
                             if refreshed:
-                                self._edgekv_h1_p_reuse[block_id] = float(profile.get('p_reuse', 0.5))
-                                self._edgekv_h1_scores[block_id] = float(profile.get('score', 0.0))
-                                self._edgekv_h1_score_update_seq[block_id] = int(
-                                    profile.get('score_update_seq', 0) or 0
-                                )
+                                _edgekv_policy_refresh_block_score(self, block_id, profile)
                                 _edgekv_heap_touch_block(self, block)
         _edgekv_note_policy_time(start_ns)
         return result
@@ -1554,7 +1685,6 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
             if getattr(block, 'is_null', False):
                 continue
             block_id = _edgekv_block_id(block)
-            self._edgekv_h1_seq += 1
             score = float(meta.get('score', 0.0) or 0.0)
             p_reuse = float(meta.get('p_reuse', 0.5) or 0.5)
             profile: dict[str, Any] | None = None
@@ -1588,15 +1718,14 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                     admission_object_blocks.setdefault(object_id, []).append(block)
                     score = float(profile.get('score', score) or score)
                     p_reuse = float(profile.get('p_reuse', p_reuse) or p_reuse)
-                    self._edgekv_h1_p_reuse[block_id] = p_reuse
-                    self._edgekv_h1_score_update_seq[block_id] = int(
-                        profile.get('score_update_seq', 0) or 0
-                    )
-                if pinned:
-                    self._edgekv_h1_pinned.add(block_id)
-            self._edgekv_h1_scores[block_id] = score
-            self._edgekv_h1_freq[block_id] = max(int(self._edgekv_h1_freq.get(block_id, 0)), 1)
-            self._edgekv_h1_recency[block_id] = self._edgekv_h1_seq
+            _edgekv_policy_on_admit(
+                self,
+                block_id,
+                score=score,
+                p_reuse=p_reuse,
+                pinned=pinned,
+                profile=profile,
+            )
             _edgekv_heap_touch_block(self, block)
             _edgekv_note_gpu_stat('cached_blocks')
             _edgekv_note_gpu_stat('admissions')
@@ -1699,13 +1828,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                 p_reuse=p_reuse,
             )
             _edgekv_drop_block_object(self, kv_cache_group_id, block_id)
-        self._edgekv_h1_scores.pop(block_id, None)
-        self._edgekv_h1_p_reuse.pop(block_id, None)
-        self._edgekv_h1_score_update_seq.pop(block_id, None)
-        self._edgekv_h1_freq.pop(block_id, None)
-        self._edgekv_h1_recency.pop(block_id, None)
-        self._edgekv_h1_access_history.pop(block_id, None)
-        self._edgekv_h1_pinned.discard(block_id)
+        _edgekv_policy_on_evict(self, block_id, profile=profile, score=score, p_reuse=p_reuse)
         _edgekv_heap_drop_block(self, block_id)
         self._edgekv_h1_recent_evictions = int(getattr(self, '_edgekv_h1_recent_evictions', 0) or 0) + 1
         self._edgekv_h1_queue_dirty = True
@@ -1725,23 +1848,20 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
                     _edgekv_note_gpu_stat('touches')
                     if needs_state:
                         block_id = _edgekv_block_id(block)
-                        self._edgekv_h1_seq += 1
-                        self._edgekv_h1_freq[block_id] = int(self._edgekv_h1_freq.get(block_id, 0)) + 1
-                        self._edgekv_h1_recency[block_id] = self._edgekv_h1_seq
+                        profile = None
+                        refreshed = False
                         if _EDGEKV_GPU_POLICY_IS_LPE:
                             profile = _edgekv_block_profile(self, block_id)
                             if profile is not None:
                                 score_update_seq = int(profile.get('score_update_seq', 0) or 0)
-                                if self._edgekv_h1_score_update_seq.get(block_id) != score_update_seq:
-                                    self._edgekv_h1_p_reuse[block_id] = float(profile.get('p_reuse', 0.5))
-                                    self._edgekv_h1_scores[block_id] = float(profile.get('score', 0.0))
-                                    self._edgekv_h1_score_update_seq[block_id] = score_update_seq
+                                refreshed = self._edgekv_h1_score_update_seq.get(block_id) != score_update_seq
                                 _edgekv_record_lpe_monitor(
                                     'touch',
                                     block_id=block_id,
                                     profile=profile,
                                     hit=None,
                                 )
+                        _edgekv_policy_on_access(self, block_id, profile=profile, refreshed=refreshed)
                         _edgekv_heap_touch_block(self, block)
         _edgekv_note_policy_time(start_ns)
         return original_touch(self, blocks)

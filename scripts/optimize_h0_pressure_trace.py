@@ -31,6 +31,7 @@ if str(H0_DIR) not in sys.path:
 from run_h0_vllm import (  # noqa: E402
     DEFAULT_HOTPOTQA_PATH,
     DEFAULT_SHAREGPT_TRACE_PATH,
+    build_sharegpt_cumulative_sessions,
     estimate_tokens,
     hotpotqa_high_frequency_group_order,
     load_hotpotqa_chunk_groups,
@@ -896,13 +897,27 @@ def source_temperature_stats(sessions: Sequence[dict[str, Any]], source: str) ->
     hot = [row for row in rows if row.get("temperature") == "hot"]
     cold = [row for row in rows if row.get("temperature") == "cold"]
     token_key = "prompt_est_tokens"
+    cumulative_turns = [
+        turn
+        for row in rows
+        if row.get("turns_format") == "cumulative_user"
+        for turn in row.get("turns", [])
+    ]
+    cumulative_tokens = [
+        estimate_tokens(str(turn.get("user", "")))
+        for turn in cumulative_turns
+        if str(turn.get("user", "")).strip()
+    ]
     return {
         "hot_objects": len({row["reuse_key"] for row in hot}),
         "cold_objects": len({row["reuse_key"] for row in cold}),
         "hot_accesses": len(hot),
         "cold_accesses": len(cold),
-        "avg_hot_prompt_est_tokens": round(average([int(row[token_key]) for row in hot]), 2),
-        "avg_cold_prompt_est_tokens": round(average([int(row[token_key]) for row in cold]), 2),
+        "cumulative_sessions": len([row for row in rows if row.get("turns_format") == "cumulative_user"]),
+        "cumulative_turns": len(cumulative_turns),
+        "avg_cumulative_prompt_est_tokens": round(average(cumulative_tokens), 2),
+        "avg_hot_prompt_est_tokens": round(average([int(row.get(token_key, 0)) for row in hot]), 2),
+        "avg_cold_prompt_est_tokens": round(average([int(row.get(token_key, 0)) for row in cold]), 2),
     }
 
 
@@ -948,15 +963,26 @@ def build_summary(args: argparse.Namespace, sessions: Sequence[dict[str, Any]], 
 
     all_hot = [row for row in sessions if row.get("temperature") == "hot"]
     all_cold = [row for row in sessions if row.get("temperature") == "cold"]
+    sharegpt_cumulative = [
+        row for row in sessions
+        if row.get("source") == "sharegpt" and row.get("turns_format") == "cumulative_user"
+    ]
+    sharegpt_cumulative_turns = sum(len(row.get("turns", [])) for row in sharegpt_cumulative)
     summary = {
         "out": str(args.out.expanduser()),
         "source_mode": args.source_mode,
         "total_requests": len(sessions),
+        "expanded_total_requests": (
+            len([row for row in sessions if row.get("source") != "sharegpt"])
+            + sharegpt_cumulative_turns
+        ),
+        "sharegpt_cumulative_sessions": len(sharegpt_cumulative),
+        "sharegpt_cumulative_turns": sharegpt_cumulative_turns,
         "unique_prompt_prefix_families": len(prompt_prefix_families(sessions)),
         "sharegpt": source_temperature_stats(sessions, "sharegpt"),
         "rag": source_temperature_stats(sessions, "hotpotqa"),
-        "avg_hot_prompt_est_tokens": round(average([int(row["prompt_est_tokens"]) for row in all_hot]), 2),
-        "avg_cold_prompt_est_tokens": round(average([int(row["prompt_est_tokens"]) for row in all_cold]), 2),
+        "avg_hot_prompt_est_tokens": round(average([int(row.get("prompt_est_tokens", 0)) for row in all_hot]), 2),
+        "avg_cold_prompt_est_tokens": round(average([int(row.get("prompt_est_tokens", 0)) for row in all_cold]), 2),
         "estimated_hot_working_set_tokens": sum(prefix_hot_first_access.values()),
         "estimated_cold_scan_tokens_per_round": cold_scan_tokens_by_round,
         "budget_ladder_prefix_requests": len(prefix),
@@ -968,8 +994,8 @@ def build_summary(args: argparse.Namespace, sessions: Sequence[dict[str, Any]], 
             "ladder_segments": args.ladder_segments,
         },
         "expected_behavior": (
-            "Low KV budgets should evict many primed hot prefixes during each unique cold scan; "
-            "mid/high budgets should retain increasingly more hot object prefixes, raising prefix-cache hit rate."
+            "ShareGPT rows use real cumulative dialogue context. HotpotQA/RAG rows retain the budget ladder "
+            "when present; pure ShareGPT mode preserves original session/turn order for prefix-cache reuse."
         ),
     }
     return summary
@@ -1156,17 +1182,14 @@ def main() -> None:
 
     sharegpt_sessions: list[dict[str, Any]] = []
     if args.source_mode in {"mixed", "sharegpt"}:
-        sharegpt_sessions = build_hot_cold_sharegpt_sessions(
+        sharegpt_sessions, sharegpt_meta = build_sharegpt_cumulative_sessions(
             args.sharegpt_path.expanduser(),
-            args.sharegpt_groups,
-            args.hot_ratio,
-            args.hot_repeats,
-            args.hot_context_words,
-            args.cold_context_words,
-            args.min_context_words,
-            args.random_seed,
-            args.prompt_prefix_mode,
+            max_turns=args.sharegpt_groups,
+            min_human_turns=2,
+            order=args.sharegpt_order,
         )
+    else:
+        sharegpt_meta = {}
 
     rag_sessions: list[dict[str, Any]] = []
     if args.source_mode in {"mixed", "hotpotqa"}:
@@ -1184,10 +1207,15 @@ def main() -> None:
             timeout_s=args.timeout_s,
             prompt_prefix_mode=args.prompt_prefix_mode,
         )
-    all_sessions = sharegpt_sessions + rag_sessions
-    if args.reuse_schedule == "segmented_ladder":
+    if args.source_mode == "sharegpt":
+        sessions = sharegpt_sessions
+        prefix = sharegpt_sessions
+    elif args.source_mode == "mixed":
+        sessions = sharegpt_sessions + rag_sessions
+        prefix = sessions
+    elif args.reuse_schedule == "segmented_ladder":
         sessions, prefix = segmented_ladder_order(
-            all_sessions,
+            rag_sessions,
             hot_objects=args.scan_hot_objects,
             cold_scan_objects=args.scan_cold_objects,
             probe_rounds=args.scan_probe_rounds,
@@ -1195,13 +1223,17 @@ def main() -> None:
         )
     else:
         sessions, prefix = budget_ladder_order(
-            all_sessions,
+            rag_sessions,
             hot_objects=args.scan_hot_objects,
             cold_scan_objects=args.scan_cold_objects,
             probe_rounds=args.scan_probe_rounds,
         )
     write_replay_trace(args.out.expanduser(), sessions)
     summary = build_summary(args, sessions, prefix)
+    if sharegpt_meta:
+        summary["sharegpt_cumulative_meta"] = sharegpt_meta
+        summary["prefix_layout"] = "original_conversation_cumulative"
+        summary["trace_format"] = "mixed_session_cumulative_user_and_complete_prompt"
     summary_path = args.out.expanduser().with_suffix(args.out.expanduser().suffix + ".summary.json")
     removed_old_trace_files: list[str] = []
     if not args.keep_other_traces:

@@ -235,6 +235,168 @@ def load_sharegpt_sessions(path: Path, max_sessions: int, order: str = "file") -
     return sessions[:max_sessions]
 
 
+def build_sharegpt_cumulative_sessions(
+    path: Path,
+    max_turns: int,
+    min_human_turns: int = 2,
+    order: str = "file",
+    max_prompt_est_tokens: int = 0,
+) -> tuple[List[dict], dict]:
+    """Build one JSONL row per ShareGPT session with cumulative prompts.
+
+    ``max_turns`` caps the expanded request count, not the number of sessions.
+    The last emitted session may be truncated to respect that cap.
+    """
+    if max_turns <= 0:
+        raise ValueError("max_turns must be > 0")
+    if min_human_turns <= 0:
+        raise ValueError("min_human_turns must be > 0")
+    if max_prompt_est_tokens < 0:
+        raise ValueError("max_prompt_est_tokens must be >= 0")
+    with path.open("r", encoding="utf-8") as f:
+        raw_rows = json.load(f)
+    if not isinstance(raw_rows, list):
+        raise ValueError(f"ShareGPT input must be a JSON list: {path}")
+
+    candidates: List[dict] = []
+    skipped_non_list_conversations = 0
+    skipped_min_human_turns = 0
+    skipped_first_role = 0
+    for raw_session_idx, raw in enumerate(raw_rows):
+        if not isinstance(raw, dict):
+            skipped_non_list_conversations += 1
+            continue
+        conversations = raw.get("conversations", [])
+        if not isinstance(conversations, list):
+            skipped_non_list_conversations += 1
+            continue
+
+        first_role = ""
+        turns: List[dict] = []
+        current_turn: dict | None = None
+        for msg in conversations:
+            if not isinstance(msg, dict):
+                continue
+            role = message_role(msg)
+            text = message_text(msg).strip()
+            if not text:
+                continue
+            if not first_role:
+                first_role = role
+            if role in {"human", "user"}:
+                current_turn = {"i": len(turns), "user": text}
+                turns.append(current_turn)
+            elif role in {"gpt", "assistant"} and current_turn is not None and "assistant" not in current_turn:
+                current_turn["assistant"] = text
+
+        if first_role not in {"human", "user"}:
+            skipped_first_role += 1
+            continue
+        if len(turns) < min_human_turns:
+            skipped_min_human_turns += 1
+            continue
+        session_id = str(raw.get("id", f"sharegpt_{raw_session_idx:06d}"))
+        candidates.append(
+            {
+                "session_id": session_id,
+                "source": "sharegpt",
+                "object_type": "sharegpt_session_prefix",
+                "reuse_key": session_id,
+                "source_index": raw_session_idx,
+                "total_user_chars": sum(len(str(turn.get("user", ""))) for turn in turns),
+                "first_nonempty_role": first_role,
+                "raw_turns": turns,
+            }
+        )
+
+    if order == "longest":
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("total_user_chars", 0)),
+                len(item.get("raw_turns", [])),
+            ),
+            reverse=True,
+        )
+    elif order != "file":
+        raise ValueError(f"unsupported ShareGPT order: {order}")
+
+    sessions: List[dict] = []
+    written_turns = 0
+    prompt_token_estimates: List[int] = []
+    for candidate in candidates:
+        if written_turns >= max_turns:
+            break
+        if max_turns - written_turns < min_human_turns:
+            break
+        transcript: List[str] = []
+        cumulative_turns: List[dict] = []
+        for turn in candidate["raw_turns"]:
+            if written_turns + len(cumulative_turns) >= max_turns:
+                break
+            user_text = str(turn.get("user", "")).strip()
+            if not user_text:
+                continue
+            prompt = "\n".join(transcript + [f"User: {user_text}", "Assistant:"])
+            prompt_est_tokens = estimate_tokens(prompt)
+            if max_prompt_est_tokens and prompt_est_tokens > max_prompt_est_tokens:
+                break
+            prompt_token_estimates.append(prompt_est_tokens)
+            next_turn = dict(turn)
+            next_turn["user"] = prompt
+            next_turn["i"] = len(cumulative_turns)
+            cumulative_turns.append(next_turn)
+            transcript.append(f"User: {user_text}")
+            assistant_text = str(turn.get("assistant", "")).strip()
+            if assistant_text:
+                transcript.append(f"Assistant: {assistant_text}")
+        if len(cumulative_turns) >= min_human_turns:
+            written_turns += len(cumulative_turns)
+            sessions.append(
+                {
+                    "session_id": str(candidate["session_id"]),
+                    "source": "sharegpt",
+                    "workload": "sharegpt_session_prefix",
+                    "object_type": "sharegpt_session_prefix",
+                    "reuse_key": str(candidate["reuse_key"]),
+                    "turns_format": "cumulative_user",
+                    "source_index": int(candidate["source_index"]),
+                    "total_user_chars": int(candidate["total_user_chars"]),
+                    "first_nonempty_role": str(candidate["first_nonempty_role"]),
+                    "turns": cumulative_turns,
+                }
+            )
+
+    summary = {
+        "sharegpt_path": str(path),
+        "source": "sharegpt",
+        "prefix_layout": "original_conversation_cumulative",
+        "turns_format": "cumulative_user",
+        "sessions": len(sessions),
+        "written_requests": written_turns,
+        "max_turns": max_turns,
+        "min_human_turns": min_human_turns,
+        "max_prompt_est_tokens": max_prompt_est_tokens,
+        "order": order,
+        "scanned_sessions": len(raw_rows),
+        "eligible_sessions": len(candidates),
+        "skipped_sessions": {
+            "non_list_or_missing_conversations": skipped_non_list_conversations,
+            "first_nonempty_role_not_human_or_user": skipped_first_role,
+            "fewer_than_min_human_turns": skipped_min_human_turns,
+        },
+        "prompt_content": "cumulative_user_assistant_history",
+        "assistant_text_preserved": True,
+        "history_prefix_preserved": True,
+        "prompt_est_tokens_avg": (
+            sum(prompt_token_estimates) / len(prompt_token_estimates)
+            if prompt_token_estimates else 0.0
+        ),
+        "prompt_est_tokens_min": min(prompt_token_estimates) if prompt_token_estimates else 0,
+        "prompt_est_tokens_max": max(prompt_token_estimates) if prompt_token_estimates else 0,
+    }
+    return sessions, summary
+
+
 def sharegpt_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
     prompts: List[dict] = []
     session_id = str(session["session_id"])
@@ -793,11 +955,19 @@ def complete_prompt_session_to_prompts(session: dict, tokenizer=None) -> List[di
 def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
     prompts: List[dict] = []
     session_id = str(session["session_id"])
-    for turn in session.get("turns", []):
-        turn_index = int(turn.get("i", len(prompts)))
+    turns = session.get("turns")
+    if not isinstance(turns, list) or not turns:
+        raise ValueError(f"cumulative_user session {session_id!r} must have nonempty turns list")
+    for turn in turns:
+        if not isinstance(turn, dict):
+            raise ValueError(f"cumulative_user session {session_id!r} has non-object turn")
+        try:
+            turn_index = int(turn.get("i"))
+        except (TypeError, ValueError):
+            raise ValueError(f"cumulative_user session {session_id!r} turn has invalid i")
         user_text = str(turn.get("user", "")).strip()
         if not user_text:
-            continue
+            raise ValueError(f"cumulative_user session {session_id!r} turn {turn_index} has empty user")
         rag = turn.get("rag")
         rag_prefix = ""
         if isinstance(rag, dict):
@@ -809,7 +979,7 @@ def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[di
                 rag_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
         prompt = rag_prefix + user_text
         row = {
-            "request_id": f"{session_id}:turn:{turn_index:03d}",
+            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
             "session_id": session_id,
             "turn_index": turn_index,
             "prompt": prompt,
@@ -820,6 +990,10 @@ def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[di
             "object_type": str(session.get("object_type", "sharegpt_session_prefix")),
             "reuse_key": str(session.get("reuse_key", session_id)),
             "replay_source": "frozen_replay_trace",
+            "history_format": "cumulative_user",
+            "history_turns": turn_index + 1,
+            "history_prompt_chars": len(prompt),
+            "replay_trace_format": "session_cumulative_user",
         }
         if isinstance(rag, dict):
             chunks = rag.get("chunks", [])
