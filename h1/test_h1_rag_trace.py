@@ -371,7 +371,7 @@ def test_h1_order_trace_round_robin_interleaves_sessions() -> None:
         {"session_id": "s2", "turn_index": 1, "_trace_original_index": 5},
     ]
 
-    ordered = h1.order_trace_for_batches(trace, "round_robin")
+    ordered = h1.order_trace_for_batches(trace, "round_robin", replay_batch_size=3)
 
     assert [(row["session_id"], row["turn_index"]) for row in ordered] == [
         ("s0", 0),
@@ -379,6 +379,28 @@ def test_h1_order_trace_round_robin_interleaves_sessions() -> None:
         ("s2", 0),
         ("s0", 1),
         ("s1", 1),
+        ("s2", 1),
+    ]
+
+
+def test_h1_order_trace_round_robin_uses_session_windows() -> None:
+    trace = [
+        {"session_id": "s0", "turn_index": 0, "_trace_original_index": 0},
+        {"session_id": "s0", "turn_index": 1, "_trace_original_index": 1},
+        {"session_id": "s1", "turn_index": 0, "_trace_original_index": 2},
+        {"session_id": "s1", "turn_index": 1, "_trace_original_index": 3},
+        {"session_id": "s2", "turn_index": 0, "_trace_original_index": 4},
+        {"session_id": "s2", "turn_index": 1, "_trace_original_index": 5},
+    ]
+
+    ordered = h1.order_trace_for_batches(trace, "round_robin", replay_batch_size=2)
+
+    assert [(row["session_id"], row["turn_index"]) for row in ordered] == [
+        ("s0", 0),
+        ("s1", 0),
+        ("s0", 1),
+        ("s1", 1),
+        ("s2", 0),
         ("s2", 1),
     ]
 
@@ -393,15 +415,15 @@ def test_h1_order_trace_round_robin_handles_uneven_sessions() -> None:
         {"session_id": "s2", "turn_index": 1, "_trace_original_index": 5},
     ]
 
-    ordered = h1.order_trace_for_batches(trace, "round_robin")
+    ordered = h1.order_trace_for_batches(trace, "round_robin", replay_batch_size=2)
 
     assert [(row["session_id"], row["turn_index"]) for row in ordered] == [
         ("s0", 0),
         ("s1", 0),
-        ("s2", 0),
         ("s0", 1),
-        ("s2", 1),
         ("s0", 2),
+        ("s2", 0),
+        ("s2", 1),
     ]
 
 
@@ -414,7 +436,7 @@ def test_h1_order_trace_round_robin_appends_orphans() -> None:
         {"session_id": "", "request_id": "orphan_1", "_trace_original_index": 4},
     ]
 
-    ordered = h1.order_trace_for_batches(trace, "round_robin")
+    ordered = h1.order_trace_for_batches(trace, "round_robin", replay_batch_size=2)
 
     assert [
         (row.get("session_id", ""), row.get("turn_index", row.get("request_id")))
@@ -435,8 +457,8 @@ def test_h1_round_robin_batches_have_unique_sessions() -> None:
         for turn in range(3)
     ]
 
-    ordered = h1.order_trace_for_batches(trace, "round_robin")
-    batches = h1.replay_batches(ordered, replay_batch_size=8)
+    ordered = h1.order_trace_for_batches(trace, "round_robin", replay_batch_size=3)
+    batches = h1.replay_batches(ordered, replay_batch_size=3)
 
     for _, batch in batches:
         session_ids = [row["session_id"] for row in batch if row.get("session_id")]

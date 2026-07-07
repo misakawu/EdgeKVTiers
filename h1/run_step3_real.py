@@ -53,6 +53,7 @@ RAG_CHUNKS_PER_QUERY = 2
 RAG_QUERY_REPEATS = 4
 MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
+MAX_NUM_BATCHED_TOKENS = 8192
 # 默认使用保守压力点。可用 --batch-sweep 8 16 32 64 根据 queue_wait_p95_ms /
 # ttft_proxy_p95_ms 和策略区分度选择最终工作点，避免默认把批大小 64
 # 作为主要结论。
@@ -122,6 +123,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, replay_batch_size: int,
         "--max-tokens", str(MAX_TOKENS),
         "--replay-batch-size", str(replay_batch_size),
         "--batch-order", args.batch_order,
+        "--max-num-batched-tokens", str(args.max_num_batched_tokens),
         "--warmup-batches", str(args.warmup_batches),
         "--visible-devices", args.visible_devices,
     ]
@@ -136,6 +138,7 @@ def summary_matches_config(summary_json: Path, replay_batch_size: int,
     return (
         int(data.get("replay_batch_size", -1)) == replay_batch_size
         and str(data.get("batch_order", DEFAULT_BATCH_ORDER)) == args.batch_order
+        and int(data.get("max_num_batched_tokens", -1)) == args.max_num_batched_tokens
         and int(data.get("warmup_batches", DEFAULT_WARMUP_BATCHES)) == args.warmup_batches
     )
 
@@ -158,6 +161,8 @@ def main() -> None:
     ap.add_argument("--batch-order", choices=("original", "length_bucket"),
                     default=DEFAULT_BATCH_ORDER,
                     help="request order before batching; length_bucket groups similar prompt lengths")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=MAX_NUM_BATCHED_TOKENS,
+                    help="vLLM scheduler token cap; keep fixed while sweeping replay batch size")
     ap.add_argument("--warmup-batches", type=int, default=DEFAULT_WARMUP_BATCHES,
                     help="run this many synthetic warmup batches before measured replay")
     ap.add_argument("--sharegpt-path", default=SHAREGPT_PATH)

@@ -41,8 +41,10 @@ MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
 # REPLAY_BATCH_SIZE = 64
 REPLAY_BATCH_SIZE=16
-# MAX_NUM_BATCHED_TOKENS = 64
-MAX_NUM_BATCHED_TOKENS = 32768   
+# Keep this decoupled from REPLAY_BATCH_SIZE. A larger replay batch raises
+# max_num_seqs; inflating the token cap at the same time can make vLLM fail
+# engine initialization on tight GPU-memory budgets.
+MAX_NUM_BATCHED_TOKENS = 8192
 BATCH_ORDER = "round_robin"
 TENSOR_PARALLEL_SIZE = 2
 PYTHONPATH = ".:h1:h0"

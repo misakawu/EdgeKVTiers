@@ -460,6 +460,7 @@ def length_bucket_id(n_tokens: int) -> int:
 def order_trace_for_batches(
     trace: list[dict[str, Any]],
     batch_order: str,
+    replay_batch_size: int | None = None,
 ) -> list[dict[str, Any]]:
     if batch_order == 'original':
         return list(trace)
@@ -471,6 +472,11 @@ def order_trace_for_batches(
         indexed.sort(key=lambda row: (row[0], row[1]))
         return [item for _, _, item in indexed]
     if batch_order == 'round_robin':
+        window_size = (
+            replay_batch_size
+            if replay_batch_size and replay_batch_size > 0
+            else max(1, len(trace))
+        )
         sessions: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         session_order: list[str] = []
         orphans: list[dict[str, Any]] = []
@@ -493,16 +499,18 @@ def order_trace_for_batches(
             for session_id in session_order
         ]
         ordered: list[dict[str, Any]] = []
-        offset = 0
-        while True:
-            emitted = False
-            for session_items in ordered_sessions:
-                if offset < len(session_items):
-                    ordered.append(session_items[offset])
-                    emitted = True
-            if not emitted:
-                break
-            offset += 1
+        for window_start in range(0, len(ordered_sessions), window_size):
+            window = ordered_sessions[window_start:window_start + window_size]
+            offset = 0
+            while True:
+                emitted = False
+                for session_items in window:
+                    if offset < len(session_items):
+                        ordered.append(session_items[offset])
+                        emitted = True
+                if not emitted:
+                    break
+                offset += 1
         ordered.extend(orphans)
         return ordered
     raise ValueError(f'unknown batch_order={batch_order!r}')
@@ -591,7 +599,8 @@ def request_trace_fields(
 
 
 def resolved_max_num_batched_tokens(args: argparse.Namespace) -> int:
-    default_value = args.max_model_len * args.replay_batch_size
+    upper_bound = args.max_model_len * args.replay_batch_size
+    default_value = min(8192, upper_bound)
     value = args.max_num_batched_tokens
     if value is None:
         return default_value
@@ -600,10 +609,10 @@ def resolved_max_num_batched_tokens(args: argparse.Namespace) -> int:
             'max_num_batched_tokens must be >= replay_batch_size '
             f'({value} < {args.replay_batch_size})'
         )
-    if value > default_value:
+    if value > upper_bound:
         raise ValueError(
             'max_num_batched_tokens must be <= max_model_len * replay_batch_size '
-            f'({value} > {default_value})'
+            f'({value} > {upper_bound})'
         )
     return value
 
@@ -719,7 +728,11 @@ def run_cell(
     try:
         monitor.start()
         llm = build_llm(args, policy, gpu_memory_utilization)
-        replay_trace = order_trace_for_batches(trace, args.batch_order)
+        replay_trace = order_trace_for_batches(
+            trace,
+            args.batch_order,
+            args.replay_batch_size,
+        )
         batches = replay_batches(replay_trace, args.replay_batch_size)
         print(
             f"[cell] policy={policy} budget={budget_name} requests={len(replay_trace)} "
@@ -1193,8 +1206,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             'Order requests before batching. original preserves trace order; '
             'length_bucket groups similar prompt lengths while preserving order '
-            'within each length bucket; round_robin interleaves sessions so a '
-            'batch tends to contain one request from each session.'
+            'within each length bucket; round_robin interleaves active session '
+            'windows sized by replay batch size so a batch tends to contain one '
+            'request from each session.'
         ),
     )
     parser.add_argument(
@@ -1209,7 +1223,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             'vLLM scheduler/profile token cap. Defaults to '
-            'max_model_len * replay_batch_size for backward compatibility.'
+            'min(8192, max_model_len * replay_batch_size) so increasing '
+            'replay batch size does not also inflate the prefill token budget.'
         ),
     )
     parser.add_argument('--c-re-ms-per-token', type=float, default=float(os.environ.get('EDGEKV_C_RE_MS_PER_TOKEN', DEFAULT_C_RE_MS_PER_TOKEN)))
