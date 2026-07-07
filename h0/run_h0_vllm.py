@@ -37,6 +37,9 @@ DEFAULT_HOTPOTQA_PATH = REPO_ROOT / "data" / "hotpotqa"
 DEFAULT_REPLAY_TRACE_PATH = (
     REPO_ROOT / "data" / "edgekv_traces" / "sharegpt_hotpotqa_session.jsonl"
 )
+# structured_conversation_v2 回放：session 不带 system_prompt 时用此默认系统提示，
+# 与生成器 scripts/sharedgpt_structured_trace.py 保持一致，保证渲染确定性。
+DEFAULT_SYSTEM_PROMPT = "You are a helpful, accurate assistant."
 HOTPOTQA_HF_BASE_URL = "https://huggingface.co/datasets/hotpotqa/hotpot_qa/resolve/main/distractor"
 HOTPOTQA_HF_FILES = (
     "validation-00000-of-00001.parquet",
@@ -1117,6 +1120,81 @@ def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[di
     return prompts
 
 
+def load_structured_conversation(session: dict, tokenizer=None) -> List[dict]:
+    """structured_conversation_v2：动态累积历史 → apply_chat_template 渲染纯文本 Prompt。
+
+    Trace 只存原始多轮消息（role/content/turn_index），渲染/分词职责全在此处。
+    不产出 prompt_token_ids/prefix_hash：下游 run_cell 缺 prompt_token_ids 时会自动
+    改喂 str(item['prompt'])，vLLM 内置前缀缓存对确定性渲染的纯文本同样命中。
+    命中/复用统计一律走回放器真实执行，不再有 trace-side 模拟。
+    """
+    session_id = str(session.get("session_id", session.get("session_group_id", ""))).strip()
+    if not session_id:
+        raise ValueError("structured_conversation_v2 session missing session_id")
+    messages = session.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError(f"structured_conversation_v2 session {session_id!r} must have nonempty messages")
+    if tokenizer is None or not getattr(tokenizer, "apply_chat_template", None):
+        raise ValueError(
+            f"structured_conversation_v2 session {session_id!r} requires a tokenizer with a chat template"
+        )
+
+    system_prompt = session.get("system_prompt")
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        system_prompt = DEFAULT_SYSTEM_PROMPT
+    history: List[dict] = [{"role": "system", "content": system_prompt}]
+    temperature = str(session.get("temperature", ""))
+    workload = str(session.get("workload", "sharegpt_session_prefix"))
+    object_type = str(session.get("object_type", "sharegpt_session_prefix"))
+    reuse_key = str(session.get("reuse_key", session_id))
+
+    prompts: List[dict] = []
+    user_turn = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            raise ValueError(f"structured_conversation_v2 session {session_id!r} has non-object message")
+        role = str(msg.get("role", "")).strip()
+        content = str(msg.get("content", ""))
+        if role == "user":
+            rendered = tokenizer.apply_chat_template(
+                history + [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt = rendered if isinstance(rendered, str) else str(rendered)
+            row = {
+                "request_id": f"{session_id}:turn:{user_turn:03d}",
+                "session_id": session_id,
+                "turn_index": user_turn,
+                "prompt": prompt,
+                "prompt_chars": len(prompt),
+                "prompt_est_tokens": estimate_tokens(prompt),
+                # n_tokens 为 max_model_len 过滤所必需（无 prompt_token_ids 时是唯一长度依据）。
+                "n_tokens": count_tokens(prompt, tokenizer),
+                "reuse_key": reuse_key,
+                "workload": workload,
+                "object_type": object_type,
+                "history_format": "structured_conversation_v2",
+                "history_turns": user_turn + 1,
+                "history_prompt_chars": len(prompt),
+                "replay_trace_format": "structured_conversation_v2",
+                "replay_source": "frozen_replay_trace",
+                "temperature": temperature,
+            }
+            for key, value in session.items():
+                if key not in row and key not in {"messages", "turns"}:
+                    row[key] = value
+            prompts.append(row)
+            history.append({"role": "user", "content": content})
+            user_turn += 1
+        else:
+            # assistant（及未来其它 role，如注入的检索上下文）只累积历史，不产出请求。
+            history.append({"role": role, "content": content})
+    if not prompts:
+        raise ValueError(f"structured_conversation_v2 session {session_id!r} produced no user turns")
+    return prompts
+
+
 def replay_sessions_to_prompts(sessions: Sequence[dict], tokenizer=None, max_requests: int = 0) -> List[dict]:
     prompts: List[dict] = []
     for session_index, session in enumerate(sessions):
@@ -1125,7 +1203,9 @@ def replay_sessions_to_prompts(sessions: Sequence[dict], tokenizer=None, max_req
         source = str(session.get("source", "sharegpt")).lower()
         turns_format = str(session.get("turns_format", ""))
         trace_format = str(session.get("trace_format", ""))
-        if trace_format == "sharegpt_token_delta_v1":
+        if trace_format == "structured_conversation_v2":
+            session_prompts = load_structured_conversation(session, tokenizer)
+        elif trace_format == "sharegpt_token_delta_v1":
             session_prompts = token_delta_session_to_prompts(session, tokenizer)
         elif turns_format == "cumulative_user":
             session_prompts = cumulative_user_session_to_prompts(session, tokenizer)

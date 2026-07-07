@@ -484,7 +484,7 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
     for index, item in enumerate(trace):
         session_id = str(item.get('session_id', ''))
         must_split = (
-            item.get('history_format') in {'cumulative_user', 'token_delta_chatml'}
+            item.get('history_format') in {'cumulative_user', 'token_delta_chatml', 'structured_conversation_v2'}
             and session_id
             and session_id in current_sessions
         )
@@ -496,7 +496,7 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
         if not current:
             current_start = index
         current.append(item)
-        if item.get('history_format') in {'cumulative_user', 'token_delta_chatml'} and session_id:
+        if item.get('history_format') in {'cumulative_user', 'token_delta_chatml', 'structured_conversation_v2'} and session_id:
             current_sessions.add(session_id)
     if current:
         batches.append((current_start, current))
@@ -516,29 +516,20 @@ def llm_generate_no_tqdm(llm: LLM, prompts: list[Any], sampling: list[SamplingPa
         return generate(prompts, sampling)
 
 
-def trace_side_reuse(
-    item: dict[str, Any], reuse_seen: set[str]
-) -> tuple[str, bool, str, bool]:
-    if item.get('history_format') == 'token_delta_chatml':
-        reuse_key = str(item.get('session_group_id', item.get('session_id', '')))
-        hit = int(item.get('reused_prefix_token_count', 0) or 0) > 0
-    else:
-        reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
-        hit = reuse_key in reuse_seen
-    rag_reuse_key = str(item.get('rag_reuse_key', ''))
-    rag_hit = bool(rag_reuse_key and rag_reuse_key in reuse_seen)
-    return reuse_key, hit, rag_reuse_key, rag_hit
-
-
 def request_trace_fields(
     item: dict[str, Any],
-    trace_hit: bool,
-    rag_hit: bool,
     policy: str,
     kv_mib_per_token: float,
     cop: COPProfiler,
     event_index: int,
 ) -> dict[str, Any]:
+    """产出对象成本列（COP）与引擎 meta 所需字段。
+
+    **不再产出任何 trace-side 模拟命中**：命中/复用统计只来自回放器真实执行
+    （sitecustomize 的 native_hits/native_queries）。COP 仅用于对象成本估计
+    （c_recomp/c_restore/risk_exp/size/object_id）与 p_reuse_prior seed；
+    update_from_item 的 hit 恒传 False，在线 p_reuse 由引擎从真实访问自算。
+    """
     workload = str(item.get('workload', 'sharegpt_session_prefix'))
     reuse_key = (
         str(item.get('session_group_id', item.get('session_id', '')))
@@ -547,7 +538,7 @@ def request_trace_fields(
     )
     profile = cop.update_from_item(
         item,
-        hit=bool(trace_hit or rag_hit),
+        hit=False,
         access_index=event_index,
     )
     fields = {k: v for k, v in item.items() if k not in {'prompt', 'prompt_token_ids', '_trace_original_index'}}
@@ -557,15 +548,6 @@ def request_trace_fields(
             'object_type': profile.object_type,
             'object_id': profile.object_id,
             'reuse_key': reuse_key,
-            'hit': trace_hit,
-            'hit_source': (
-                'trace_side_token_lcp'
-                if item.get('history_format') == 'token_delta_chatml'
-                else 'trace_side_rag_reuse_key' if rag_hit and not trace_hit else 'trace_side_reuse_key'
-            ),
-            'rag_hit': rag_hit if item.get('rag_reuse_key') else '',
-            'rag_hit_source': 'trace_side_rag_reuse_key' if item.get('rag_reuse_key') else '',
-            'p_reuse': round(profile.p_reuse, 6),
             'p_reuse_prior': (
                 round(float(profile.p_reuse_prior), 6)
                 if profile.p_reuse_prior is not None else item.get('p_reuse_prior', '')
@@ -573,7 +555,6 @@ def request_trace_fields(
             'c_recomp_ms': round(profile.c_recomp_ms, 6),
             'c_restore_ms': round(profile.c_restore_ms, 6),
             'risk_exp': round(profile.risk_exp, 6),
-            'score': round(profile.score, 9),
             'score_source': 'object_level_cop',
             'lpe_action': 'score_evaluated' if policy == 'h1_lpe' else '',
             'size_mb': round(profile.size_mb, 6),
@@ -674,7 +655,6 @@ def run_cell(
     started = time.time()
     ok = False
     error = ''
-    reuse_seen: set[str] = set()
     gpu_memory_utilization = float(budget['gpu_memory_utilization'])
     model_config = load_model_config(args.model)
     kv_mib_per_token = kv_size_mib_per_token(model_config, args.tensor_parallel_size)
@@ -748,18 +728,15 @@ def run_cell(
                 if item.get('prompt_token_ids') else str(item['prompt'])
                 for item in batch
             ]
-            trace_reuse = [trace_side_reuse(item, reuse_seen) for item in batch]
             trace_fields_batch = [
                 request_trace_fields(
                     item,
-                    reuse_info[1],
-                    reuse_info[3],
                     policy,
                     kv_mib_per_token,
                     cop,
                     batch_start + offset,
                 )
-                for offset, (item, reuse_info) in enumerate(zip(batch, trace_reuse))
+                for offset, item in enumerate(batch)
             ]
             sampling = [
                 SamplingParams(
@@ -774,13 +751,13 @@ def run_cell(
                             'object_type': trace_fields.get('object_type', ''),
                             'workload': trace_fields.get('workload', ''),
                             'n_tokens': trace_fields.get('n_tokens', 0),
-                            'p_reuse': trace_fields.get('p_reuse', 0.0),
+                            # 不再传伪造的 p_reuse/score：只传 p_reuse_prior 作先验 seed，
+                            # 在线 p_reuse 与 score 由引擎从真实访问/命中自算。
                             'p_reuse_prior': trace_fields.get('p_reuse_prior', ''),
                             'temperature': trace_fields.get('temperature', ''),
                             'c_recomp_ms': trace_fields.get('c_recomp_ms', 0.0),
                             'c_restore_ms': trace_fields.get('c_restore_ms', 0.0),
                             'risk_exp': trace_fields.get('risk_exp', 0.0),
-                            'score': trace_fields.get('score', 0.0),
                             'size_mb': trace_fields.get('size_mb', 0.0),
                         }
                     },
@@ -791,8 +768,8 @@ def run_cell(
             outputs = llm_generate_no_tqdm(llm, prompts, sampling)
             latency_ms = (time.perf_counter() - t0) * 1000.0
             batch_rows: list[dict[str, Any]] = []
-            for offset, (item, output, reuse_info, trace_fields) in enumerate(
-                zip(batch, outputs, trace_reuse, trace_fields_batch)
+            for offset, (item, output, trace_fields) in enumerate(
+                zip(batch, outputs, trace_fields_batch)
             ):
                 text = output.outputs[0].text
                 timing = request_output_timing_ms(output)
@@ -804,7 +781,6 @@ def run_cell(
                     else latency_ms
                 )
                 idx = batch_start + offset
-                reuse_key, trace_hit, rag_reuse_key, rag_hit = reuse_info
                 row = {
                     **trace_fields,
                     'experiment': 'H1_vLLM_real_0_5_1',
@@ -830,8 +806,8 @@ def run_cell(
                     'tensor_parallel_size': args.tensor_parallel_size,
                     'kv_cache_location': 'gpu',
                 }
-                if rag_reuse_key:
-                    row['rag_reuse_key'] = rag_reuse_key
+                if item.get('rag_reuse_key'):
+                    row['rag_reuse_key'] = str(item.get('rag_reuse_key', ''))
                 batch_rows.append(row)
             batch_queue_values = [
                 float(row.get('queue_wait_ms', 0.0) or 0.0)
@@ -846,15 +822,6 @@ def run_cell(
             for row in batch_rows:
                 row['batch_queue_span_ms'] = round(batch_queue_span_ms, 6)
                 rows.append(row)
-            for item in batch:
-                reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
-                if item.get('history_format') == 'token_delta_chatml':
-                    reuse_key = str(item.get('session_group_id', reuse_key))
-                if reuse_key:
-                    reuse_seen.add(reuse_key)
-                rag_reuse_key = str(item.get('rag_reuse_key', ''))
-                if rag_reuse_key:
-                    reuse_seen.add(rag_reuse_key)
         ok = True
     except Exception as exc:
         error = f'{type(exc).__name__}: {exc}'
@@ -887,7 +854,6 @@ def run_cell(
     d4_prefill_p95_ms = percentile(prefill_values, 95)
     batch_queue_span_p95_ms = percentile(batch_queue_spans, 95)
     d4_ttft_p95_ms = percentile(ttft_values, 95)
-    trace_hit_count = sum(1 for row in valid if row.get('hit'))
     gpu_cache_stats: dict[str, Any] = {}
     try:
         import sitecustomize
@@ -902,7 +868,6 @@ def run_cell(
     gpu_lookup_hits = int(gpu_cache_stats.get('lookup_hits', 0) or 0)
     gpu_hit_rate = float(gpu_cache_stats.get('hit_rate', 0.0) or 0.0)
     workload_counts: dict[str, int] = {}
-    workload_hit_counts: dict[str, int] = {}
     replay_trace_formats = sorted({str(row.get('replay_trace_format', 'legacy_or_complete_prompt')) for row in valid})
     history_formats = sorted({str(row.get('history_format', '')) for row in valid if row.get('history_format')})
     cumulative_sessions = len({
@@ -920,12 +885,6 @@ def run_cell(
     for row in valid:
         workload = str(row.get('workload', 'unknown'))
         workload_counts[workload] = workload_counts.get(workload, 0) + 1
-        if row.get('hit'):
-            workload_hit_counts[workload] = workload_hit_counts.get(workload, 0) + 1
-    workload_hit_rates = {
-        workload: round(workload_hit_counts.get(workload, 0) / max(count, 1), 6)
-        for workload, count in workload_counts.items()
-    }
     summary = {
         'experiment': 'H1_vLLM_real_0_5_1',
         'policy': policy,
@@ -974,10 +933,13 @@ def run_cell(
         'prefill_p95_ratio': round(d4_prefill_p95_ms / d4_ttft_p95_ms, 6) if d4_ttft_p95_ms else 0.0,
         'd4_metrics_available_count': d4_metrics_available_count,
         'd4_metrics_available_ratio': round(d4_metrics_available_count / max(len(valid), 1), 6),
-        'hit_rate': round(gpu_hit_rate, 6),
-        'hit_source': str(gpu_cache_stats.get('hit_source', 'gpu_prefix_cache_block_lookup')),
+        # 主命中率指向真实缓存命中口径（native_hits/native_queries），与 trace-side 模拟无关。
+        'hit_rate': round(float(gpu_cache_stats.get('native_hit_rate', 0.0) or 0.0), 6),
+        'hit_source': 'gpu_prefix_cache_native',
         'native_hit_rate': round(float(gpu_cache_stats.get('native_hit_rate', 0.0) or 0.0), 6),
+        # 块级 lookup 命中率为附带口径（matched blocks / total blocks），仅供参考。
         'block_lookup_hit_rate': round(float(gpu_cache_stats.get('block_lookup_hit_rate', 0.0) or 0.0), 6),
+        'gpu_block_lookup_hit_rate': round(gpu_hit_rate, 6),
         'gpu_prefix_cache_native_queries': int(gpu_cache_stats.get('native_queries', 0) or 0),
         'gpu_prefix_cache_native_hits': int(gpu_cache_stats.get('native_hits', 0) or 0),
         'gpu_prefix_cache_native_requests': int(gpu_cache_stats.get('native_requests', 0) or 0),
@@ -1019,10 +981,8 @@ def run_cell(
         'low_score_evictions': int(gpu_cache_stats.get('low_score_evictions', 0) or 0),
         'hot_prefix_evictions': int(gpu_cache_stats.get('hot_prefix_evictions', 0) or 0),
         'gpu_prefix_cache_policy_impl': 'sitecustomize.BlockPool.free_block_queue',
-        'trace_side_hit_rate': round(trace_hit_count / max(len(valid), 1), 6),
-        'trace_side_hit_source': 'trace_side_reuse_key',
+        'hit_rate_source': 'real_gpu_prefix_cache_native',
         'workload_counts': workload_counts,
-        'workload_hit_rates': workload_hit_rates,
         'gpu_memory_peak_mib': round(monitor.peak_mib(args.visible_devices), 6),
         'elapsed_s': round(time.time() - started, 3),
         'model': args.model,
@@ -1043,7 +1003,7 @@ def run_cell(
         print(
             f"[cell-done] policy={policy} budget={budget_name} requests={len(valid)} "
             f"elapsed_s={summary['elapsed_s']} native_hit_rate={summary['native_hit_rate']} "
-            f"trace_side_hit_rate={summary['trace_side_hit_rate']} "
+            f"block_lookup_hit_rate={summary['block_lookup_hit_rate']} "
             f"ttft_p95_ms={summary['ttft_proxy_p95_ms']} "
             f"gpu_memory_peak_mib={summary['gpu_memory_peak_mib']}",
             flush=True,

@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 H1_DIR = Path(__file__).resolve().parent
@@ -21,6 +22,39 @@ if str(H1_DIR) not in sys.path:
     sys.path.insert(0, str(H1_DIR))
 if str(H0_DIR) not in sys.path:
     sys.path.insert(0, str(H0_DIR))
+
+try:
+    import transformers  # noqa: F401
+except ModuleNotFoundError:
+    transformers_stub = types.ModuleType("transformers")
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakeTokenizer()
+
+    class _PreTrainedTokenizerBase:
+        all_special_tokens = []
+
+    transformers_stub.AutoTokenizer = _AutoTokenizer
+    transformers_stub.PreTrainedTokenizerBase = _PreTrainedTokenizerBase
+    sys.modules["transformers"] = transformers_stub
+
+try:
+    import vllm  # noqa: F401
+except ModuleNotFoundError:
+    vllm_stub = types.ModuleType("vllm")
+
+    class _LLM:
+        pass
+
+    class _SamplingParams:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    vllm_stub.LLM = _LLM
+    vllm_stub.SamplingParams = _SamplingParams
+    sys.modules["vllm"] = vllm_stub
 
 import run_h1_vllm0110_real as h1
 from edgekv_cop import COPProfiler
@@ -44,6 +78,18 @@ class FakeBlock:
 class FakeTokenizer:
     def encode(self, text: str, add_special_tokens: bool = False) -> list[str]:
         return text.split()
+
+
+class FakeChatTokenizer(FakeTokenizer):
+    chat_template = "fake"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        rendered = "\n".join(f"{m['role']}:{m['content']}" for m in messages)
+        if add_generation_prompt:
+            rendered += "\nassistant:"
+        if tokenize:
+            return rendered.split()
+        return rendered
 
 
 def write_sharegpt_fixture(path: Path) -> None:
@@ -315,18 +361,73 @@ def test_h1_token_delta_replay_batches_split_same_session() -> None:
     assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
 
 
-def test_h1_token_delta_trace_side_hit_uses_lcp() -> None:
-    item = {
-        "session_id": "sg_tok",
-        "session_group_id": "sg_tok",
-        "history_format": "token_delta_chatml",
-        "reused_prefix_token_count": 7,
-    }
-    reuse_key, hit, rag_reuse_key, rag_hit = h1.trace_side_reuse(item, set())
-    assert reuse_key == "sg_tok"
-    assert hit is True
-    assert rag_reuse_key == ""
-    assert rag_hit is False
+def test_h1_loads_structured_conversation_v2_replay_trace(tmp_path: Path, monkeypatch) -> None:
+    trace_path = tmp_path / "unused_sharegpt.json"
+    trace_path.write_text("[]", encoding="utf-8")
+    replay_path = tmp_path / "structured_v2.jsonl"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "trace_format": "structured_conversation_v2",
+                "session_id": "sg_struct",
+                "source": "sharegpt",
+                "system_prompt": None,
+                "messages": [
+                    {"role": "user", "content": "first question", "turn_index": 0},
+                    {"role": "assistant", "content": "first answer", "turn_index": 0},
+                    {"role": "user", "content": "second question", "turn_index": 1},
+                ],
+                "reuse_key": "sg_struct",
+                "temperature": "warm",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(h1.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeChatTokenizer())
+    args = argparse.Namespace(
+        model="models/Qwen2.5-7B-Instruct",
+        trace_path=str(trace_path),
+        replay_trace=str(replay_path),
+        workload="mixed",
+        max_requests=8,
+        rag_requests=0,
+        max_sessions=2,
+        hotpotqa_path=tmp_path / "unused_hotpotqa.json",
+        download_hotpotqa=False,
+        hotpotqa_max_examples=0,
+        rag_chunk_words=56,
+        rag_chunks_per_query=2,
+        rag_query_repeats=4,
+        sharegpt_order="file",
+        timeout_s=120.0,
+        max_tokens=16,
+        max_model_len=2048,
+    )
+
+    rows = h1.load_trace(args)
+    assert [row["request_id"] for row in rows] == ["sg_struct:turn:000", "sg_struct:turn:001"]
+    assert all(row["history_format"] == "structured_conversation_v2" for row in rows)
+    assert all(row["replay_trace_format"] == "structured_conversation_v2" for row in rows)
+    assert all("prompt_token_ids" not in row for row in rows)
+    assert all("prefix_hash" not in row for row in rows)
+    assert rows[0]["prompt"].endswith("\nassistant:")
+    assert rows[1]["prompt"].endswith("\nassistant:")
+    assert rows[1]["prompt"].startswith(rows[0]["prompt"].removesuffix("\nassistant:"))
+    assert rows[0]["n_tokens"] > 0
+    assert rows[1]["n_tokens"] > rows[0]["n_tokens"]
+
+
+def test_h1_structured_conversation_replay_batches_split_same_session() -> None:
+    trace = [
+        {"session_id": "sg0", "history_format": "structured_conversation_v2", "turn_index": 0},
+        {"session_id": "sg0", "history_format": "structured_conversation_v2", "turn_index": 1},
+        {"session_id": "sg1", "history_format": "structured_conversation_v2", "turn_index": 0},
+        {"session_id": "sg1", "history_format": "structured_conversation_v2", "turn_index": 1},
+    ]
+    batches = h1.replay_batches(trace, replay_batch_size=2)
+    assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
 
 
 def test_h1_generate_helper_disables_tqdm_when_supported() -> None:
@@ -343,7 +444,7 @@ def test_h1_generate_helper_disables_tqdm_when_supported() -> None:
     assert fake.use_tqdm is False
 
 
-def test_h1_trace_side_fields_include_lpe_score() -> None:
+def test_h1_request_trace_fields_include_cop_costs_without_simulated_hits() -> None:
     item = {
         "request_id": "rag_0",
         "session_id": "rag_session_0",
@@ -359,22 +460,21 @@ def test_h1_trace_side_fields_include_lpe_score() -> None:
 
     fields = h1.request_trace_fields(
         item,
-        trace_hit=True,
-        rag_hit=False,
         policy="h1_lpe",
         kv_mib_per_token=0.25,
         cop=h1.COPProfiler(mu_kv_mb_per_token=0.25),
         event_index=0,
     )
-    assert fields["hit"] is True
-    assert fields["hit_source"] == "trace_side_reuse_key"
     assert fields["object_id"] == "rag:hotpotqa:a|b"
-    assert fields["p_reuse"] > 0.0
     assert fields["c_recomp_ms"] == 15.36
     assert fields["size_mb"] == 32.0
-    assert abs(fields["score"] - (0.12 * fields["p_reuse"] / 0.25)) < 1e-6
     assert fields["score_source"] == "object_level_cop"
     assert fields["lpe_action"] == "score_evaluated"
+    assert "hit" not in fields
+    assert "hit_source" not in fields
+    assert "rag_hit" not in fields
+    assert "p_reuse" not in fields
+    assert "score" not in fields
     assert "prompt" not in fields
 
 
@@ -394,8 +494,6 @@ def test_h1_weak_link_rag_uses_rag_object_id() -> None:
 
     fields = h1.request_trace_fields(
         item,
-        trace_hit=False,
-        rag_hit=True,
         policy="h1_lpe",
         kv_mib_per_token=0.25,
         cop=h1.COPProfiler(mu_kv_mb_per_token=0.25),
@@ -403,15 +501,7 @@ def test_h1_weak_link_rag_uses_rag_object_id() -> None:
     )
     assert fields["object_id"] == "rag:hotpotqa:a|b"
     assert fields["object_type"] == "rag_chunk_set"
-    assert fields["hit"] is False
-    assert fields["rag_hit"] is True
     assert fields["score_source"] == "object_level_cop"
-
-
-def test_h1_trace_side_reuse_tracks_reuse_key() -> None:
-    item = {"session_id": "s0", "reuse_key": "shared-prefix"}
-    assert h1.trace_side_reuse(item, set()) == ("shared-prefix", False, "", False)
-    assert h1.trace_side_reuse(item, {"shared-prefix"}) == ("shared-prefix", True, "", False)
 
 
 def test_sitecustomize_infers_prefix_repetition_object_without_extra_args() -> None:
@@ -975,8 +1065,6 @@ def test_h1_trace_fields_preserve_prior_temperature() -> None:
     }
     fields = h1.request_trace_fields(
         item,
-        trace_hit=False,
-        rag_hit=False,
         policy="h1_lpe",
         kv_mib_per_token=0.25,
         cop=h1.COPProfiler(mu_kv_mb_per_token=0.25),
@@ -984,7 +1072,8 @@ def test_h1_trace_fields_preserve_prior_temperature() -> None:
     )
     assert fields["temperature"] == "hot"
     assert fields["p_reuse_prior"] == 0.95
-    assert fields["p_reuse"] > 0.65
+    assert "p_reuse" not in fields
+    assert "hit" not in fields
 
 
 def test_sitecustomize_refresh_keeps_hot_prior_after_first_miss() -> None:
