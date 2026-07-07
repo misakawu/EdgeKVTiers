@@ -43,6 +43,7 @@ MAX_MODEL_LEN = 2048
 REPLAY_BATCH_SIZE=16
 # MAX_NUM_BATCHED_TOKENS = 64
 MAX_NUM_BATCHED_TOKENS = 32768   
+BATCH_ORDER = "round_robin"
 TENSOR_PARALLEL_SIZE = 2
 PYTHONPATH = ".:h1:h0"
 # --------------------------------------------------------------------------------------
@@ -52,7 +53,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
               replay_batch_size: int, replay_trace: Path, hotpotqa_path: str,
               visible_devices: str, max_num_batched_tokens: int,
               max_model_len: int, workload: str, rag_requests: int,
-              hotpotqa_max_examples: int) -> list[str]:
+              hotpotqa_max_examples: int, batch_order: str) -> list[str]:
     return [
         "--out", str(cell_dir),
         "--dtype", "float16",
@@ -73,6 +74,7 @@ def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
         "--max-model-len", str(max_model_len),
         "--max-tokens", str(MAX_TOKENS),
         "--replay-batch-size", str(replay_batch_size),
+        "--batch-order", batch_order,
         "--max-num-batched-tokens", str(max_num_batched_tokens),
         "--visible-devices", visible_devices,
     ]
@@ -86,6 +88,7 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
               hotpotqa_path=HOTPOTQA_PATH, workload=WORKLOAD,
               rag_requests=RAG_REQUESTS,
               hotpotqa_max_examples=HOTPOTQA_MAX_EXAMPLES,
+              batch_order=BATCH_ORDER,
               no_finalize=False, force=False,
               keep_cells=False) -> Path:
     """在 pressure replay trace 上运行单个 tier 的 budget x policy 矩阵。"""
@@ -99,7 +102,8 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
     R.log(f"[step3] tier={tier} out={tier_dir} budgets={budgets} policies={policies}")
     R.log(
         f"[step3] workload={workload} trace={replay_trace} "
-        f"max_requests={num_prompts} rag_requests={rag_requests} bs={replay_batch_size}"
+        f"max_requests={num_prompts} rag_requests={rag_requests} "
+        f"bs={replay_batch_size} order={batch_order}"
     )
     for budget in budgets:
         for policy in policies:
@@ -122,7 +126,8 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
                 cell_args(out_dir, budget, policy, num_prompts, replay_batch_size,
                           replay_trace, hotpotqa_path, visible_devices,
                           max_num_batched_tokens, max_model_len,
-                          workload, rag_requests, hotpotqa_max_examples),
+                          workload, rag_requests, hotpotqa_max_examples,
+                          batch_order),
                 env_overrides,
                 log_file=log_dir / f"{budget}_{policy}.log",
             )
@@ -162,6 +167,8 @@ def main() -> None:
     ap.add_argument("--num-prompts", type=int, default=MAX_REQUESTS)
     ap.add_argument("--replay-trace", default=str(REPLAY_TRACE))
     ap.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
+    ap.add_argument("--batch-order", default=BATCH_ORDER,
+                    choices=("original", "length_bucket", "round_robin"))
     ap.add_argument("--max-num-batched-tokens", type=int, default=MAX_NUM_BATCHED_TOKENS)
     ap.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
@@ -182,6 +189,7 @@ def main() -> None:
         visible_devices=args.visible_devices,
         replay_trace=Path(args.replay_trace),
         replay_batch_size=args.replay_batch_size,
+        batch_order=args.batch_order,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         hotpotqa_path=args.hotpotqa_path,

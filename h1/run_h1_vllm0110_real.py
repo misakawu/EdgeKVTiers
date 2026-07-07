@@ -463,14 +463,49 @@ def order_trace_for_batches(
 ) -> list[dict[str, Any]]:
     if batch_order == 'original':
         return list(trace)
-    if batch_order != 'length_bucket':
-        raise ValueError(f'unknown batch_order={batch_order!r}')
-    indexed = [
-        (length_bucket_id(item_token_count(item)), idx, item)
-        for idx, item in enumerate(trace)
-    ]
-    indexed.sort(key=lambda row: (row[0], row[1]))
-    return [item for _, _, item in indexed]
+    if batch_order == 'length_bucket':
+        indexed = [
+            (length_bucket_id(item_token_count(item)), idx, item)
+            for idx, item in enumerate(trace)
+        ]
+        indexed.sort(key=lambda row: (row[0], row[1]))
+        return [item for _, _, item in indexed]
+    if batch_order == 'round_robin':
+        sessions: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        session_order: list[str] = []
+        orphans: list[dict[str, Any]] = []
+        for idx, item in enumerate(trace):
+            session_id = str(item.get('session_id', '') or '')
+            if not session_id:
+                orphans.append(item)
+                continue
+            if session_id not in sessions:
+                sessions[session_id] = []
+                session_order.append(session_id)
+            try:
+                original_index = int(item.get('_trace_original_index', idx))
+            except (TypeError, ValueError):
+                original_index = idx
+            sessions[session_id].append((original_index, item))
+
+        ordered_sessions = [
+            [item for _, item in sorted(sessions[session_id], key=lambda row: row[0])]
+            for session_id in session_order
+        ]
+        ordered: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            emitted = False
+            for session_items in ordered_sessions:
+                if offset < len(session_items):
+                    ordered.append(session_items[offset])
+                    emitted = True
+            if not emitted:
+                break
+            offset += 1
+        ordered.extend(orphans)
+        return ordered
+    raise ValueError(f'unknown batch_order={batch_order!r}')
 
 
 def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[tuple[int, list[dict[str, Any]]]]:
@@ -1153,12 +1188,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--replay-batch-size', type=int, default=1)
     parser.add_argument(
         '--batch-order',
-        choices=('original', 'length_bucket'),
+        choices=('original', 'length_bucket', 'round_robin'),
         default='original',
         help=(
             'Order requests before batching. original preserves trace order; '
             'length_bucket groups similar prompt lengths while preserving order '
-            'within each length bucket.'
+            'within each length bucket; round_robin interleaves sessions so a '
+            'batch tends to contain one request from each session.'
         ),
     )
     parser.add_argument(

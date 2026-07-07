@@ -29,9 +29,10 @@ BUDGETS = ["0.75", "0.825", "0.95"]
 REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_256_original_order.jsonl")
 # structured_conversation_v2 trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
-REPLAY_BATCH_SIZE = 1
-MAX_MODEL_LEN = 4096
-MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN
+REPLAY_BATCH_SIZE = 2
+MAX_MODEL_LEN = 2048
+MAX_NUM_BATCHED_TOKENS = None
+BATCH_ORDER = "round_robin"
 WORKLOAD = "sharegpt"
 RAG_REQUESTS = 0
 HOTPOTQA_MAX_EXAMPLES = 0
@@ -46,6 +47,7 @@ def main() -> None:
     parser.add_argument("--budgets", default=" ".join(BUDGETS))
     parser.add_argument("--policies", default=" ".join(POLICIES))
     parser.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
+    parser.add_argument("--batch-order", choices=("round_robin",), default=BATCH_ORDER)
     parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--workload", choices=("sharegpt", "rag", "mixed"), default=WORKLOAD)
@@ -67,10 +69,11 @@ def main() -> None:
         keep_cells=True,
         replay_trace=args.replay_trace,
         replay_batch_size=args.replay_batch_size,
+        batch_order=args.batch_order,
         max_num_batched_tokens=(
             args.max_num_batched_tokens
             if args.max_num_batched_tokens is not None
-            else args.max_model_len
+            else args.max_model_len * args.replay_batch_size
         ),
         max_model_len=args.max_model_len,
         workload=args.workload,

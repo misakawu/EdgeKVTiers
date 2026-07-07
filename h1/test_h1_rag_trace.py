@@ -361,6 +361,88 @@ def test_h1_token_delta_replay_batches_split_same_session() -> None:
     assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
 
 
+def test_h1_order_trace_round_robin_interleaves_sessions() -> None:
+    trace = [
+        {"session_id": "s0", "turn_index": 0, "_trace_original_index": 0},
+        {"session_id": "s0", "turn_index": 1, "_trace_original_index": 1},
+        {"session_id": "s1", "turn_index": 0, "_trace_original_index": 2},
+        {"session_id": "s1", "turn_index": 1, "_trace_original_index": 3},
+        {"session_id": "s2", "turn_index": 0, "_trace_original_index": 4},
+        {"session_id": "s2", "turn_index": 1, "_trace_original_index": 5},
+    ]
+
+    ordered = h1.order_trace_for_batches(trace, "round_robin")
+
+    assert [(row["session_id"], row["turn_index"]) for row in ordered] == [
+        ("s0", 0),
+        ("s1", 0),
+        ("s2", 0),
+        ("s0", 1),
+        ("s1", 1),
+        ("s2", 1),
+    ]
+
+
+def test_h1_order_trace_round_robin_handles_uneven_sessions() -> None:
+    trace = [
+        {"session_id": "s0", "turn_index": 0, "_trace_original_index": 0},
+        {"session_id": "s0", "turn_index": 1, "_trace_original_index": 1},
+        {"session_id": "s0", "turn_index": 2, "_trace_original_index": 2},
+        {"session_id": "s1", "turn_index": 0, "_trace_original_index": 3},
+        {"session_id": "s2", "turn_index": 0, "_trace_original_index": 4},
+        {"session_id": "s2", "turn_index": 1, "_trace_original_index": 5},
+    ]
+
+    ordered = h1.order_trace_for_batches(trace, "round_robin")
+
+    assert [(row["session_id"], row["turn_index"]) for row in ordered] == [
+        ("s0", 0),
+        ("s1", 0),
+        ("s2", 0),
+        ("s0", 1),
+        ("s2", 1),
+        ("s0", 2),
+    ]
+
+
+def test_h1_order_trace_round_robin_appends_orphans() -> None:
+    trace = [
+        {"session_id": "s0", "turn_index": 0, "_trace_original_index": 0},
+        {"request_id": "orphan_0", "_trace_original_index": 1},
+        {"session_id": "s0", "turn_index": 1, "_trace_original_index": 2},
+        {"session_id": "s1", "turn_index": 0, "_trace_original_index": 3},
+        {"session_id": "", "request_id": "orphan_1", "_trace_original_index": 4},
+    ]
+
+    ordered = h1.order_trace_for_batches(trace, "round_robin")
+
+    assert [
+        (row.get("session_id", ""), row.get("turn_index", row.get("request_id")))
+        for row in ordered
+    ] == [
+        ("s0", 0),
+        ("s1", 0),
+        ("s0", 1),
+        ("", "orphan_0"),
+        ("", "orphan_1"),
+    ]
+
+
+def test_h1_round_robin_batches_have_unique_sessions() -> None:
+    trace = [
+        {"session_id": f"s{session}", "turn_index": turn, "_trace_original_index": session * 3 + turn}
+        for session in range(5)
+        for turn in range(3)
+    ]
+
+    ordered = h1.order_trace_for_batches(trace, "round_robin")
+    batches = h1.replay_batches(ordered, replay_batch_size=8)
+
+    for _, batch in batches:
+        session_ids = [row["session_id"] for row in batch if row.get("session_id")]
+        assert len(session_ids) == len(set(session_ids))
+
+
 def test_h1_loads_structured_conversation_v2_replay_trace(tmp_path: Path, monkeypatch) -> None:
     trace_path = tmp_path / "unused_sharegpt.json"
     trace_path.write_text("[]", encoding="utf-8")
