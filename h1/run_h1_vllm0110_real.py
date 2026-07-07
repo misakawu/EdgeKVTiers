@@ -430,7 +430,7 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
     filtered: list[dict[str, Any]] = []
     for original_index, item in enumerate(prompts):
-        n_tokens = len(item.get('prompt_token_ids', []) or []) or int(item['n_tokens'])
+        n_tokens = int(item['n_tokens'])
         if n_tokens + args.max_tokens <= args.max_model_len:
             item = dict(item)
             item['n_tokens'] = n_tokens
@@ -442,9 +442,6 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def item_token_count(item: dict[str, Any]) -> int:
-    token_ids = item.get('prompt_token_ids')
-    if isinstance(token_ids, list) and token_ids:
-        return len(token_ids)
     for key in ('n_tokens', 'prompt_est_tokens'):
         try:
             value = int(item.get(key, 0) or 0)
@@ -483,11 +480,7 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
     current_sessions: set[str] = set()
     for index, item in enumerate(trace):
         session_id = str(item.get('session_id', ''))
-        must_split = (
-            item.get('history_format') in {'cumulative_user', 'token_delta_chatml', 'structured_conversation_v2'}
-            and session_id
-            and session_id in current_sessions
-        )
+        must_split = bool(session_id and session_id in current_sessions)
         if current and (len(current) >= replay_batch_size or must_split):
             batches.append((current_start, current))
             current = []
@@ -496,7 +489,7 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
         if not current:
             current_start = index
         current.append(item)
-        if item.get('history_format') in {'cumulative_user', 'token_delta_chatml', 'structured_conversation_v2'} and session_id:
+        if session_id:
             current_sessions.add(session_id)
     if current:
         batches.append((current_start, current))
@@ -531,17 +524,13 @@ def request_trace_fields(
     update_from_item 的 hit 恒传 False，在线 p_reuse 由引擎从真实访问自算。
     """
     workload = str(item.get('workload', 'sharegpt_session_prefix'))
-    reuse_key = (
-        str(item.get('session_group_id', item.get('session_id', '')))
-        if item.get('history_format') == 'token_delta_chatml'
-        else str(item.get('reuse_key', item.get('session_id', '')))
-    )
+    reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
     profile = cop.update_from_item(
         item,
         hit=False,
         access_index=event_index,
     )
-    fields = {k: v for k, v in item.items() if k not in {'prompt', 'prompt_token_ids', '_trace_original_index'}}
+    fields = {k: v for k, v in item.items() if k not in {'prompt', '_trace_original_index'}}
     fields.update(
         {
             'workload': workload,
@@ -723,11 +712,7 @@ def run_cell(
                     f"batch={batch_number}/{len(batches)} done_requests={len(rows)}",
                     flush=True,
                 )
-            prompts = [
-                {'prompt_token_ids': [int(tok) for tok in item['prompt_token_ids']]}
-                if item.get('prompt_token_ids') else str(item['prompt'])
-                for item in batch
-            ]
+            prompts = [str(item['prompt']) for item in batch]
             trace_fields_batch = [
                 request_trace_fields(
                     item,
@@ -868,20 +853,14 @@ def run_cell(
     gpu_lookup_hits = int(gpu_cache_stats.get('lookup_hits', 0) or 0)
     gpu_hit_rate = float(gpu_cache_stats.get('hit_rate', 0.0) or 0.0)
     workload_counts: dict[str, int] = {}
-    replay_trace_formats = sorted({str(row.get('replay_trace_format', 'legacy_or_complete_prompt')) for row in valid})
-    history_formats = sorted({str(row.get('history_format', '')) for row in valid if row.get('history_format')})
-    cumulative_sessions = len({
+    replay_trace_formats = sorted({str(row.get('replay_trace_format', 'structured_conversation_v2')) for row in valid})
+    history_formats = sorted({str(row.get('history_format', 'structured_conversation_v2')) for row in valid})
+    structured_sessions = len({
         str(row.get('session_id', ''))
         for row in valid
-        if row.get('history_format') == 'cumulative_user'
+        if row.get('session_id')
     })
-    cumulative_turns = sum(1 for row in valid if row.get('history_format') == 'cumulative_user')
-    token_delta_sessions = len({
-        str(row.get('session_id', ''))
-        for row in valid
-        if row.get('history_format') == 'token_delta_chatml'
-    })
-    token_delta_turns = sum(1 for row in valid if row.get('history_format') == 'token_delta_chatml')
+    structured_turns = len(valid)
     for row in valid:
         workload = str(row.get('workload', 'unknown'))
         workload_counts[workload] = workload_counts.get(workload, 0) + 1
@@ -906,10 +885,8 @@ def run_cell(
         'replay_trace': args.replay_trace,
         'replay_trace_format': ",".join(replay_trace_formats) if replay_trace_formats else "unknown",
         'history_format': ",".join(history_formats) if history_formats else "",
-        'cumulative_sessions': cumulative_sessions,
-        'cumulative_turns': cumulative_turns,
-        'token_delta_sessions': token_delta_sessions,
-        'token_delta_turns': token_delta_turns,
+        'structured_sessions': structured_sessions,
+        'structured_turns': structured_turns,
         'vllm_generate_tqdm': False,
         'replay_progress_log': 'task_level',
         'workload': args.workload,

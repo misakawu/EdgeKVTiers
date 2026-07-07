@@ -20,13 +20,13 @@ import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
 # POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
-POLICIES = ["h1_lpe"]
+POLICIES = ["h1_lru"]
 TIER = "sharegpt_structured_v2"
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
-# BUDGETS = ["0.75", "0.80", "0.85", "0.90", "0.95"]
 BUDGETS = ["0.75", "0.825", "0.95"]
-REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_structured_v2.jsonl")
+# BUDGETS = ["0.75"]
+REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_256_original_order.jsonl")
 # structured_conversation_v2 trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
 REPLAY_BATCH_SIZE = 1

@@ -14,7 +14,6 @@ sys.path.insert(0, str(REPO_ROOT))   # 强制插入最前面
 import argparse
 import concurrent.futures
 import csv
-import hashlib
 import json
 import os
 import statistics
@@ -73,21 +72,6 @@ def count_tokens(text: str, tokenizer) -> int:
     if tokenizer is None:
         return estimate_tokens(text)
     return len(tokenizer.encode(text, add_special_tokens=False))
-
-
-def lcp_token_count(left: Sequence[int], right: Sequence[int]) -> int:
-    count = 0
-    for a, b in zip(left, right):
-        if a != b:
-            break
-        count += 1
-    return count
-
-
-def token_prefix_hash(token_ids: Sequence[int], prefix_len: int | None = None) -> str:
-    limit = len(token_ids) if prefix_len is None else max(0, min(prefix_len, len(token_ids)))
-    payload = ",".join(str(int(tok)) for tok in token_ids[:limit]).encode("ascii")
-    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def load_model_config(model_path: str) -> dict:
@@ -414,63 +398,6 @@ def build_sharegpt_cumulative_sessions(
         "prompt_est_tokens_max": max(prompt_token_estimates) if prompt_token_estimates else 0,
     }
     return sessions, summary
-
-
-def sharegpt_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
-    prompts: List[dict] = []
-    session_id = str(session["session_id"])
-    transcript: List[str] = []
-    for turn in session.get("turns", []):
-        turn_index = int(turn.get("i", len(prompts)))
-        user_text = str(turn.get("user", "")).strip()
-        if not user_text:
-            continue
-        rag = turn.get("rag")
-        rag_prefix = ""
-        if isinstance(rag, dict):
-            context_lines = [
-                f"[{row['chunk_id']}] {row['title']}: {row['text']}"
-                for row in rag.get("chunks", [])
-            ]
-            if context_lines:
-                rag_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
-        prompt = rag_prefix + "\n".join(transcript + [f"User: {user_text}", "Assistant:"])
-        row = {
-            "request_id": f"{session_id}:turn:{turn_index:03d}",
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "prompt": prompt,
-            "prompt_chars": len(prompt),
-            "prompt_est_tokens": estimate_tokens(prompt),
-            "n_tokens": count_tokens(prompt, tokenizer),
-            "workload": "sharegpt_session_prefix",
-            "object_type": str(session.get("object_type", "sharegpt_session_prefix")),
-            "reuse_key": str(session.get("reuse_key", session_id)),
-            "replay_source": "frozen_replay_trace",
-        }
-        if isinstance(rag, dict):
-            chunks = rag.get("chunks", [])
-            row.update(
-                {
-                    "workload": "sharegpt_hotpotqa_weak_link",
-                    "rag_reuse_key": str(rag.get("reuse_key", "")),
-                    "rag_chunk_ids": [chunk.get("chunk_id", "") for chunk in chunks],
-                    "rag_doc_ids": sorted({chunk.get("doc_id", "") for chunk in chunks}),
-                    "dataset": rag.get("dataset", "hotpotqa"),
-                    "hotpotqa_example_id": rag.get("hotpotqa_example_id", ""),
-                    "hotpotqa_source_path": rag.get("hotpotqa_source_path", ""),
-                    "rag_match_mode": rag.get("match_mode", "weak_round_robin"),
-                }
-            )
-        for key, value in session.items():
-            if key not in row and key != "turns":
-                row[key] = value
-        prompts.append(row)
-        transcript.append(f"User: {user_text}")
-        assistant_text = str(turn.get("assistant", "")).strip()
-        if assistant_text:
-            transcript.append(f"Assistant: {assistant_text}")
-    return prompts
 
 
 def chunk_words(text: str, chunk_words_count: int) -> List[str]:
@@ -835,77 +762,8 @@ def attach_weak_rag_to_sharegpt(
     return linked
 
 
-def rag_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
-    chunks = session.get("chunks", [])
-    context_lines = [
-        f"[{row['chunk_id']}] {row['title']}: {row['text']}"
-        for row in chunks
-    ]
-    context_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
-    prompts: List[dict] = []
-    for turn in session.get("turns", []):
-        turn_index = int(turn.get("i", len(prompts)))
-        query = str(turn.get("user", "")).strip()
-        if not query:
-            continue
-        prompt = context_prefix + f"Question: {query}\nAnswer:"
-        row = {
-            "request_id": f"{session['session_id']}:turn:{turn_index:03d}",
-            "session_id": str(session["session_id"]),
-            "turn_index": turn_index,
-            "prompt": prompt,
-            "prompt_chars": len(prompt),
-            "prompt_est_tokens": estimate_tokens(prompt),
-            "n_tokens": count_tokens(prompt, tokenizer),
-            "workload": "rag_chunk_reuse",
-            "object_type": str(session.get("object_type", "rag_chunk_set")),
-            "reuse_key": str(session["reuse_key"]),
-            "chunk_ids": [row["chunk_id"] for row in chunks],
-            "doc_ids": sorted({row["doc_id"] for row in chunks}),
-            "dataset": session.get("dataset", "hotpotqa"),
-            "hotpotqa_example_id": session.get("hotpotqa_example_id", ""),
-            "hotpotqa_source_path": session.get("hotpotqa_source_path", ""),
-            "query": query,
-            "answer": session.get("answer", ""),
-            "replay_source": "frozen_replay_trace",
-        }
-        for key, value in session.items():
-            if key not in row and key not in {"turns", "chunks"}:
-                row[key] = value
-        prompts.append(row)
-    return prompts
-
-
-def session_to_cumulative_user_session(session: dict) -> dict:
-    row = dict(session)
-    turns = session.get("turns", [])
-    if not isinstance(turns, list) or row.get("turns_format") in {"cumulative_user", "complete_prompt"}:
-        return row
-    if str(row.get("source", "sharegpt")).lower() == "hotpotqa":
-        return row
-
-    transcript: List[str] = []
-    cumulative_turns: List[dict] = []
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        user_text = str(turn.get("user", "")).strip()
-        if not user_text:
-            continue
-        next_turn = dict(turn)
-        next_turn["user"] = "\n".join(transcript + [f"User: {user_text}", "Assistant:"])
-        cumulative_turns.append(next_turn)
-        transcript.append(f"User: {user_text}")
-        assistant_text = str(turn.get("assistant", "")).strip()
-        if assistant_text:
-            transcript.append(f"Assistant: {assistant_text}")
-    row["turns"] = cumulative_turns
-    row["turns_format"] = "cumulative_user"
-    return row
-
-
 def write_replay_trace(path: Path, sessions: Sequence[dict]) -> None:
-    write_jsonl(path, [session_to_cumulative_user_session(session) for session in sessions])
+    write_jsonl(path, sessions)
 
 
 def load_replay_sessions(path: Path) -> List[dict]:
@@ -926,206 +784,11 @@ def load_replay_sessions(path: Path) -> List[dict]:
     return sessions
 
 
-def is_flat_replay_prompt(row: dict) -> bool:
-    return "prompt" in row and "turns" not in row
-
-
-def flat_replay_prompt_to_session(row: dict, fallback_index: int) -> dict:
-    session_id = str(row.get("session_id", f"flat_replay_{fallback_index:06d}"))
-    turn_index = int(row.get("turn_index", row.get("i", 0)) or 0)
-    user_text = str(row.get("prompt", "")).strip()
-    session = {k: v for k, v in row.items() if k not in {"prompt", "turns", "turn_index"}}
-    session.setdefault("session_id", session_id)
-    session.setdefault("source", str(row.get("source", "flat_replay")))
-    session.setdefault("object_type", str(row.get("object_type", "flat_prompt")))
-    session.setdefault("reuse_key", str(row.get("reuse_key", session_id)))
-    session["turns"] = [{"i": turn_index, "user": user_text, "prompt_is_complete": True}]
-    return session
-
-
-def complete_prompt_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
-    prompts: List[dict] = []
-    session_id = str(session["session_id"])
-    for turn in session.get("turns", []):
-        turn_index = int(turn.get("i", len(prompts)))
-        prompt = str(turn.get("user", "")).strip()
-        if not prompt:
-            continue
-        row = {
-            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "prompt": prompt,
-            "prompt_chars": len(prompt),
-            "prompt_est_tokens": estimate_tokens(prompt),
-            "n_tokens": count_tokens(prompt, tokenizer),
-            "workload": str(session.get("workload", "sharegpt_session_prefix")),
-            "object_type": str(session.get("object_type", "flat_prompt")),
-            "reuse_key": str(session.get("reuse_key", session_id)),
-            "replay_source": "frozen_replay_trace",
-        }
-        for key, value in session.items():
-            if key not in row and key != "turns":
-                row[key] = value
-        prompts.append(row)
-    return prompts
-
-
-def token_delta_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
-    session_id = str(session.get("session_id", session.get("session_group_id", ""))).strip()
-    if not session_id:
-        raise ValueError("token delta session missing session_id/session_group_id")
-    if session.get("trace_format") != "sharegpt_token_delta_v1":
-        raise ValueError(f"unsupported token trace format: {session.get('trace_format')!r}")
-    turns = session.get("turns")
-    if not isinstance(turns, list) or not turns:
-        raise ValueError(f"token delta session {session_id!r} must have nonempty turns list")
-
-    prompts: List[dict] = []
-    previous_ids: List[int] = []
-    previous_turn_index = -1
-    for offset, turn in enumerate(turns):
-        if not isinstance(turn, dict):
-            raise ValueError(f"token delta session {session_id!r} has non-object turn")
-        try:
-            turn_index = int(turn.get("i", turn.get("turn_index", offset)))
-        except (TypeError, ValueError):
-            raise ValueError(f"token delta session {session_id!r} turn has invalid index")
-        if turn_index <= previous_turn_index:
-            raise ValueError(f"token delta session {session_id!r} turn_index must be strictly increasing")
-        previous_turn_index = turn_index
-
-        raw_ids = turn.get("prompt_token_ids")
-        if not isinstance(raw_ids, list) or not raw_ids:
-            raise ValueError(f"token delta session {session_id!r} turn {turn_index} has empty prompt_token_ids")
-        try:
-            token_ids = [int(tok) for tok in raw_ids]
-        except (TypeError, ValueError):
-            raise ValueError(f"token delta session {session_id!r} turn {turn_index} has non-integer token id")
-        declared_count = int(turn.get("prompt_token_count", len(token_ids)) or 0)
-        if declared_count != len(token_ids):
-            raise ValueError(
-                f"token delta session {session_id!r} turn {turn_index} prompt_token_count mismatch"
-            )
-        actual_lcp = lcp_token_count(previous_ids, token_ids) if previous_ids else 0
-        declared_reused = int(turn.get("reused_prefix_token_count", actual_lcp) or 0)
-        if declared_reused != actual_lcp:
-            raise ValueError(
-                f"token delta session {session_id!r} turn {turn_index} reused_prefix_token_count mismatch"
-            )
-        declared_new = int(turn.get("new_prefill_token_count", len(token_ids) - actual_lcp) or 0)
-        if declared_new != len(token_ids) - actual_lcp:
-            raise ValueError(
-                f"token delta session {session_id!r} turn {turn_index} new_prefill_token_count mismatch"
-            )
-
-        row = {
-            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
-            "session_id": session_id,
-            "session_group_id": str(session.get("session_group_id", session_id)),
-            "turn_index": turn_index,
-            "prompt": str(turn.get("prompt", "")),
-            "prompt_chars": len(str(turn.get("prompt", ""))),
-            "prompt_est_tokens": len(token_ids),
-            "n_tokens": len(token_ids),
-            "prompt_token_ids": token_ids,
-            "prompt_token_count": len(token_ids),
-            "reused_prefix_token_count": actual_lcp,
-            "new_prefill_token_count": len(token_ids) - actual_lcp,
-            "token_prefix_hash": str(turn.get("prefix_hash", token_prefix_hash(token_ids))),
-            "prefix_hash": str(turn.get("prefix_hash", token_prefix_hash(token_ids))),
-            "system_prefix_token_count": int(session.get("system_prefix_token_count", 0) or 0),
-            "workload": str(session.get("workload", "sharegpt_session_prefix")),
-            "object_type": str(session.get("object_type", "sharegpt_token_delta")),
-            "replay_source": "frozen_replay_trace",
-            "history_format": "token_delta_chatml",
-            "history_turns": turn_index + 1,
-            "history_prompt_chars": len(str(turn.get("prompt", ""))),
-            "replay_trace_format": "sharegpt_token_delta_v1",
-            "tokenizer_name_or_path": str(session.get("tokenizer_name_or_path", "")),
-            "chat_template_source": str(session.get("chat_template_source", "")),
-            "system_fingerprint": str(session.get("system_fingerprint", "")),
-        }
-        if "delta_messages" in turn:
-            row["delta_messages"] = turn["delta_messages"]
-        for key, value in session.items():
-            if key not in row and key != "turns":
-                row[key] = value
-        prompts.append(row)
-        previous_ids = token_ids
-    return prompts
-
-
-def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
-    prompts: List[dict] = []
-    session_id = str(session["session_id"])
-    turns = session.get("turns")
-    if not isinstance(turns, list) or not turns:
-        raise ValueError(f"cumulative_user session {session_id!r} must have nonempty turns list")
-    for turn in turns:
-        if not isinstance(turn, dict):
-            raise ValueError(f"cumulative_user session {session_id!r} has non-object turn")
-        try:
-            turn_index = int(turn.get("i"))
-        except (TypeError, ValueError):
-            raise ValueError(f"cumulative_user session {session_id!r} turn has invalid i")
-        user_text = str(turn.get("user", "")).strip()
-        if not user_text:
-            raise ValueError(f"cumulative_user session {session_id!r} turn {turn_index} has empty user")
-        rag = turn.get("rag")
-        rag_prefix = ""
-        if isinstance(rag, dict):
-            context_lines = [
-                f"[{row['chunk_id']}] {row['title']}: {row['text']}"
-                for row in rag.get("chunks", [])
-            ]
-            if context_lines:
-                rag_prefix = "Retrieved context:\n" + "\n".join(context_lines) + "\n\n"
-        prompt = rag_prefix + user_text
-        row = {
-            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "prompt": prompt,
-            "prompt_chars": len(prompt),
-            "prompt_est_tokens": estimate_tokens(prompt),
-            "n_tokens": count_tokens(prompt, tokenizer),
-            "workload": "sharegpt_session_prefix",
-            "object_type": str(session.get("object_type", "sharegpt_session_prefix")),
-            "reuse_key": str(session.get("reuse_key", session_id)),
-            "replay_source": "frozen_replay_trace",
-            "history_format": "cumulative_user",
-            "history_turns": turn_index + 1,
-            "history_prompt_chars": len(prompt),
-            "replay_trace_format": "session_cumulative_user",
-        }
-        if isinstance(rag, dict):
-            chunks = rag.get("chunks", [])
-            row.update(
-                {
-                    "workload": "sharegpt_hotpotqa_weak_link",
-                    "rag_reuse_key": str(rag.get("reuse_key", "")),
-                    "rag_chunk_ids": [chunk.get("chunk_id", "") for chunk in chunks],
-                    "rag_doc_ids": sorted({chunk.get("doc_id", "") for chunk in chunks}),
-                    "dataset": rag.get("dataset", "hotpotqa"),
-                    "hotpotqa_example_id": rag.get("hotpotqa_example_id", ""),
-                    "hotpotqa_source_path": rag.get("hotpotqa_source_path", ""),
-                    "rag_match_mode": rag.get("match_mode", "weak_round_robin"),
-                }
-            )
-        for key, value in session.items():
-            if key not in row and key != "turns":
-                row[key] = value
-        prompts.append(row)
-    return prompts
-
-
 def load_structured_conversation(session: dict, tokenizer=None) -> List[dict]:
     """structured_conversation_v2：动态累积历史 → apply_chat_template 渲染纯文本 Prompt。
 
     Trace 只存原始多轮消息（role/content/turn_index），渲染/分词职责全在此处。
-    不产出 prompt_token_ids/prefix_hash：下游 run_cell 缺 prompt_token_ids 时会自动
-    改喂 str(item['prompt'])，vLLM 内置前缀缓存对确定性渲染的纯文本同样命中。
+    只产出纯文本 prompt，vLLM 内置前缀缓存对确定性渲染的纯文本命中。
     命中/复用统计一律走回放器真实执行，不再有 trace-side 模拟。
     """
     session_id = str(session.get("session_id", session.get("session_group_id", ""))).strip()
@@ -1169,7 +832,7 @@ def load_structured_conversation(session: dict, tokenizer=None) -> List[dict]:
                 "prompt": prompt,
                 "prompt_chars": len(prompt),
                 "prompt_est_tokens": estimate_tokens(prompt),
-                # n_tokens 为 max_model_len 过滤所必需（无 prompt_token_ids 时是唯一长度依据）。
+                # n_tokens 为 max_model_len 过滤所必需。
                 "n_tokens": count_tokens(prompt, tokenizer),
                 "reuse_key": reuse_key,
                 "workload": workload,
@@ -1197,24 +860,8 @@ def load_structured_conversation(session: dict, tokenizer=None) -> List[dict]:
 
 def replay_sessions_to_prompts(sessions: Sequence[dict], tokenizer=None, max_requests: int = 0) -> List[dict]:
     prompts: List[dict] = []
-    for session_index, session in enumerate(sessions):
-        if is_flat_replay_prompt(session):
-            session = flat_replay_prompt_to_session(session, session_index)
-        source = str(session.get("source", "sharegpt")).lower()
-        turns_format = str(session.get("turns_format", ""))
-        trace_format = str(session.get("trace_format", ""))
-        if trace_format == "structured_conversation_v2":
-            session_prompts = load_structured_conversation(session, tokenizer)
-        elif trace_format == "sharegpt_token_delta_v1":
-            session_prompts = token_delta_session_to_prompts(session, tokenizer)
-        elif turns_format == "cumulative_user":
-            session_prompts = cumulative_user_session_to_prompts(session, tokenizer)
-        elif any(turn.get("prompt_is_complete") for turn in session.get("turns", [])):
-            session_prompts = complete_prompt_session_to_prompts(session, tokenizer)
-        elif source == "hotpotqa":
-            session_prompts = rag_session_to_prompts(session, tokenizer)
-        else:
-            session_prompts = sharegpt_session_to_prompts(session, tokenizer)
+    for session in sessions:
+        session_prompts = load_structured_conversation(session, tokenizer)
         for item in session_prompts:
             prompts.append(item)
             if max_requests > 0 and len(prompts) >= max_requests:

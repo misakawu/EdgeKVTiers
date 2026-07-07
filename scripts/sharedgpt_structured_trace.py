@@ -29,14 +29,10 @@ if str(H0_DIR) not in sys.path:
 from run_h0_vllm import DEFAULT_SHAREGPT_TRACE_PATH  # noqa: E402
 
 DEFAULT_OUT = (
-    REPO_ROOT / "data" / "edgekv_traces" / "source_ablation" / "sharegpt_structured_v2.jsonl"
+    REPO_ROOT / "data" / "edgekv_traces" / "source_ablation" / "sharegpt_256_original_order.jsonl"
 )
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, accurate assistant."
 TRACE_FORMAT = "structured_conversation_v2"
-
-# 长度分桶阈值（user 轮数）：把会话粗分为 hot/warm，作为下游 p_reuse_prior 的钩子。
-# 纯 ShareGPT 下无真实 hot/cold 标注，这里用"多轮=更可能被复用"的朴素先验。
-HOT_USER_TURN_THRESHOLD = 4
 
 
 def message_role(message: dict[str, Any]) -> str:
@@ -83,22 +79,10 @@ def iter_clean_messages(row: dict[str, Any]) -> Iterable[dict[str, str]]:
         yield {"role": role, "content": text}
 
 
-def conversation_length(row: dict[str, Any]) -> tuple[int, int]:
-    messages = list(iter_clean_messages(row))
-    user_count = sum(1 for msg in messages if msg["role"] == "user")
-    total_chars = sum(len(msg["content"]) for msg in messages)
-    return user_count, total_chars
-
-
-def temperature_for(user_count: int) -> str:
-    return "hot" if user_count >= HOT_USER_TURN_THRESHOLD else "warm"
-
-
 def build_session(row: dict[str, Any], source_index: int) -> dict[str, Any] | None:
     """把一行 ShareGPT 会话转成 structured_conversation_v2 记录。"""
     raw_messages = list(iter_clean_messages(row))
-    user_count = sum(1 for msg in raw_messages if msg["role"] == "user")
-    if user_count < 2:
+    if not raw_messages or not any(msg["role"] == "user" for msg in raw_messages):
         return None
 
     session_id = str(row.get("id", f"sharegpt_{source_index:06d}"))
@@ -116,9 +100,6 @@ def build_session(row: dict[str, Any], source_index: int) -> dict[str, Any] | No
             }
         )
 
-    if sum(1 for msg in messages if msg["role"] == "user") < 2:
-        return None
-
     return {
         "session_id": session_id,
         "trace_format": TRACE_FORMAT,
@@ -126,7 +107,6 @@ def build_session(row: dict[str, Any], source_index: int) -> dict[str, Any] | No
         "system_prompt": None,
         "messages": messages,
         "reuse_key": session_id,
-        "temperature": temperature_for(user_count),
         "workload": "sharegpt_session_prefix",
         "object_type": "sharegpt_session_prefix",
         "source_index": source_index,
@@ -150,18 +130,14 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--system-prompt", default=None,
                         help="可选：写入每个 session 的 system_prompt；缺省为 null，由回放器用其默认值。")
-    parser.add_argument("--max-sessions", type=int, default=0, help="0 means no limit")
-    parser.add_argument("--max-requests", type=int, default=1536, help="0 means no limit")
-    parser.add_argument("--order", choices=("file", "longest"), default="longest")
+    parser.add_argument("--max-sessions", type=int, default=256, help="0 means no limit")
+    parser.add_argument("--max-requests", type=int, default=0, help="0 means no limit")
     args = parser.parse_args()
 
     sessions: list[dict[str, Any]] = []
     request_count = 0
     rows = load_sharegpt_rows(args.sharegpt.expanduser())
-    indexed_rows = list(enumerate(rows))
-    if args.order == "longest":
-        indexed_rows.sort(key=lambda item: conversation_length(item[1]), reverse=True)
-    for source_index, row in indexed_rows:
+    for source_index, row in enumerate(rows):
         session = build_session(row, source_index)
         if session is None:
             continue
