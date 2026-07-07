@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))   # 强制插入最前面
 import argparse
 import concurrent.futures
 import csv
+import hashlib
 import json
 import os
 import statistics
@@ -69,6 +70,21 @@ def count_tokens(text: str, tokenizer) -> int:
     if tokenizer is None:
         return estimate_tokens(text)
     return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def lcp_token_count(left: Sequence[int], right: Sequence[int]) -> int:
+    count = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        count += 1
+    return count
+
+
+def token_prefix_hash(token_ids: Sequence[int], prefix_len: int | None = None) -> str:
+    limit = len(token_ids) if prefix_len is None else max(0, min(prefix_len, len(token_ids)))
+    payload = ",".join(str(int(tok)) for tok in token_ids[:limit]).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def load_model_config(model_path: str) -> dict:
@@ -952,6 +968,91 @@ def complete_prompt_session_to_prompts(session: dict, tokenizer=None) -> List[di
     return prompts
 
 
+def token_delta_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
+    session_id = str(session.get("session_id", session.get("session_group_id", ""))).strip()
+    if not session_id:
+        raise ValueError("token delta session missing session_id/session_group_id")
+    if session.get("trace_format") != "sharegpt_token_delta_v1":
+        raise ValueError(f"unsupported token trace format: {session.get('trace_format')!r}")
+    turns = session.get("turns")
+    if not isinstance(turns, list) or not turns:
+        raise ValueError(f"token delta session {session_id!r} must have nonempty turns list")
+
+    prompts: List[dict] = []
+    previous_ids: List[int] = []
+    previous_turn_index = -1
+    for offset, turn in enumerate(turns):
+        if not isinstance(turn, dict):
+            raise ValueError(f"token delta session {session_id!r} has non-object turn")
+        try:
+            turn_index = int(turn.get("i", turn.get("turn_index", offset)))
+        except (TypeError, ValueError):
+            raise ValueError(f"token delta session {session_id!r} turn has invalid index")
+        if turn_index <= previous_turn_index:
+            raise ValueError(f"token delta session {session_id!r} turn_index must be strictly increasing")
+        previous_turn_index = turn_index
+
+        raw_ids = turn.get("prompt_token_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError(f"token delta session {session_id!r} turn {turn_index} has empty prompt_token_ids")
+        try:
+            token_ids = [int(tok) for tok in raw_ids]
+        except (TypeError, ValueError):
+            raise ValueError(f"token delta session {session_id!r} turn {turn_index} has non-integer token id")
+        declared_count = int(turn.get("prompt_token_count", len(token_ids)) or 0)
+        if declared_count != len(token_ids):
+            raise ValueError(
+                f"token delta session {session_id!r} turn {turn_index} prompt_token_count mismatch"
+            )
+        actual_lcp = lcp_token_count(previous_ids, token_ids) if previous_ids else 0
+        declared_reused = int(turn.get("reused_prefix_token_count", actual_lcp) or 0)
+        if declared_reused != actual_lcp:
+            raise ValueError(
+                f"token delta session {session_id!r} turn {turn_index} reused_prefix_token_count mismatch"
+            )
+        declared_new = int(turn.get("new_prefill_token_count", len(token_ids) - actual_lcp) or 0)
+        if declared_new != len(token_ids) - actual_lcp:
+            raise ValueError(
+                f"token delta session {session_id!r} turn {turn_index} new_prefill_token_count mismatch"
+            )
+
+        row = {
+            "request_id": str(turn.get("request_id", f"{session_id}:turn:{turn_index:03d}")),
+            "session_id": session_id,
+            "session_group_id": str(session.get("session_group_id", session_id)),
+            "turn_index": turn_index,
+            "prompt": str(turn.get("prompt", "")),
+            "prompt_chars": len(str(turn.get("prompt", ""))),
+            "prompt_est_tokens": len(token_ids),
+            "n_tokens": len(token_ids),
+            "prompt_token_ids": token_ids,
+            "prompt_token_count": len(token_ids),
+            "reused_prefix_token_count": actual_lcp,
+            "new_prefill_token_count": len(token_ids) - actual_lcp,
+            "token_prefix_hash": str(turn.get("prefix_hash", token_prefix_hash(token_ids))),
+            "prefix_hash": str(turn.get("prefix_hash", token_prefix_hash(token_ids))),
+            "system_prefix_token_count": int(session.get("system_prefix_token_count", 0) or 0),
+            "workload": str(session.get("workload", "sharegpt_session_prefix")),
+            "object_type": str(session.get("object_type", "sharegpt_token_delta")),
+            "replay_source": "frozen_replay_trace",
+            "history_format": "token_delta_chatml",
+            "history_turns": turn_index + 1,
+            "history_prompt_chars": len(str(turn.get("prompt", ""))),
+            "replay_trace_format": "sharegpt_token_delta_v1",
+            "tokenizer_name_or_path": str(session.get("tokenizer_name_or_path", "")),
+            "chat_template_source": str(session.get("chat_template_source", "")),
+            "system_fingerprint": str(session.get("system_fingerprint", "")),
+        }
+        if "delta_messages" in turn:
+            row["delta_messages"] = turn["delta_messages"]
+        for key, value in session.items():
+            if key not in row and key != "turns":
+                row[key] = value
+        prompts.append(row)
+        previous_ids = token_ids
+    return prompts
+
+
 def cumulative_user_session_to_prompts(session: dict, tokenizer=None) -> List[dict]:
     prompts: List[dict] = []
     session_id = str(session["session_id"])
@@ -1023,7 +1124,10 @@ def replay_sessions_to_prompts(sessions: Sequence[dict], tokenizer=None, max_req
             session = flat_replay_prompt_to_session(session, session_index)
         source = str(session.get("source", "sharegpt")).lower()
         turns_format = str(session.get("turns_format", ""))
-        if turns_format == "cumulative_user":
+        trace_format = str(session.get("trace_format", ""))
+        if trace_format == "sharegpt_token_delta_v1":
+            session_prompts = token_delta_session_to_prompts(session, tokenizer)
+        elif turns_format == "cumulative_user":
             session_prompts = cumulative_user_session_to_prompts(session, tokenizer)
         elif any(turn.get("prompt_is_complete") for turn in session.get("turns", [])):
             session_prompts = complete_prompt_session_to_prompts(session, tokenizer)

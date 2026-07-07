@@ -51,19 +51,20 @@ PYTHONPATH = ".:h1:h0"
 def cell_args(cell_dir: Path, budget: str, policy: str, max_requests: int,
               replay_batch_size: int, replay_trace: Path, hotpotqa_path: str,
               visible_devices: str, max_num_batched_tokens: int,
-              max_model_len: int) -> list[str]:
+              max_model_len: int, workload: str, rag_requests: int,
+              hotpotqa_max_examples: int) -> list[str]:
     return [
         "--out", str(cell_dir),
         "--dtype", "float16",
         "--policies", policy,
         "--budgets", budget,
-        "--workload", WORKLOAD,
+        "--workload", workload,
         "--replay-trace", str(replay_trace),
         "--hotpotqa-path", hotpotqa_path,
-        "--hotpotqa-max-examples", str(HOTPOTQA_MAX_EXAMPLES),
+        "--hotpotqa-max-examples", str(hotpotqa_max_examples),
         "--max-sessions", str(MAX_SESSIONS),
         "--max-requests", str(max_requests),
-        "--rag-requests", str(RAG_REQUESTS),
+        "--rag-requests", str(rag_requests),
         "--rag-chunk-words", str(RAG_CHUNK_WORDS),
         "--rag-chunks-per-query", str(RAG_CHUNKS_PER_QUERY),
         "--rag-query-repeats", str(RAG_QUERY_REPEATS),
@@ -82,7 +83,10 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
               replay_trace=REPLAY_TRACE, replay_batch_size=REPLAY_BATCH_SIZE,
               max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
               max_model_len=MAX_MODEL_LEN,
-              hotpotqa_path=HOTPOTQA_PATH, no_finalize=False, force=False,
+              hotpotqa_path=HOTPOTQA_PATH, workload=WORKLOAD,
+              rag_requests=RAG_REQUESTS,
+              hotpotqa_max_examples=HOTPOTQA_MAX_EXAMPLES,
+              no_finalize=False, force=False,
               keep_cells=False) -> Path:
     """在 pressure replay trace 上运行单个 tier 的 budget x policy 矩阵。"""
     base_out = Path(base_out)
@@ -93,7 +97,10 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
         log_dir.mkdir(parents=True, exist_ok=True)
 
     R.log(f"[step3] tier={tier} out={tier_dir} budgets={budgets} policies={policies}")
-    R.log(f"[step3] workload=pressure_replay trace={replay_trace} max_requests={num_prompts} bs={replay_batch_size}")
+    R.log(
+        f"[step3] workload={workload} trace={replay_trace} "
+        f"max_requests={num_prompts} rag_requests={rag_requests} bs={replay_batch_size}"
+    )
     for budget in budgets:
         for policy in policies:
             out_dir = tier_dir / budget / policy
@@ -114,7 +121,8 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
                 visible_devices,
                 cell_args(out_dir, budget, policy, num_prompts, replay_batch_size,
                           replay_trace, hotpotqa_path, visible_devices,
-                          max_num_batched_tokens, max_model_len),
+                          max_num_batched_tokens, max_model_len,
+                          workload, rag_requests, hotpotqa_max_examples),
                 env_overrides,
                 log_file=log_dir / f"{budget}_{policy}.log",
             )
@@ -157,6 +165,9 @@ def main() -> None:
     ap.add_argument("--max-num-batched-tokens", type=int, default=MAX_NUM_BATCHED_TOKENS)
     ap.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     ap.add_argument("--hotpotqa-path", default=HOTPOTQA_PATH)
+    ap.add_argument("--workload", choices=("sharegpt", "rag", "mixed"), default=WORKLOAD)
+    ap.add_argument("--rag-requests", type=int, default=RAG_REQUESTS)
+    ap.add_argument("--hotpotqa-max-examples", type=int, default=HOTPOTQA_MAX_EXAMPLES)
     ap.add_argument("--no-finalize", action="store_true", help="defer summary/cleanup (for repeat)")
     ap.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
     ap.add_argument("--keep-cells", action="store_true", help="retain per-cell outputs and logs")
@@ -174,6 +185,9 @@ def main() -> None:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         hotpotqa_path=args.hotpotqa_path,
+        workload=args.workload,
+        rag_requests=args.rag_requests,
+        hotpotqa_max_examples=args.hotpotqa_max_examples,
         no_finalize=args.no_finalize,
         force=args.force,
         keep_cells=args.keep_cells,

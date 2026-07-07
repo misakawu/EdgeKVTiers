@@ -430,8 +430,10 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
     filtered: list[dict[str, Any]] = []
     for original_index, item in enumerate(prompts):
-        if int(item['n_tokens']) + args.max_tokens <= args.max_model_len:
+        n_tokens = len(item.get('prompt_token_ids', []) or []) or int(item['n_tokens'])
+        if n_tokens + args.max_tokens <= args.max_model_len:
             item = dict(item)
+            item['n_tokens'] = n_tokens
             item['_trace_original_index'] = original_index
             filtered.append(item)
         if len(filtered) >= args.max_requests:
@@ -440,6 +442,9 @@ def load_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def item_token_count(item: dict[str, Any]) -> int:
+    token_ids = item.get('prompt_token_ids')
+    if isinstance(token_ids, list) and token_ids:
+        return len(token_ids)
     for key in ('n_tokens', 'prompt_est_tokens'):
         try:
             value = int(item.get(key, 0) or 0)
@@ -479,7 +484,7 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
     for index, item in enumerate(trace):
         session_id = str(item.get('session_id', ''))
         must_split = (
-            item.get('history_format') == 'cumulative_user'
+            item.get('history_format') in {'cumulative_user', 'token_delta_chatml'}
             and session_id
             and session_id in current_sessions
         )
@@ -491,14 +496,14 @@ def replay_batches(trace: list[dict[str, Any]], replay_batch_size: int) -> list[
         if not current:
             current_start = index
         current.append(item)
-        if item.get('history_format') == 'cumulative_user' and session_id:
+        if item.get('history_format') in {'cumulative_user', 'token_delta_chatml'} and session_id:
             current_sessions.add(session_id)
     if current:
         batches.append((current_start, current))
     return batches
 
 
-def llm_generate_no_tqdm(llm: LLM, prompts: list[str], sampling: list[SamplingParams]) -> Any:
+def llm_generate_no_tqdm(llm: LLM, prompts: list[Any], sampling: list[SamplingParams]) -> Any:
     generate = llm.generate
     try:
         if 'use_tqdm' in inspect.signature(generate).parameters:
@@ -514,8 +519,12 @@ def llm_generate_no_tqdm(llm: LLM, prompts: list[str], sampling: list[SamplingPa
 def trace_side_reuse(
     item: dict[str, Any], reuse_seen: set[str]
 ) -> tuple[str, bool, str, bool]:
-    reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
-    hit = reuse_key in reuse_seen
+    if item.get('history_format') == 'token_delta_chatml':
+        reuse_key = str(item.get('session_group_id', item.get('session_id', '')))
+        hit = int(item.get('reused_prefix_token_count', 0) or 0) > 0
+    else:
+        reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+        hit = reuse_key in reuse_seen
     rag_reuse_key = str(item.get('rag_reuse_key', ''))
     rag_hit = bool(rag_reuse_key and rag_reuse_key in reuse_seen)
     return reuse_key, hit, rag_reuse_key, rag_hit
@@ -531,13 +540,17 @@ def request_trace_fields(
     event_index: int,
 ) -> dict[str, Any]:
     workload = str(item.get('workload', 'sharegpt_session_prefix'))
-    reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+    reuse_key = (
+        str(item.get('session_group_id', item.get('session_id', '')))
+        if item.get('history_format') == 'token_delta_chatml'
+        else str(item.get('reuse_key', item.get('session_id', '')))
+    )
     profile = cop.update_from_item(
         item,
         hit=bool(trace_hit or rag_hit),
         access_index=event_index,
     )
-    fields = {k: v for k, v in item.items() if k not in {'prompt', '_trace_original_index'}}
+    fields = {k: v for k, v in item.items() if k not in {'prompt', 'prompt_token_ids', '_trace_original_index'}}
     fields.update(
         {
             'workload': workload,
@@ -545,7 +558,11 @@ def request_trace_fields(
             'object_id': profile.object_id,
             'reuse_key': reuse_key,
             'hit': trace_hit,
-            'hit_source': 'trace_side_rag_reuse_key' if rag_hit and not trace_hit else 'trace_side_reuse_key',
+            'hit_source': (
+                'trace_side_token_lcp'
+                if item.get('history_format') == 'token_delta_chatml'
+                else 'trace_side_rag_reuse_key' if rag_hit and not trace_hit else 'trace_side_reuse_key'
+            ),
             'rag_hit': rag_hit if item.get('rag_reuse_key') else '',
             'rag_hit_source': 'trace_side_rag_reuse_key' if item.get('rag_reuse_key') else '',
             'p_reuse': round(profile.p_reuse, 6),
@@ -726,7 +743,11 @@ def run_cell(
                     f"batch={batch_number}/{len(batches)} done_requests={len(rows)}",
                     flush=True,
                 )
-            prompts = [str(item['prompt']) for item in batch]
+            prompts = [
+                {'prompt_token_ids': [int(tok) for tok in item['prompt_token_ids']]}
+                if item.get('prompt_token_ids') else str(item['prompt'])
+                for item in batch
+            ]
             trace_reuse = [trace_side_reuse(item, reuse_seen) for item in batch]
             trace_fields_batch = [
                 request_trace_fields(
@@ -827,6 +848,8 @@ def run_cell(
                 rows.append(row)
             for item in batch:
                 reuse_key = str(item.get('reuse_key', item.get('session_id', '')))
+                if item.get('history_format') == 'token_delta_chatml':
+                    reuse_key = str(item.get('session_group_id', reuse_key))
                 if reuse_key:
                     reuse_seen.add(reuse_key)
                 rag_reuse_key = str(item.get('rag_reuse_key', ''))
@@ -888,6 +911,12 @@ def run_cell(
         if row.get('history_format') == 'cumulative_user'
     })
     cumulative_turns = sum(1 for row in valid if row.get('history_format') == 'cumulative_user')
+    token_delta_sessions = len({
+        str(row.get('session_id', ''))
+        for row in valid
+        if row.get('history_format') == 'token_delta_chatml'
+    })
+    token_delta_turns = sum(1 for row in valid if row.get('history_format') == 'token_delta_chatml')
     for row in valid:
         workload = str(row.get('workload', 'unknown'))
         workload_counts[workload] = workload_counts.get(workload, 0) + 1
@@ -920,6 +949,8 @@ def run_cell(
         'history_format': ",".join(history_formats) if history_formats else "",
         'cumulative_sessions': cumulative_sessions,
         'cumulative_turns': cumulative_turns,
+        'token_delta_sessions': token_delta_sessions,
+        'token_delta_turns': token_delta_turns,
         'vllm_generate_tqdm': False,
         'replay_progress_log': 'task_level',
         'workload': args.workload,

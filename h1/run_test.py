@@ -21,17 +21,20 @@ import run_step3_budget_tiers as step3
 OUT_DIR = Path("h1/out")
 # POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
 POLICIES = ["h1_lpe"]
-TIER = "sharedgpt_v5"
+TIER = "sharedgpt_token_v1"
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
 # BUDGETS = ["0.75", "0.80", "0.85", "0.90", "0.95"]
 BUDGETS = ["0.75", "0.825", "0.95"]
-REPLAY_TRACE = Path("data/edgekv_traces/有效实验数据/sharedgpt_v5.jsonl")
-# sharedgpt_v5 pressure trace 包含 1536 个请求（匹配 config.json trace_size）。
+REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharedgpt_token_v1.jsonl")
+# sharedgpt_token_v1 pressure trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
-REPLAY_BATCH_SIZE = 8
+REPLAY_BATCH_SIZE = 1
 MAX_MODEL_LEN = 1024
-MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN * REPLAY_BATCH_SIZE
+MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN
+WORKLOAD = "sharegpt"
+RAG_REQUESTS = 0
+HOTPOTQA_MAX_EXAMPLES = 0
 
 
 def main() -> None:
@@ -42,8 +45,14 @@ def main() -> None:
     parser.add_argument("--replay-trace", type=Path, default=REPLAY_TRACE)
     parser.add_argument("--budgets", default=" ".join(BUDGETS))
     parser.add_argument("--policies", default=" ".join(POLICIES))
+    parser.add_argument("--replay-batch-size", type=int, default=REPLAY_BATCH_SIZE)
+    parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--workload", choices=("sharegpt", "rag", "mixed"), default=WORKLOAD)
+    parser.add_argument("--rag-requests", type=int, default=RAG_REQUESTS)
+    parser.add_argument("--hotpotqa-max-examples", type=int, default=HOTPOTQA_MAX_EXAMPLES)
     parser.add_argument("--force", action="store_true", help="rerun cells even if summary JSON exists")
-    parser.add_argument("--out-dir", default="LPE结果复现")
+    parser.add_argument("--out-dir", default="sharedgpt_token_v1")
     args = parser.parse_args()
 
     base_out = OUT_DIR / args.out_dir
@@ -57,9 +66,16 @@ def main() -> None:
         force=args.force,
         keep_cells=True,
         replay_trace=args.replay_trace,
-        replay_batch_size=REPLAY_BATCH_SIZE,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        max_model_len=MAX_MODEL_LEN,
+        replay_batch_size=args.replay_batch_size,
+        max_num_batched_tokens=(
+            args.max_num_batched_tokens
+            if args.max_num_batched_tokens is not None
+            else args.max_model_len
+        ),
+        max_model_len=args.max_model_len,
+        workload=args.workload,
+        rag_requests=args.rag_requests,
+        hotpotqa_max_examples=args.hotpotqa_max_examples,
     )
 
 

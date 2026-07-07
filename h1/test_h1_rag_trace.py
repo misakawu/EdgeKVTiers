@@ -180,6 +180,155 @@ def test_h1_cumulative_replay_batches_split_same_session() -> None:
     assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
 
 
+def test_sharegpt_token_trace_builder_has_token_delta_contract() -> None:
+    import scripts.sharedgpt_token_trace as token_trace
+
+    class FakeChatTokenizer:
+        chat_template = "fake"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            rendered = "|".join(f"{m['role']}:{m['content']}" for m in messages)
+            if add_generation_prompt:
+                rendered += "|assistant:"
+            if not tokenize:
+                return rendered
+            return [ord(ch) % 97 for ch in rendered]
+
+    tokenizer = FakeChatTokenizer()
+    system_ids = token_trace.build_prompt_token_ids(
+        tokenizer,
+        [{"role": "system", "content": "sys"}],
+        add_generation_prompt=False,
+    )
+    session = token_trace.build_session(
+        {
+            "id": "sg_builder",
+            "conversations": [
+                {"from": "human", "value": "hello"},
+                {"from": "gpt", "value": "hi"},
+                {"from": "human", "value": "again"},
+            ],
+        },
+        source_index=0,
+        tokenizer=tokenizer,
+        tokenizer_name="fake",
+        system_prompt="sys",
+        system_token_ids=system_ids,
+    )
+
+    assert session is not None
+    assert session["trace_format"] == "sharegpt_token_delta_v1"
+    assert "prompt" not in session
+    assert "reuse_key" not in session
+    assert "system_prompt" not in session
+    assert "tokenizer_name_or_path" not in session
+    assert len(session["turns"]) == 2
+    assert "prompt" not in session["turns"][0]
+    assert "delta_messages" not in session["turns"][0]
+    second = session["turns"][1]
+    assert second["prompt_token_count"] == len(second["prompt_token_ids"])
+    assert second["reused_prefix_token_count"] > 0
+    assert second["new_prefill_token_count"] == (
+        second["prompt_token_count"] - second["reused_prefix_token_count"]
+    )
+
+
+def test_h1_loads_token_delta_replay_trace(tmp_path: Path, monkeypatch) -> None:
+    trace_path = tmp_path / "unused_sharegpt.json"
+    trace_path.write_text("[]", encoding="utf-8")
+    replay_path = tmp_path / "token_delta.jsonl"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "trace_format": "sharegpt_token_delta_v1",
+                "session_id": "sg_tok",
+                "session_group_id": "sg_tok",
+                "tokenizer_name_or_path": "fake-tokenizer",
+                "chat_template_source": "tokenizer.apply_chat_template",
+                "system_prompt": "sys",
+                "system_fingerprint": "abc",
+                "system_prefix_token_count": 2,
+                "turns": [
+                    {
+                        "i": 0,
+                        "prompt": "p0",
+                        "prompt_token_ids": [1, 2, 3],
+                        "prompt_token_count": 3,
+                        "reused_prefix_token_count": 0,
+                        "new_prefill_token_count": 3,
+                        "prefix_hash": "h0",
+                    },
+                    {
+                        "i": 1,
+                        "prompt": "p1",
+                        "prompt_token_ids": [1, 2, 3, 4, 5],
+                        "prompt_token_count": 5,
+                        "reused_prefix_token_count": 3,
+                        "new_prefill_token_count": 2,
+                        "prefix_hash": "h1",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(h1.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer())
+    args = argparse.Namespace(
+        model="models/Qwen2.5-7B-Instruct",
+        trace_path=str(trace_path),
+        replay_trace=str(replay_path),
+        workload="mixed",
+        max_requests=8,
+        rag_requests=0,
+        max_sessions=2,
+        hotpotqa_path=tmp_path / "unused_hotpotqa.json",
+        download_hotpotqa=False,
+        hotpotqa_max_examples=0,
+        rag_chunk_words=56,
+        rag_chunks_per_query=2,
+        rag_query_repeats=4,
+        sharegpt_order="file",
+        timeout_s=120.0,
+        max_tokens=16,
+        max_model_len=64,
+    )
+
+    rows = h1.load_trace(args)
+    assert [row["n_tokens"] for row in rows] == [3, 5]
+    assert rows[0]["history_format"] == "token_delta_chatml"
+    assert rows[1]["reused_prefix_token_count"] == 3
+    assert rows[1]["new_prefill_token_count"] == 2
+    assert rows[1]["prompt_token_ids"] == [1, 2, 3, 4, 5]
+    assert "reuse_key" not in rows[1]
+
+
+def test_h1_token_delta_replay_batches_split_same_session() -> None:
+    trace = [
+        {"session_id": "sg0", "history_format": "token_delta_chatml", "turn_index": 0},
+        {"session_id": "sg0", "history_format": "token_delta_chatml", "turn_index": 1},
+        {"session_id": "sg1", "history_format": "token_delta_chatml", "turn_index": 0},
+        {"session_id": "sg1", "history_format": "token_delta_chatml", "turn_index": 1},
+    ]
+    batches = h1.replay_batches(trace, replay_batch_size=2)
+    assert [[row["turn_index"] for row in batch] for _, batch in batches] == [[0], [1, 0], [1]]
+
+
+def test_h1_token_delta_trace_side_hit_uses_lcp() -> None:
+    item = {
+        "session_id": "sg_tok",
+        "session_group_id": "sg_tok",
+        "history_format": "token_delta_chatml",
+        "reused_prefix_token_count": 7,
+    }
+    reuse_key, hit, rag_reuse_key, rag_hit = h1.trace_side_reuse(item, set())
+    assert reuse_key == "sg_tok"
+    assert hit is True
+    assert rag_reuse_key == ""
+    assert rag_hit is False
+
+
 def test_h1_generate_helper_disables_tqdm_when_supported() -> None:
     class FakeLLM:
         def __init__(self) -> None:
