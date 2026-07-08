@@ -15,6 +15,24 @@
     python h1/run_find_workload.py
     python h1/run_find_workload.py --unique-fractions 0.25 0.50 0.75 --policies h1_lru
     python h1/run_find_workload.py --unique-fractions 0.50 --four-policies --reps 3
+
+启动命令：
+    python h1/备份-启动器/run_find_workload.py
+
+参数说明：
+    --source-trace：用于派生低复用 trace 的源 JSONL。
+    --trace-out：派生 trace 输出目录。
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --budget：固定使用的 gpu_memory_utilization 档位。
+    --batch-size：固定使用的 replay_batch_size。
+    --num-prompts：每个 cell 回放请求数。
+    --unique-fractions：要注入唯一前缀的请求比例列表。
+    --policies：每个派生 trace 下运行的策略列表。
+    --reference-policy：用于判定有效窗口的参考策略。
+    --reps：每个 unique_fraction 重复运行次数。
+    --four-policies：忽略 --policies，改跑 vllm_default/h1_lru/h1_lfu/h1_lpe。
+    --metadata-only：只改 reuse metadata，不改 prompt 文本；用于验证 metadata 不影响真实 hit。
+    --force：已有 summary JSON 时仍重跑 cell。
 """
 from __future__ import annotations
 

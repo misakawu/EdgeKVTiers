@@ -38,7 +38,7 @@ def log(msg: str) -> None:
 
 
 def _strip_vllm_batch_tqdm(line: str) -> str:
-    """Drop vLLM per-generate tqdm noise while preserving real log records."""
+    """去掉 vLLM 每次 generate 的 tqdm 噪声，同时保留真实日志记录。"""
     if "Adding requests:" not in line and "Processed prompts:" not in line:
         return line
     for marker in ("INFO ", "WARNING ", "ERROR "):
@@ -49,7 +49,7 @@ def _strip_vllm_batch_tqdm(line: str) -> str:
 
 
 def lpe_runtime_env_overrides(policy: str, out_dir: Path) -> dict[str, str]:
-    """Return LPE-only runtime diagnostics env overrides for one cell."""
+    """返回单个 cell 中仅 LPE 需要的运行时诊断环境变量覆盖。"""
     if str(policy) != "h1_lpe":
         return {}
     out_dir = Path(out_dir)

@@ -1,2 +1,2 @@
-"""Stats collection helpers for H1."""
+"""H1 统计采集辅助模块。"""
 

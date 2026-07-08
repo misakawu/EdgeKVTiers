@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate ShareGPT token-delta replay trace with model chat-template tokens."""
+"""生成带模型 chat-template token 的 ShareGPT token-delta replay trace。"""
 
 from __future__ import annotations
 

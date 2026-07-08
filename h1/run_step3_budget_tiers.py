@@ -9,6 +9,29 @@
     python h1/run_step3_budget_tiers.py --budgets tight mid --policies h1_lru h1_lpe
 
 所有配置都在下方 CONFIG 块内，无需环境变量。
+
+启动命令：
+    python h1/run_step3_budget_tiers.py
+
+参数说明：
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --tier：输出 tier 目录名。
+    --base-out：Step3 输出根目录。
+    --budgets：预算档位列表，可用 tight/mid/loose 或数值 gpu_memory_utilization。
+    --policies：策略列表，空格分隔。
+    --num-prompts：每个 cell 回放请求数。
+    --replay-trace：JSONL replay trace 输入路径。
+    --replay-batch-size：回放批大小，对应 vLLM max_num_seqs 压力。
+    --batch-order：批内请求排序方式，original/length_bucket/round_robin。
+    --max-num-batched-tokens：vLLM max_num_batched_tokens。
+    --max-model-len：vLLM max_model_len。
+    --hotpotqa-path：本地 HotpotQA 数据目录。
+    --workload：回放类型，sharegpt/rag/mixed。
+    --rag-requests：mixed/rag workload 中 RAG 请求数。
+    --hotpotqa-max-examples：加载 HotpotQA 的最大样本数。
+    --no-finalize：只跑 cell，不汇总、不清理；供 repeat 协议复用。
+    --force：已有 summary JSON 时仍重跑 cell。
+    --keep-cells：保留每个 cell 的中间输出和日志。
 """
 from __future__ import annotations
 
@@ -41,9 +64,9 @@ MAX_TOKENS = 16
 MAX_MODEL_LEN = 2048
 # REPLAY_BATCH_SIZE = 64
 REPLAY_BATCH_SIZE=16
-# Keep this decoupled from REPLAY_BATCH_SIZE. A larger replay batch raises
-# max_num_seqs; inflating the token cap at the same time can make vLLM fail
-# engine initialization on tight GPU-memory budgets.
+# 保持它与 REPLAY_BATCH_SIZE 解耦。更大的 replay batch 会提高
+# max_num_seqs；如果同时放大 token 上限，vLLM 可能在紧张 GPU 显存预算下
+# 初始化引擎失败。
 MAX_NUM_BATCHED_TOKENS = 8192
 BATCH_ORDER = "round_robin"
 TENSOR_PARALLEL_SIZE = 2

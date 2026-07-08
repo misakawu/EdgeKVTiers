@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""H5: quality-bandwidth phase surface validation."""
+"""H5：quality-bandwidth 相变面验证。"""
 
 from __future__ import annotations
 

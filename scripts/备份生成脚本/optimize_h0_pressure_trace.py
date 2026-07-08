@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Build a budget-sensitive ShareGPT + HotpotQA pressure trace.
+"""构建对预算敏感的 ShareGPT + HotpotQA pressure trace。
 
-The trace is shaped for real vLLM prefix-cache behavior: every prompt starts
-with an object-level marker, hot objects repeat the same marker, and cold
-objects use unique markers. The request order primes hot objects, scans cold
-objects, then probes the hot objects again so retention improves as KV capacity
-increases.
+该 trace 针对真实 vLLM prefix-cache 行为塑形：每个 prompt 都以对象级 marker 开头，
+hot 对象重复相同 marker，cold 对象使用唯一 marker。请求顺序会先预热 hot 对象，
+再扫描 cold 对象，随后再次探测 hot 对象，因此 KV 容量越大，保留效果越好。
 
-For --source-mode sharegpt, ShareGPT objects are taken in source file order
-from the first usable sessions; the hot/cold and budget-ladder shaping only
-changes replay access order, not candidate selection.
+当 --source-mode 为 sharegpt 时，ShareGPT 对象按源文件顺序从最早可用 sessions 中选取；
+hot/cold 和 budget-ladder 塑形只改变 replay 访问顺序，不改变候选选择。
 """
 
 from __future__ import annotations
@@ -142,7 +139,7 @@ def exact_hot_cold_counts(requests: int, hot_ratio: float, hot_repeats: int) -> 
         hot_count = choose_hot_count(requests, hot_ratio)
         return hot_count, requests - hot_count
 
-    # Derived from h / (h * repeats + c) ~= hot_ratio and requests = h * repeats + c.
+    # 由 h / (h * repeats + c) ~= hot_ratio 以及 requests = h * repeats + c 推导。
     hot_count = int(round((hot_ratio * requests) / (1.0 + hot_ratio * (hot_repeats - 1))))
     hot_count = max(1, min(hot_count, requests // hot_repeats))
     cold_count = requests - hot_count * hot_repeats

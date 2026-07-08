@@ -58,7 +58,7 @@ def main() -> None:
 
     base = Path(args.base)
     # (budget, policy, replay_batch_size, batch_order, warmup_batches) ->
-    # column -> [跨 rep 的取值]。
+    # 列名 -> [跨 rep 的取值]。
     # replay_batch_size 作为 key，保证 --batch-sweep 运行能区分不同并发；
     # 普通单并发运行只会为每个 (budget, policy) 产生一个 batch 值。
     collected: dict[tuple[str, str, str, str, str], dict[str, list[float]]] = defaultdict(

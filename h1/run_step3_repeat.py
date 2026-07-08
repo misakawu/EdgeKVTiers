@@ -9,6 +9,15 @@
     python h1/run_step3_repeat.py --reps 5 --force
 
 所有配置都在下方 CONFIG 块内，无需环境变量。
+
+启动命令：
+    python h1/run_step3_repeat.py
+
+参数说明：
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --reps：每个工作点重复运行次数。
+    --force：已有 cell 输出时仍重跑。
+    --keep-cells：保留每次重复的 cell 输出和日志；不传则汇总后清理中间目录。
 """
 from __future__ import annotations
 
@@ -24,7 +33,7 @@ REPS = 3
 POLICIES = ["h1_lru", "h1_lfu", "vllm_default", "h1_lpe"]
 BASE = Path("h1/out/step3_repeat")
 
-# pressure trace 上的工作点：(标签, 预算档, 最大 replay 请求数)。
+# 压力 trace 上的工作点：(标签, 预算档, 最大 replay 请求数)。
 WORK_POINTS = [
     ("pressure_tight_n400", "tight", 400),
     ("pressure_mid_n400", "mid", 400),

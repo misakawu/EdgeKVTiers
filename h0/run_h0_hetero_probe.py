@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Deterministic analytic probe for H0 homogeneous/heterogeneous LPE behavior."""
+"""H0 同质/异质 LPE 行为的确定性解析探针。
+
+启动命令：
+    python h0/run_h0_hetero_probe.py
+
+参数说明：
+    --out-dir：输出目录根路径；每次运行会在其下创建时间戳目录。
+    --seed：随机种子，控制 trace 与对象属性生成。
+    --reps：每个场景/预算/策略重复次数。
+    --trace-len：每条模拟 trace 的请求长度。
+    --budgets：要扫描的缓存预算列表，表示可保留对象容量比例。
+"""
 
 from __future__ import annotations
 

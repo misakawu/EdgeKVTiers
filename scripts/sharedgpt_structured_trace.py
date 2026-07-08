@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a structured_conversation_v2 ShareGPT replay trace.
+"""生成 structured_conversation_v2 格式的 ShareGPT replay trace。
 
 与旧的 ``sharedgpt_token_trace.py`` 不同，这里 **只记录"发生了什么"**：原始
 ShareGPT 多轮消息（role/content/turn_index），不含任何 ``prompt_token_ids`` /

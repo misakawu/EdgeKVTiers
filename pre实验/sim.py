@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reusable analytical simulator toolkit for EdgeKVTiers pre-experiments.
+"""EdgeKVTiers 预实验可复用解析模拟器工具集。
 
-The module intentionally has no command-line parser and no H1-H5 batch entry.
-Experiment files should import this toolkit, build/load a trace, then call
-``run_one`` or ``Simulator`` directly.
+该模块有意不提供命令行解析器，也不提供 H1-H5 批量入口。
+实验文件应导入此工具集，构造/加载 trace，然后直接调用
+``run_one`` 或 ``Simulator``。
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def c_recomp_ms(obj: KVObject, q: str, cfg: SimConfig) -> float:
 
 
 def c_restore_ms(obj: KVObject, q: str, cfg: SimConfig) -> float:
-    # With BW in GB/s and size in MB, 1 GB/s is approximately 1 MB/ms.
+    # BW 单位为 GB/s、size 单位为 MB 时，1 GB/s 近似等于 1 MB/ms。
     return size_mb(obj, q, cfg) / max(cfg.bw_gbps, 1e-9) + cfg.d_deser_ms
 
 
@@ -235,11 +235,11 @@ def load_sharegpt_trace(
     min_human_turns: int = 2,
     start_ts: float = 0.0,
 ) -> Tuple[List[KVObject], List[Request]]:
-    """Convert ShareGPT V3 JSON conversations into prefix-cache requests.
+    """把 ShareGPT V3 JSON 对话转换为 prefix-cache 请求。
 
-    Each human turn accesses the previous session prefix when it exists and
-    admits the extended prefix for the following turn. Token counts use a local
-    heuristic so this loader stays independent of external tokenizers.
+    每个 human 轮次会在存在上一轮 session prefix 时访问它，
+    并把扩展后的 prefix 准入给下一轮使用。token 数采用本地启发式估计，
+    使该加载器不依赖外部 tokenizer。
     """
 
     with path.open("r", encoding="utf-8") as f:

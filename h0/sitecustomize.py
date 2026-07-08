@@ -1,4 +1,4 @@
-"""Runtime compatibility patches for H0 vLLM server entrypoints."""
+"""H0 vLLM 服务入口的运行时兼容补丁。"""
 
 try:
     from transformers import PreTrainedTokenizerBase

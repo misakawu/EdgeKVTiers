@@ -1,9 +1,40 @@
 #!/usr/bin/env python3
-"""Replay ShareGPT + RAG reuse prompts against a vLLM server.
+"""向 vLLM 服务回放 ShareGPT + RAG 复用 prompts。
 
-This is the real-engine H0 runner: it assumes vLLM is already serving with
-``--enable-prefix-caching`` and measures request TTFT, end-to-end latency, and
-GPU memory peak while replaying prompts that share prefixes.
+这是 H0 真实引擎回放器：假设 vLLM 已经用
+``--enable-prefix-caching`` 启动服务，并在回放共享前缀 prompts 时测量
+请求 TTFT、端到端延迟和 GPU 显存峰值。
+
+启动命令：
+    python h0/run_h0_vllm.py --endpoint http://127.0.0.1:8000
+
+参数说明：
+    --endpoint：已启动 vLLM OpenAI-compatible 服务地址。
+    --model：服务端模型名；为空时从 /v1/models 读取第一个 id。
+    --trace-path：ShareGPT 原始 JSON 路径。
+    --replay-trace：JSONL replay trace 输入路径。
+    --workload：回放类型，sharegpt/rag/mixed。
+    --hotpotqa-path：本地 HotpotQA 数据目录。
+    --download-hotpotqa：缺少 HotpotQA parquet 时允许下载。
+    --hotpotqa-max-examples：加载 HotpotQA 的最大样本数。
+    --max-sessions：最多加载的 ShareGPT session 数。
+    --max-requests：最多回放请求数。
+    --rag-requests：mixed/rag workload 中 RAG 请求数。
+    --rag-chunk-words：每个 RAG chunk 的词数。
+    --rag-chunks-per-query：每个 RAG query 拼接的 chunk 数。
+    --rag-query-repeats：每组 RAG query 重复次数。
+    --sharegpt-order：ShareGPT session 选择顺序，file 或 longest。
+    --max-model-len：按该长度过滤过长 prompt，并估算 KV 大小。
+    --max-tokens：每个请求生成 token 上限。
+    --concurrency：客户端并发请求数。
+    --tensor-parallel-size：用于 KV 大小估计的 tensor parallel size。
+    --temperature：采样温度。
+    --timeout-s：请求/下载相关操作超时时间。
+    --warmup-requests：正式计量前发送的 warmup 请求数。
+    --c-re-ms-per-token：COP 重算成本估计，单位 ms/token。
+    --bw-gbps：COP restore 带宽估计，单位 GB/s。
+    --d-deser-ms：COP 反序列化固定开销，单位 ms。
+    --out：输出目录。
 """
 
 from __future__ import annotations
@@ -54,8 +85,8 @@ BYTES_PER_DTYPE = {
 
 
 def estimate_tokens(text: str) -> int:
-    # Keep this runner tokenizer-free. The exact token count is not used for
-    # scheduling; it only gives a stable trace-side size estimate.
+    # 保持该回放器不依赖 tokenizer。精确 token 数不参与调度；
+    # 这里只提供稳定的 trace 侧长度估计。
     return max(1, int(len((text or "").split()) * 1.35))
 
 
@@ -245,10 +276,10 @@ def build_sharegpt_cumulative_sessions(
     order: str = "file",
     max_prompt_est_tokens: int = 0,
 ) -> tuple[List[dict], dict]:
-    """Build one JSONL row per ShareGPT session with cumulative prompts.
+    """为每个 ShareGPT session 构造一行带累计上下文 prompt 的 JSONL 记录。
 
-    ``max_turns`` caps the expanded request count, not the number of sessions.
-    The last emitted session may be truncated to respect that cap.
+    ``max_turns`` 限制展开后的请求数，而不是 session 数。
+    为满足该上限，最后输出的 session 可能会被截断。
     """
     if max_turns <= 0:
         raise ValueError("max_turns must be > 0")
@@ -561,11 +592,11 @@ def load_hotpotqa_chunk_groups(
 
 
 def hotpotqa_high_frequency_group_order(group_count: int, request_count: int) -> List[int]:
-    """Return deterministic 80/20 group indices for HotpotQA chunk reuse.
+    """返回 HotpotQA chunk 复用所需的确定性 80/20 分组索引。
 
-    The first 20% of groups are treated as hot and occupy four out of every
-    five request slots. The remaining groups are still exercised as the cold
-    tail so coverage is preserved while reuse is intentionally skewed.
+    前 20% 的 group 视为 hot，并占据每 5 个请求槽中的 4 个。
+    剩余 group 仍作为 cold tail 被访问，从而在保持覆盖率的同时
+    人为制造偏斜复用。
     """
     if group_count <= 0 or request_count <= 0:
         return []
@@ -598,12 +629,11 @@ def build_rag_chunk_prompts(
     max_examples: int = 10,
     timeout_s: float = 120.0,
 ) -> List[dict]:
-    """Build a deterministic HotpotQA RAG trace with high-frequency chunk reuse.
+    """构造带高频 chunk 复用的确定性 HotpotQA RAG trace。
 
-    The retrieved chunk prefix stays at the beginning of each prompt, while the
-    group schedule makes the first 20% of chunk groups account for about 80% of
-    RAG requests. This gives LFU/LPE a stable hot/cold signal instead of the old
-    near-uniform sequential reuse pattern.
+    检索到的 chunk prefix 保持在每个 prompt 开头，同时 group 调度让
+    前 20% 的 chunk groups 承担约 80% 的 RAG 请求。这样 LFU/LPE 会看到
+    稳定的 hot/cold 信号，而不是旧版近似均匀的顺序复用模式。
     """
 
     prompts: List[dict] = []

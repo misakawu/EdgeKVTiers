@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+# 启动命令：
+#   bash h1/run_h1_policy_serving_bench.sh [OUT_DIR] [VISIBLE_DEVICES]
+#
+# 位置参数说明：
+#   OUT_DIR：cell 输出目录；不传时写入带时间戳的 h1/out/h1_policy_pressure_replay_*。
+#   VISIBLE_DEVICES：传给 CUDA_VISIBLE_DEVICES；不传时读取 H1_VISIBLE_DEVICES，默认 0,1。
+#
+# 环境变量说明：
+#   H1_GPU_POLICY：缓存策略，默认 h1_lru。
+#   H1_GPU_MEMORY_UTILIZATION：vLLM gpu_memory_utilization；会映射为 tight/mid/loose 或读取 H1_BUDGET。
+#   H1_BUDGET：当 H1_GPU_MEMORY_UTILIZATION 不是内置映射值时使用的 budget 名。
+#   H1_MODEL：本地模型路径。
+#   H1_REPLAY_TRACE：JSONL replay trace 输入路径。
+#   H1_HOTPOTQA_PATH：本地 HotpotQA 数据目录。
+#   H1_BENCH_NUM_PROMPTS：回放请求数。
+#   H1_REPLAY_BATCH_SIZE / H1_BENCH_MAX_CONCURRENCY：回放批大小，对应 vLLM max_num_seqs。
+#   H1_MAX_MODEL_LEN：vLLM max_model_len。
+#   H1_MAX_TOKENS：每个请求生成 token 上限。
+#   H1_TENSOR_PARALLEL_SIZE：vLLM tensor parallel size。
+#   H1_ATTENTION_BACKEND：vLLM attention backend。
+#   EDGEKV_H1_PROFILE_POLICY_TIME：是否记录策略耗时。
+#   EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES：是否输出对象级画像。
+#   EDGEKV_H1_RUNTIME_MONITOR：是否启用 LPE 运行时监控。
+#   EDGEKV_H1_RUNTIME_MONITOR_PATH：运行时监控 JSONL 输出路径。
+#   EDGEKV_C_RE_MS_PER_TOKEN / EDGEKV_BW_GBPS / EDGEKV_D_DESER_MS：COP 成本模型参数。
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

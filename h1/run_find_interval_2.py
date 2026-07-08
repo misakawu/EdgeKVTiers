@@ -19,6 +19,19 @@
 
 每档跑 h1_lru（参考基线，用于定档）+ h1_lpe。复用 run_step3_budget_tiers 的 cell 运行链；
 按 budget 粒度 try/except 隔离失败，单档 OOM/拒服务只跳过该档、不中止整轮。
+
+启动命令：
+    python h1/run_find_interval_2.py
+
+参数说明：
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --num-prompts：每个 cell 回放请求数。
+    --coarse-budgets：粗网格预算档位列表。
+    --policies：每个 budget 下运行的策略列表。
+    --reference-policy：用于匹配 target hit 的参考策略。
+    --target-hits：希望定出的目标命中率列表。
+    --max-num-batched-tokens：vLLM max_num_batched_tokens。
+    --force：已有 summary JSON 时仍重跑 cell。
 """
 from __future__ import annotations
 

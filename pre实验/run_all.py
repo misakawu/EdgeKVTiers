@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Run all pure-Python pre experiments."""
+"""运行所有纯 Python 预实验。
+
+启动命令：
+    python pre实验/run_all.py
+
+参数说明：
+    本启动器不接收命令行参数；实验列表由 EXPERIMENTS 常量控制。
+"""
 
 from __future__ import annotations
 

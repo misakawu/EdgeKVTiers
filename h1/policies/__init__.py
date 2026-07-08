@@ -1,2 +1,2 @@
-"""GPU prefix-cache policy helpers for H1."""
+"""H1 GPU prefix-cache 策略辅助模块。"""
 

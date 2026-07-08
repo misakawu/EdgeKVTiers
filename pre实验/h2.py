@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""H2: restore-vs-recompute threshold validation."""
+"""H2：restore-vs-recompute 阈值验证。"""
 
 from __future__ import annotations
 

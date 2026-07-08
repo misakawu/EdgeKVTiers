@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Aggregate ws2 policy-comparison runs and emit CSV + figures.
+"""汇总 ws2 策略对比运行结果，并输出 CSV 和图。
 
-Reads h1/out/hotqa三级trace_有效窗口/policy_cmp/{policy}_rep{n}/{budget}_{policy}_summary.json,
-groups by (policy, budget), computes mean +/- std over reps for the key metrics,
-writes a tidy CSV and two PNG figures (true native hit_rate and p95 latency).
+读取 h1/out/hotqa三级trace_有效窗口/policy_cmp/{policy}_rep{n}/{budget}_{policy}_summary.json，
+按 (policy, budget) 分组，对关键指标计算跨 rep 的均值和标准差，
+并写出整洁 CSV 以及两张 PNG 图（真实原生命中率和 p95 延迟）。
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ BUDGETS = ["0.85", "0.90"]
 REPS = [1, 2, 3]
 
 METRICS = [
-    "hit_rate",            # native token coverage (true)
+    "hit_rate",            # 原生 token 覆盖率（真实值）
     "native_hit_rate",
     "block_lookup_hit_rate",
     "gpu_prefix_cache_evictions",
@@ -79,7 +79,7 @@ def main() -> None:
             w.writeheader()
             w.writerows(rows)
     print(f"wrote {out_csv}")
-    # console table
+    # 控制台表格
     for r in rows:
         print(
             f"{r['policy']:7s} bud={r['budget']} reps={r['reps_ok']} "
@@ -99,7 +99,7 @@ def main() -> None:
 
     x = list(range(len(POLICIES)))
     width = 0.35
-    # Figure 1: native hit_rate by policy x budget
+    # 图 1：按 policy x budget 展示原生命中率
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for i, budget in enumerate(BUDGETS):
         means, stds = [], []
@@ -120,7 +120,7 @@ def main() -> None:
     fig.savefig(f1, dpi=160)
     print(f"wrote {f1}")
 
-    # Figure 2: p95 latency by policy x budget
+    # 图 2：按 policy x budget 展示 p95 延迟
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for i, budget in enumerate(BUDGETS):
         means, stds = [], []

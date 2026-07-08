@@ -10,6 +10,26 @@ GPU 上初始化。
 
 默认目标是 ShareGPT trace；可传入 --replay-trace / --tier / --num-prompts 重定向
 （例如退回到冻结的 HotQA ws2 trace）。
+
+启动命令：
+    python h1/run_test.py
+
+参数说明：
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --num-prompts：每个 cell 回放请求数。
+    --tier：输出 tier 前缀；实际目录会追加 replay_batch_size。
+    --replay-trace：JSONL replay trace 输入路径。
+    --budgets：要扫描的 gpu_memory_utilization 档位，空格分隔。
+    --policies：要运行的缓存策略，空格分隔。
+    --replay-batch-size：回放批大小，对应 vLLM max_num_seqs 压力。
+    --batch-order：批内请求排序方式；本脚本默认 round_robin。
+    --max-model-len：vLLM max_model_len。
+    --max-num-batched-tokens：vLLM max_num_batched_tokens。
+    --workload：回放类型，sharegpt/rag/mixed。
+    --rag-requests：mixed/rag workload 中 RAG 请求数。
+    --hotpotqa-max-examples：加载 HotpotQA 的最大样本数。
+    --force：已有 summary JSON 时仍重跑 cell。
+    --out-dir：保留参数；当前实现固定写入 h1/out。
 """
 from __future__ import annotations
 
@@ -19,18 +39,18 @@ from pathlib import Path
 import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
-# POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
-POLICIES = ["h1_lru"]
+POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
+# POLICIES = ["h1_lru"]
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
-BUDGETS = ["0.75", "0.825", "0.95"]
+BUDGETS = ["0.75", "0.775", "0.8", "0.825", "0.85", "0.875", "0.9", "0.925", "0.95", "0.975"]
 # BUDGETS = ["0.75"]
 REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_256_original_order.jsonl")
 # structured_conversation_v2 trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
 REPLAY_BATCH_SIZE = 8
 TIER = "sharegpt_batch_"
-MAX_MODEL_LEN = 2048
+MAX_MODEL_LEN = 1024
 MAX_NUM_BATCHED_TOKENS = 8192
 BATCH_ORDER = "round_robin"
 WORKLOAD = "sharegpt"
@@ -57,7 +77,7 @@ def main() -> None:
     parser.add_argument("--out-dir", default="sharegpt_structured_v2")
     args = parser.parse_args()
 
-    # base_out = OUT_DIR / args.out_dir
+    # 原始写法：base_out = OUT_DIR / args.out_dir
     base_out = OUT_DIR
     step3.run_step3(
         tier=args.tier+str(args.replay_batch_size),

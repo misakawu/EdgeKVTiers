@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract ShareGPT sessions as cumulative-context replay trace."""
+"""将 ShareGPT sessions 提取为累计上下文 replay trace。"""
 
 from __future__ import annotations
 

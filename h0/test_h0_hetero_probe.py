@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the H0 heterogeneous analytic probe."""
+"""H0 异质解析探针测试。"""
 
 from __future__ import annotations
 

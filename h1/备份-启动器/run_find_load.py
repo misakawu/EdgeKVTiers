@@ -19,6 +19,18 @@
 
 每档跑 h1_lru（参考基线，判窗口）+ h1_lpe。复用 run_step3_budget_tiers 的 cell 运行链，
 用 tier=bs<N> 隔离各并发档目录（同 budget+policy 不会互相覆盖）。按档 try/except 隔离失败。
+
+启动命令：
+    python h1/备份-启动器/run_find_load.py
+
+参数说明：
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --budget：固定扫描的 gpu_memory_utilization 档位。
+    --batch-sizes：要扫描的 replay_batch_size 列表。
+    --num-prompts：每个 cell 回放请求数。
+    --policies：每个 batch size 下运行的策略列表。
+    --reference-policy：用于判定有效窗口的参考策略。
+    --force：已有 summary JSON 时仍重跑 cell。
 """
 from __future__ import annotations
 
@@ -49,7 +61,7 @@ MAX_NUM_BATCHED_TOKENS_CAP = 4096       # 上限；实际取 min(cap, max_model_
 
 
 def _mnbt_for_bs(bs: int) -> int:
-    """cell 约束 max_num_batched_tokens <= max_model_len*bs（且 >= bs）。按档取安全值。"""
+    """单个 cell 约束 max_num_batched_tokens <= max_model_len*bs（且 >= bs）。按档取安全值。"""
     return max(bs, min(MAX_NUM_BATCHED_TOKENS_CAP, step3.MAX_MODEL_LEN * bs))
 
 

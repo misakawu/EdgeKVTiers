@@ -189,7 +189,7 @@ def test_runner_strips_vllm_per_batch_tqdm_but_keeps_engine_info() -> None:
 
 
 def test_sitecustomize_rank_tuple_delegates_to_cached_policy_singleton() -> None:
-    # sitecustomize 导入会 monkey-patch 全局 logging 等，用子进程隔离，避免污染 pytest 进程。
+    # sitecustomize 导入会对全局 logging 等打运行时补丁，用子进程隔离，避免污染 pytest 进程。
     # 同时验证：(1) 工厂实例被缓存为单例；(2) 委托后的 rank_tuple 与重构前逐分支等价。
     script = r"""
 import sitecustomize as s

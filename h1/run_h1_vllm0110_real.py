@@ -17,6 +17,42 @@
   和 ``prefill_ms`` 也来自 ``RequestOutput.metrics``。
 - summary 中的命中率来自真实 GPU 前缀缓存块 lookup 统计。请求级行仍保留
   H0 trace 侧的复用代理字段。
+
+启动命令：
+    conda run --no-capture-output -n edgekv-vllm0110 python h1/run_h1_vllm0110_real.py
+
+参数说明：
+    --out：单次运行输出目录。
+    --model：本地模型路径或 vLLM 可加载的模型名。
+    --dtype：模型权重 dtype。
+    --trace-path：ShareGPT 原始 JSON 路径；未使用 replay trace 时生成 ShareGPT workload。
+    --replay-trace：JSONL replay trace 输入路径。
+    --workload：回放类型，sharegpt/rag/mixed。
+    --hotpotqa-path：本地 HotpotQA 数据目录。
+    --download-hotpotqa：缺少 HotpotQA parquet 时允许下载。
+    --hotpotqa-max-examples：加载 HotpotQA 的最大样本数。
+    --rag-requests：mixed/rag workload 中 RAG 请求数。
+    --rag-chunk-words：每个 RAG chunk 的词数。
+    --rag-chunks-per-query：每个 RAG query 拼接的 chunk 数。
+    --rag-query-repeats：每组 RAG query 重复次数。
+    --sharegpt-order：ShareGPT session 选择顺序，file 或 longest。
+    --timeout-s：请求/下载相关操作超时时间。
+    --policies：要运行的缓存策略列表。
+    --budgets：预算档位，可用命名档或数值 gpu_memory_utilization。
+    --max-sessions：最多加载的 ShareGPT session 数。
+    --max-requests：最多回放请求数。
+    --tensor-parallel-size：vLLM tensor parallel size。
+    --max-model-len：vLLM max_model_len。
+    --max-tokens：每个请求生成 token 上限。
+    --replay-batch-size：回放批大小，对应 vLLM max_num_seqs。
+    --batch-order：批内请求排序方式，original/length_bucket/round_robin。
+    --warmup-batches：正式计量前跳过的 warmup batch 数。
+    --max-num-batched-tokens：vLLM scheduler/profile token 上限。
+    --c-re-ms-per-token：COP 重算成本估计，单位 ms/token。
+    --bw-gbps：COP restore 带宽估计，单位 GB/s。
+    --d-deser-ms：COP 反序列化固定开销，单位 ms。
+    --visible-devices：设置 CUDA_VISIBLE_DEVICES。
+    --stats-dir：EdgeKV GPU stats 输出目录；为空时使用 cell 输出目录下的默认位置。
 """
 
 from __future__ import annotations

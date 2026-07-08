@@ -13,6 +13,22 @@
   4. 用共享备份名备份 trace 和运行输出。
 
 最终候选对比可使用 --groups E --policies h1_lru h1_lpe。
+
+启动命令：
+    python h1/run_find_hit.py
+
+参数说明：
+    --groups：要运行的 trace 参数组，默认 A B C D E。
+    --budgets：每个参数组要扫描的 gpu_memory_utilization 档位。
+    --policies：每个 budget 下运行的策略列表。
+    --reference-policy：用于判断 hit 曲线的参考策略。
+    --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
+    --num-prompts：每个 cell 回放请求数。
+    --max-num-batched-tokens：vLLM max_num_batched_tokens。
+    --skip-trace-generation：跳过 trace 生成，只使用已有 trace。
+    --skip-run：只生成/归档 trace，不运行 cell。
+    --force：已有 summary JSON 时仍重跑 cell。
+    --overwrite-backups：允许覆盖已有 trace/结果备份。
 """
 from __future__ import annotations
 

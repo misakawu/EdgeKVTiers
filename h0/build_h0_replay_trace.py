@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the frozen H0 replay JSONL required by pre-experiment 0.5.0."""
+"""构建预实验 0.5.0 所需的冻结版 H0 replay JSONL。"""
 
 from __future__ import annotations
 

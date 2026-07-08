@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""H4: quality dimension benefit validation."""
+"""H4：quality 维度收益验证。"""
 
 from __future__ import annotations
 

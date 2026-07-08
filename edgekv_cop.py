@@ -1,4 +1,4 @@
-"""Object-level Cache Object Profiler for EdgeKVTiers experiments."""
+"""EdgeKVTiers 实验使用的对象级缓存对象画像器。"""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ class ObjectProfile:
         bw_gbps = max(float(self.bw_gbps), 1e-9)
         self.size_mb = mu_kv * n_tokens
         self.c_recomp_ms = c_re * n_tokens
-        # 1 GB/s is approximately 1000 MB/s, or 1 MB/ms.
+        # 1 GB/s 约等于 1000 MB/s，也就是 1 MB/ms。
         self.c_restore_ms = self.size_mb / bw_gbps + float(self.d_deser_ms)
         self.score = (float(self.p_reuse) * self.c_recomp_ms) / max(self.size_mb, 1e-9)
 
@@ -146,7 +146,7 @@ class ObjectProfile:
 
 
 class COPProfiler:
-    """Object-level COP registry keyed by prefix/session/chunk reuse identity."""
+    """按 prefix/session/chunk 复用身份索引的对象级 COP 注册表。"""
 
     def __init__(
         self,

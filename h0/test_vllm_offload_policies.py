@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
-"""Legacy CPU offload policy smoke tests.
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
+"""旧版 CPU offload 策略冒烟测试。
 
-H0/H1 experiments are GPU-only. These tests are disabled by default so the
-normal validation path cannot accidentally import or exercise CPU KV offload
-code. Set ``EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS=1`` to run them explicitly.
+H0/H1 实验只走 GPU 路径。这些测试默认禁用，避免常规验证流程
+意外导入或执行 CPU KV offload 代码。需要显式设置
+``EDGEKV_ENABLE_LEGACY_CPU_OFFLOAD_TESTS=1`` 才会运行。
 """
 
 from __future__ import annotations

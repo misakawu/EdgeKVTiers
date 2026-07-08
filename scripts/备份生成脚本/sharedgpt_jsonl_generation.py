@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Generate a prefix-cache-friendly ShareGPT replay trace.
+"""生成对 prefix-cache 友好的 ShareGPT replay trace。
 
-Layout per request (strictly position-stable so vLLM block-level prefix cache
-can reuse):
+每个请求的布局（严格保持位置稳定，使 vLLM 块级 prefix cache 可复用）：
 
-    HOT  (constant for every request, sets the floor)
-    WARM (exactly one chunk, chosen by Zipf popularity, drives the climb)
-    TAIL (short per-request unique string, caps the ceiling)
+    HOT  （每个请求都固定，决定下限）
+    WARM （精确一个 chunk，按 Zipf 热度选择，推动命中率上升）
+    TAIL （每请求唯一的短字符串，限制上限）
 
-Only "which warm chunk" is random; the warm chunk always sits immediately
-after the identical HOT region, so two requests that pick the same warm chunk
-share the entire `HOT + WARM` token prefix and reuse its blocks. The unique
-tail is the only never-reused region, so it sets the ceiling gap.
+只有“选择哪个 warm chunk”是随机的；warm chunk 始终紧跟在相同 HOT 区域之后，
+因此选择相同 warm chunk 的两个请求会共享完整的 `HOT + WARM` token 前缀并复用其 blocks。
+unique tail 是唯一永不复用的区域，因此决定命中率上限缺口。
 """
 
 from __future__ import annotations
@@ -57,14 +55,14 @@ DEFAULT_MIN_CHUNK_WORDS = 240
 DEFAULT_MAX_SOURCE_SESSIONS = 4096
 DEFAULT_MIN_HUMAN_TURNS = 2
 
-# Single constant task, kept in the SHARED prefix (before the unique tail) so it
-# never breaks prefix-cache matching. Per-request task rotation would inflate the
-# always-miss region and depress the ceiling.
+# 使用单个固定任务，并放在 SHARED 前缀中（位于 unique tail 之前），
+# 避免破坏 prefix-cache 匹配。按请求轮换任务会扩大
+# 永远 miss 的区域，并压低命中率上限。
 CONSTANT_TASK = "Summarize the recurring context and answer using the shared prefix."
 
-# Deterministic filler vocabulary for padding the per-request unique tail to a
-# fixed word budget. Sourced words are still ShareGPT-derived (session id), the
-# filler only pads to a stable token length.
+# 使用确定性 filler 词表，把每个请求的 unique tail 填充到
+# 固定词数预算。来源词仍由 ShareGPT（session id）派生，
+# filler 只用于填充到稳定 token 长度。
 TAIL_FILLER = (
     "context", "detail", "note", "item", "step",
     "case", "point", "topic", "aspect", "factor",
@@ -188,10 +186,9 @@ def format_prefix_context(tier: str, row: dict[str, Any]) -> str:
 
 
 def build_unique_tail(session_id: str, request_index: int, tail_words: int) -> str:
-    """Per-request unique short string (sets the ceiling gap).
+    """每个请求唯一的短字符串（用于设定命中率上限缺口）。
 
-    Uniqueness is guaranteed by embedding the request index; the remaining
-    budget is padded with deterministic filler to a stable token length.
+    通过嵌入请求索引保证唯一性；剩余预算用确定性 filler 填充到稳定 token 长度。
     """
     head = ["query", session_id, f"r{request_index:06d}"]
     words = list(head)
@@ -259,11 +256,11 @@ def build_sharegpt_hierarchical_sessions(
     sessions: list[dict[str, Any]] = []
 
     for request_index in range(request_count):
-        # HOT: entire hot pool, identical order, every request -> constant floor.
+        # HOT：每个请求都按相同顺序使用整个 hot pool，形成稳定下限。
         selected_hot = list(hot_pool)
 
-        # WARM: exactly one chunk chosen by Zipf popularity, placed right after
-        # the identical hot region so its blocks reuse on repeat picks.
+        # WARM：按 Zipf 热度精确选择一个 chunk，并放在
+        # 相同 hot 区域之后，使其 block 在重复选择时复用。
         warm_index = rng.choices(range(warm_pool_size), weights=weights, k=1)[0]
         selected_warm = [warm_pool[warm_index]]
 

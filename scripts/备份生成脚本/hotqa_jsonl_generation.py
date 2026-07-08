@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Generate a prefix-cache-friendly HotpotQA replay trace.
+"""生成对 prefix-cache 友好的 HotpotQA replay trace。
 
-Layout per request (strictly position-stable so vLLM block-level prefix cache
-can reuse):
+每个请求的布局（严格保持位置稳定，使 vLLM 块级 prefix cache 可复用）：
 
-    HOT  (constant for every request, sets the floor)
-    WARM (exactly one chunk, chosen by Zipf popularity, drives the climb)
-    TAIL (short per-request unique string, caps the ceiling)
+    HOT  （每个请求都固定，决定下限）
+    WARM （精确一个 chunk，按 Zipf 热度选择，推动命中率上升）
+    TAIL （每请求唯一的短字符串，限制上限）
 
-Only "which warm chunk" is random; the warm chunk always sits immediately
-after the identical HOT region, so two requests that pick the same warm chunk
-share the entire `HOT + WARM` token prefix and reuse its blocks. The unique
-tail is the only never-reused region, so it sets the ceiling gap.
+只有“选择哪个 warm chunk”是随机的；warm chunk 始终紧跟在相同 HOT 区域之后，
+因此选择相同 warm chunk 的两个请求会共享完整的 `HOT + WARM` token 前缀并复用其 blocks。
+unique tail 是唯一永不复用的区域，因此决定命中率上限缺口。
 """
 
 from __future__ import annotations
@@ -55,14 +53,14 @@ DEFAULT_CHUNK_WORDS = 240
 DEFAULT_MIN_CHUNK_WORDS = 240
 DEFAULT_MAX_EXAMPLES = 200
 
-# Single constant task, kept in the SHARED prefix (before the unique tail) so it
-# never breaks prefix-cache matching. Per-request task/question rotation would
-# inflate the always-miss region and depress the ceiling.
+# 使用单个固定任务，并放在 SHARED 前缀中（位于 unique tail 之前），
+# 避免破坏 prefix-cache 匹配。按请求轮换任务/问题会
+# 扩大永远 miss 的区域，并压低命中率上限。
 CONSTANT_TASK = "Answer the question using the retrieved HotpotQA context above."
 
-# Deterministic filler vocabulary for padding the per-request unique tail to a
-# fixed word budget. The uniqueness still comes from the session id, the filler
-# only pads to a stable token length.
+# 使用确定性 filler 词表，把每个请求的 unique tail 填充到
+# 固定词数预算。唯一性仍来自 session id，filler
+# 只用于填充到稳定 token 长度。
 TAIL_FILLER = (
     "context", "detail", "note", "item", "step",
     "case", "point", "topic", "aspect", "factor",
@@ -127,27 +125,26 @@ def load_unique_hotqa_chunks(
     min_chunk_words: int,
     timeout_s: float,
 ) -> list[dict[str, Any]]:
-    """Load HotpotQA text and re-chunk it into UNIFORM, large prefix chunks.
+    """加载 HotpotQA 文本，并重新切分为均匀的大 prefix chunks。
 
-    HotpotQA context paragraphs are intrinsically small (~50-150 words), so one
-    paragraph per chunk yields tiny chunks where the unique tail + warm
-    first-touch misses dominate and the prefix-cache hit ceiling is capped at
-    ~0.76. To lift the ceiling we mirror ``sharedgpt_jsonl_generation.py``: stream
-    all paragraph text in deterministic load order and re-slice into fixed
-    ``chunk_words_count``-word chunks, dropping any trailing remainder shorter
-    than ``min_chunk_words``. The content is still entirely HotpotQA-derived.
+    HotpotQA context 段落天然较短（约 50-150 词），如果每段一个 chunk，
+    会形成很小的 chunks，使 unique tail + warm 首次触碰 miss 占主导，
+    prefix-cache 命中率上限被压到约 0.76。为抬高上限，这里对齐
+    ``sharedgpt_jsonl_generation.py``：按确定性加载顺序流式拼接所有段落文本，
+    再重新切成固定 ``chunk_words_count`` 词的 chunks，并丢弃短于
+    ``min_chunk_words`` 的尾部余量。内容仍完全来自 HotpotQA。
     """
     groups = load_hotpotqa_chunk_groups(
         hotpotqa_path,
         download_hotpotqa,
         max_examples,
-        # Pull whole paragraphs (large window) so the loader does not pre-split;
-        # we control the final chunk size ourselves below.
+        # 拉取完整段落（大窗口），避免 loader 预先切分；
+        # 最终 chunk 大小由下方逻辑自行控制。
         max(chunk_words_count, min_chunk_words) * 4,
         1,
         timeout_s,
     )
-    # Concatenate every unique paragraph's words in deterministic load order.
+    # 按确定性加载顺序拼接每个唯一段落的词。
     words: list[str] = []
     seen_ids: set[str] = set()
     for group in groups:
@@ -158,7 +155,7 @@ def load_unique_hotqa_chunks(
         seen_ids.add(paragraph_id)
         words.extend(str(paragraph.get("text", "")).split())
 
-    # Re-slice into uniform chunks; drop the trailing under-min remainder.
+    # 重新切分为均匀 chunks；丢弃末尾不足最小长度的余量。
     chunks: list[dict[str, Any]] = []
     for start in range(0, len(words), max(chunk_words_count, 1)):
         piece = words[start:start + chunk_words_count]
@@ -181,10 +178,9 @@ def format_prefix_chunk(tier: str, chunk: dict[str, Any]) -> str:
 
 
 def build_unique_tail(session_id: str, request_index: int, tail_words: int) -> str:
-    """Per-request unique short string (sets the ceiling gap).
+    """每个请求唯一的短字符串（用于设定命中率上限缺口）。
 
-    Uniqueness is guaranteed by embedding the request index; the remaining
-    budget is padded with deterministic filler to a stable token length.
+    通过嵌入请求索引保证唯一性；剩余预算用确定性 filler 填充到稳定 token 长度。
     """
     head = ["query", session_id, f"r{request_index:06d}"]
     words = list(head)
@@ -256,11 +252,11 @@ def build_hotqa_hierarchical_sessions(
     sessions: list[dict[str, Any]] = []
 
     for request_index in range(request_count):
-        # HOT: entire hot pool, identical order, every request -> constant floor.
+        # HOT：每个请求都按相同顺序使用整个 hot pool，形成稳定下限。
         selected_global = list(hot_pool)
 
-        # WARM: exactly one chunk chosen by Zipf popularity, placed right after
-        # the identical hot region so its blocks reuse on repeat picks.
+        # WARM：按 Zipf 热度精确选择一个 chunk，并放在
+        # 相同 hot 区域之后，使其 block 在重复选择时复用。
         warm_index = rng.choices(range(warm_pool_size), weights=weights, k=1)[0]
         selected_warm = [warm_pool[warm_index]]
 
@@ -416,8 +412,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-chunk-words", type=positive_int, default=DEFAULT_MIN_CHUNK_WORDS)
     parser.add_argument("--hotpotqa-max-examples", type=positive_int, default=DEFAULT_MAX_EXAMPLES)
     parser.add_argument("--timeout-s", type=float, default=120.0)
-    # Deprecated knobs from the old hierarchical layout: accepted but ignored so
-    # existing command lines keep working.
+    # 旧层次化布局遗留参数：接受但忽略，
+    # 以保证现有命令行仍可运行。
     parser.add_argument("--cold-pool-size", type=positive_int, default=None,
                         help="Deprecated; ignored (cold tier removed).")
     parser.add_argument("--warm-request-ratio", type=bounded_ratio, default=None,

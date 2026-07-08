@@ -1,2 +1,2 @@
-"""Runtime configuration helpers for H1."""
+"""H1 运行时配置辅助模块。"""
 

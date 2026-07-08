@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# TEST DATA CONTRACT: tests in this repository must use JSONL replay trace files as workload data. Do not use vLLM built-in datasets/test data.
-"""Smoke tests for H0 RAG chunk reuse trace construction."""
+# 测试数据契约：本仓库测试必须使用 JSONL replay trace 文件作为 workload 数据，不使用 vLLM 内置数据集/测试数据。
+"""H0 RAG chunk 复用 trace 构造的冒烟测试。"""
 
 from __future__ import annotations
 
