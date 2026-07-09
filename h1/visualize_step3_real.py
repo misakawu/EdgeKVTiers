@@ -8,7 +8,7 @@ GPU 显存预算下绘制 4 策略对比（vLLM / LRU / LFU / LPE）：
     python h1/visualize_step3_real.py
     python h1/visualize_step3_real.py --summary <path> --out <png_stem>
 
-默认在 summary CSV 旁保存 <out>.png 和 <out>.pdf。仅依赖 matplotlib + numpy
+默认在 summary CSV 旁保存 <out>.png。仅依赖 matplotlib + numpy
 （stdlib csv 负责读取；不依赖 pandas）。改写自 visualize_lpe_scenarios.py。
 """
 from __future__ import annotations
@@ -96,12 +96,9 @@ def main() -> None:
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     png = out_stem.with_suffix(".png")
-    pdf = out_stem.with_suffix(".pdf")
     out_stem.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(png, dpi=150)
-    fig.savefig(pdf)
     print(f"wrote {png}")
-    print(f"wrote {pdf}")
 
 
 if __name__ == "__main__":

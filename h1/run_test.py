@@ -5,8 +5,7 @@
 运行一个 Step3 tier，其预算轴为三个数值型 gpu_memory_utilization：
 0.75 / 0.825 / 0.95。每档预算默认运行四种缓存策略：LPE、LRU、LFU 和 vLLM
 默认策略。低预算会更激进地驱逐已预热的 hot prefix；高预算保留更多内容，从而
-提高前缀缓存命中率。max_model_len 保持为 1024，使低预算能在本地 2x11GiB
-GPU 上初始化。
+提高前缀缓存命中率。max_model_len 保持为 2048，对齐三档 batch 测试口径。
 
 默认目标是 ShareGPT trace；可传入 --replay-trace / --tier / --num-prompts 重定向
 （例如退回到冻结的 HotQA ws2 trace）。
@@ -43,14 +42,15 @@ POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
 # POLICIES = ["h1_lru"]
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
-BUDGETS = ["0.75", "0.775", "0.8", "0.825", "0.85", "0.875", "0.9", "0.925", "0.95", "0.975"]
+# BUDGETS = ["0.75", "0.8", "0.85", "0.9"]
+BUDGETS = ["0.9","0.85","0.8","0.75"]
 # BUDGETS = ["0.75"]
 REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_256_original_order.jsonl")
 # structured_conversation_v2 trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
 REPLAY_BATCH_SIZE = 8
 TIER = "sharegpt_batch_"
-MAX_MODEL_LEN = 1024
+MAX_MODEL_LEN = 2048
 MAX_NUM_BATCHED_TOKENS = 8192
 BATCH_ORDER = "round_robin"
 WORKLOAD = "sharegpt"

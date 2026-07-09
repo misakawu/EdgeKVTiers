@@ -95,10 +95,8 @@ def plot_dataset(name: str, summary: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = out_dir / f"step3_{name}"
     fig.savefig(stem.with_suffix(".png"), dpi=150)
-    fig.savefig(stem.with_suffix(".pdf"))
     plt.close(fig)
     print(f"wrote {stem.with_suffix('.png')}")
-    print(f"wrote {stem.with_suffix('.pdf')}")
 
 
 def main() -> None:

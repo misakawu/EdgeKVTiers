@@ -100,11 +100,8 @@ def main() -> None:
     stem = out.with_suffix("") if out.suffix else out
     stem.parent.mkdir(parents=True, exist_ok=True)
     png = stem.with_suffix(".png")
-    pdf = stem.with_suffix(".pdf")
     fig.savefig(png, dpi=160)
-    fig.savefig(pdf)
     print(f"wrote {png}")
-    print(f"wrote {pdf}")
 
 
 if __name__ == "__main__":

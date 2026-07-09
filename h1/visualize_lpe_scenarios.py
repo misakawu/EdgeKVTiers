@@ -12,7 +12,7 @@
     python h1/visualize_lpe_scenarios.py
     python h1/visualize_lpe_scenarios.py --summary <path> --out <png>
 
-默认在 summary CSV 旁保存 <out>.png 和 <out>.pdf。
+默认在 summary CSV 旁保存 <out>.png。
 """
 from __future__ import annotations
 
@@ -100,12 +100,9 @@ def main() -> None:
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     png = out_stem.with_suffix(".png")
-    pdf = out_stem.with_suffix(".pdf")
     out_stem.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(png, dpi=150)
-    fig.savefig(pdf)
     print(f"wrote {png}")
-    print(f"wrote {pdf}")
 
 
 if __name__ == "__main__":

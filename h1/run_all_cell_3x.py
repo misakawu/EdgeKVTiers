@@ -77,6 +77,92 @@ def mean_row(values: dict[str, list[float]]) -> dict[str, str]:
     return row
 
 
+def write_rep_summary(
+    *,
+    tier_dir: Path,
+    budgets: list[str],
+    policies: list[str],
+    summary_csv: Path | None = None,
+    request_rate: float = 0.0,
+) -> None:
+    """写出单个 rep 的 step3_summary.csv，字段对齐 summarize_step3_budget_tiers.py。"""
+    rows: list[dict[str, str]] = []
+    by_budget: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
+
+    for budget in budgets:
+        for policy in policies:
+            summary_json = tier_dir / budget / policy / f"{budget}_{policy}_summary.json"
+            if not summary_json.exists():
+                R.log(f"[warn] missing rep summary: {summary_json}")
+                continue
+            source = row_from_real_summary(summary_json)
+            if not source:
+                R.log(f"[warn] unreadable rep summary: {summary_json}")
+                continue
+            by_budget[budget][policy] = source
+            throughput = as_float(source, "request_throughput")
+            row = {
+                "budget": budget,
+                "policy": policy,
+                "saturated": str(bool(request_rate and throughput < 0.8 * request_rate)).lower(),
+            }
+            for metric in METRICS:
+                row[metric] = source.get(metric, "")
+            rows.append(row)
+
+    for row in rows:
+        row.update(
+            {
+                "p95_ttft_gain_pct_vs_lru": "",
+                "mean_ttft_gain_pct_vs_lru": "",
+                "hit_rate_delta_vs_lru": "",
+                "eviction_delta_vs_lru": "",
+            }
+        )
+        if row["policy"] != "h1_lpe":
+            continue
+        lru = by_budget.get(row["budget"], {}).get("h1_lru")
+        if not lru:
+            continue
+        lru_p95 = as_float(lru, "p95_ttft_ms")
+        lpe_p95 = as_float(row, "p95_ttft_ms")
+        lru_mean = as_float(lru, "mean_ttft_ms")
+        lpe_mean = as_float(row, "mean_ttft_ms")
+        row["p95_ttft_gain_pct_vs_lru"] = (
+            f"{((lru_p95 - lpe_p95) / lru_p95 * 100.0):.6f}" if lru_p95 else ""
+        )
+        row["mean_ttft_gain_pct_vs_lru"] = (
+            f"{((lru_mean - lpe_mean) / lru_mean * 100.0):.6f}" if lru_mean else ""
+        )
+        row["hit_rate_delta_vs_lru"] = (
+            f'{(as_float(row, "hit_rate") - as_float(lru, "hit_rate")):.6f}'
+        )
+        row["eviction_delta_vs_lru"] = (
+            f'{(as_float(row, "gpu_prefix_cache_evictions") - as_float(lru, "gpu_prefix_cache_evictions")):.6f}'
+        )
+
+    fields = [
+        "budget",
+        "policy",
+        *METRICS,
+        "p95_ttft_gain_pct_vs_lru",
+        "mean_ttft_gain_pct_vs_lru",
+        "hit_rate_delta_vs_lru",
+        "eviction_delta_vs_lru",
+        "saturated",
+    ]
+    summary_csv = summary_csv or tier_dir / "step3_summary.csv"
+    if R.DRY_RUN:
+        R.log(f"[dry-run] rep summary: {summary_csv} ({len(rows)} rows)")
+        return
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    with summary_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    R.log(f"[done] rep summary: {summary_csv} ({len(rows)} rows)")
+
+
 def write_average_summary(
     *,
     base_out: Path,
@@ -213,7 +299,8 @@ def main() -> None:
     )
     for rep in range(1, args.reps + 1):
         R.log(f"[protocol] rep={rep}/{args.reps}")
-        remove_failed_summaries(args.base_out / f"rep{rep}" / tier, budgets, policies)
+        tier_dir = args.base_out / f"rep{rep}" / tier
+        remove_failed_summaries(tier_dir, budgets, policies)
         step3.run_step3(
             tier=tier,
             base_out=args.base_out / f"rep{rep}",
@@ -233,6 +320,7 @@ def main() -> None:
             rag_requests=args.rag_requests,
             hotpotqa_max_examples=args.hotpotqa_max_examples,
         )
+        write_rep_summary(tier_dir=tier_dir, budgets=budgets, policies=policies)
 
     write_average_summary(
         base_out=args.base_out,
