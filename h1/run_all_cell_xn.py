@@ -10,7 +10,7 @@
 最终 CSV 会对每个 budget/policy cell 的已完成重复取平均值。
 
 启动命令：
-    python h1/run_all_cell_3x.py
+    python h1/run_all_cell_xn.py
 
 参数说明：
     --visible-devices：传给每个 cell 的 CUDA_VISIBLE_DEVICES。
@@ -29,6 +29,10 @@
     --hotpotqa-max-examples：加载 HotpotQA 的最大样本数。
     --base-out：三次重复的根输出目录。
     --summary：跨重复取平均后的 CSV 输出路径。
+    --cooldown-s：每个 budget 子实验结束后的固定冷却等待秒数，默认 300。
+    --cooldown-temp-c：可选 GPU 温度阈值；大于 0 时固定等待后继续等到温度不高于该值。
+    --cooldown-check-interval-s：温度恢复检查间隔。
+    --cooldown-max-s：温度阈值等待的最长秒数；0 表示不限。
     --force：已有 summary JSON 时仍重跑 cell。
     --keep-cells：兼容参数；本脚本始终保留各次重复输出。
 """
@@ -37,7 +41,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import statistics
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -49,6 +55,9 @@ from summarize_step3_budget_tiers import METRICS, as_float, row_from_real_summar
 
 BASE_OUT = Path("h1/out/run_all_cell_3x")
 REPS = 3
+DEFAULT_COOLDOWN_S = 120.0
+DEFAULT_COOLDOWN_CHECK_INTERVAL_S = 30.0
+DEFAULT_COOLDOWN_MAX_S = 0.0
 
 
 def remove_failed_summaries(tier_dir: Path, budgets: list[str], policies: list[str]) -> None:
@@ -75,6 +84,89 @@ def mean_row(values: dict[str, list[float]]) -> dict[str, str]:
         vals = values.get(metric, [])
         row[metric] = f"{statistics.fmean(vals):.6f}" if vals else ""
     return row
+
+
+def budget_needs_run(tier_dir: Path, budget: str, policies: list[str], force: bool) -> bool:
+    if force:
+        return True
+    for policy in policies:
+        summary_json = tier_dir / budget / policy / f"{budget}_{policy}_summary.json"
+        if not summary_json.exists():
+            return True
+    return False
+
+
+def gpu_temperatures_c(visible_devices: str) -> list[int]:
+    ids = [item.strip() for item in visible_devices.split(",") if item.strip()]
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    if ids:
+        cmd.extend(["-i", ",".join(ids)])
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        R.log(f"[cooldown] cannot query GPU temperature: {proc.stderr.strip()}")
+        return []
+    temps: list[int] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            temps.append(int(float(line)))
+        except ValueError:
+            continue
+    return temps
+
+
+def cooldown_after_budget(
+    *,
+    label: str,
+    visible_devices: str,
+    cooldown_s: float,
+    cooldown_temp_c: int,
+    check_interval_s: float,
+    max_temp_wait_s: float,
+) -> None:
+    if cooldown_s <= 0 and cooldown_temp_c <= 0:
+        return
+    temps = gpu_temperatures_c(visible_devices)
+    temp_msg = f" temps={temps}C" if temps else ""
+    if cooldown_s > 0:
+        R.log(f"[cooldown] {label}: sleep {cooldown_s:.1f}s{temp_msg}")
+        if not R.DRY_RUN:
+            time.sleep(cooldown_s)
+    if cooldown_temp_c <= 0:
+        return
+
+    interval = max(check_interval_s, 1.0)
+    started = time.monotonic()
+    while True:
+        temps = gpu_temperatures_c(visible_devices)
+        if temps and max(temps) <= cooldown_temp_c:
+            R.log(f"[cooldown] {label}: recovered temps={temps}C threshold={cooldown_temp_c}C")
+            return
+        elapsed = time.monotonic() - started
+        if max_temp_wait_s > 0 and elapsed >= max_temp_wait_s:
+            temp_msg = f" temps={temps}C" if temps else ""
+            R.log(
+                f"[cooldown] {label}: max wait reached "
+                f"({max_temp_wait_s:.1f}s){temp_msg} threshold={cooldown_temp_c}C"
+            )
+            return
+        temp_msg = f" temps={temps}C" if temps else ""
+        R.log(f"[cooldown] {label}: waiting for <= {cooldown_temp_c}C{temp_msg}")
+        if R.DRY_RUN:
+            return
+        time.sleep(interval)
 
 
 def write_rep_summary(
@@ -285,9 +377,41 @@ def main() -> None:
     parser.add_argument("--hotpotqa-max-examples", type=int, default=run_test.HOTPOTQA_MAX_EXAMPLES)
     parser.add_argument("--base-out", type=Path, default=BASE_OUT)
     parser.add_argument("--summary", type=Path, default=BASE_OUT / "run_all_cell_3x_average.csv")
+    parser.add_argument(
+        "--cooldown-s",
+        type=float,
+        default=DEFAULT_COOLDOWN_S,
+        help="每个 budget 子实验结束后的固定冷却等待秒数；设为 0 可关闭。",
+    )
+    parser.add_argument(
+        "--cooldown-temp-c",
+        type=int,
+        default=0,
+        help="可选 GPU 温度阈值；大于 0 时固定等待后继续等到所有可见 GPU 不高于该温度。",
+    )
+    parser.add_argument(
+        "--cooldown-check-interval-s",
+        type=float,
+        default=DEFAULT_COOLDOWN_CHECK_INTERVAL_S,
+        help="等待温度恢复时的检查间隔秒数。",
+    )
+    parser.add_argument(
+        "--cooldown-max-s",
+        type=float,
+        default=DEFAULT_COOLDOWN_MAX_S,
+        help="温度阈值等待的最长秒数；0 表示不限。",
+    )
     parser.add_argument("--force", action="store_true", help="即使 summary JSON 已存在也重新运行 cell")
     parser.add_argument("--keep-cells", action="store_true", help="兼容参数；本脚本始终保留各次重复输出")
     args = parser.parse_args()
+    if args.cooldown_s < 0:
+        parser.error("--cooldown-s must be >= 0")
+    if args.cooldown_check_interval_s <= 0:
+        parser.error("--cooldown-check-interval-s must be > 0")
+    if args.cooldown_max_s < 0:
+        parser.error("--cooldown-max-s must be >= 0")
+    if args.cooldown_temp_c < 0:
+        parser.error("--cooldown-temp-c must be >= 0")
 
     budgets = args.budgets.split()
     policies = args.policies.split()
@@ -301,25 +425,37 @@ def main() -> None:
         R.log(f"[protocol] rep={rep}/{args.reps}")
         tier_dir = args.base_out / f"rep{rep}" / tier
         remove_failed_summaries(tier_dir, budgets, policies)
-        step3.run_step3(
-            tier=tier,
-            base_out=args.base_out / f"rep{rep}",
-            budgets=budgets,
-            policies=policies,
-            num_prompts=args.num_prompts,
-            visible_devices=args.visible_devices,
-            force=args.force,
-            keep_cells=True,
-            no_finalize=True,
-            replay_trace=args.replay_trace,
-            replay_batch_size=args.replay_batch_size,
-            batch_order=args.batch_order,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            max_model_len=args.max_model_len,
-            workload=args.workload,
-            rag_requests=args.rag_requests,
-            hotpotqa_max_examples=args.hotpotqa_max_examples,
-        )
+        for budget_index, budget in enumerate(budgets):
+            should_run = budget_needs_run(tier_dir, budget, policies, args.force)
+            step3.run_step3(
+                tier=tier,
+                base_out=args.base_out / f"rep{rep}",
+                budgets=[budget],
+                policies=policies,
+                num_prompts=args.num_prompts,
+                visible_devices=args.visible_devices,
+                force=args.force,
+                keep_cells=True,
+                no_finalize=True,
+                replay_trace=args.replay_trace,
+                replay_batch_size=args.replay_batch_size,
+                batch_order=args.batch_order,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                max_model_len=args.max_model_len,
+                workload=args.workload,
+                rag_requests=args.rag_requests,
+                hotpotqa_max_examples=args.hotpotqa_max_examples,
+            )
+            is_final_budget = rep == args.reps and budget_index == len(budgets) - 1
+            if should_run and not is_final_budget:
+                cooldown_after_budget(
+                    label=f"rep={rep}/{args.reps} budget={budget}",
+                    visible_devices=args.visible_devices,
+                    cooldown_s=args.cooldown_s,
+                    cooldown_temp_c=args.cooldown_temp_c,
+                    check_interval_s=args.cooldown_check_interval_s,
+                    max_temp_wait_s=args.cooldown_max_s,
+                )
         write_rep_summary(tier_dir=tier_dir, budgets=budgets, policies=policies)
 
     write_average_summary(

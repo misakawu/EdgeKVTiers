@@ -88,10 +88,10 @@ def main() -> None:
             ax.set_ylabel(ylabel)
             ax.grid(axis="y", linestyle=":", alpha=0.55)
             ax.margins(y=0.18)
-            if col_idx == 0:
-                ax.text(-0.25, 1.04, dataset, transform=ax.transAxes, fontsize=11, fontweight="bold", va="bottom")
-            if row_idx == 0 and col_idx == n_cols - 1:
-                ax.legend(loc="upper left", fontsize=8)
+            # if col_idx == 0:
+            ax.text(-0.25, 1.04, dataset, transform=ax.transAxes, fontsize=11, fontweight="bold", va="bottom")
+            # if row_idx == 0 and col_idx == n_cols - 1:
+            ax.legend(loc="upper left", fontsize=8)
 
     fig.suptitle("H1 replay trace policy comparison (3 budgets x 4 policies)", fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
