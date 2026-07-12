@@ -174,7 +174,7 @@ def run_step3(*, tier=TIER, base_out=BASE_OUT, budgets=BUDGETS, policies=POLICIE
 
     summary_csv = tier_dir / "step3_summary.csv"
     R.log(f"[summary] writing {summary_csv}")
-    R.summarize("summarize_step3_budget_tiers.py",
+    R.summarize("visual_summary/summarize_step3_budget_tiers.py",
                 ["--out", str(tier_dir), "--summary", str(summary_csv),
                  "--request-rate", str(request_rate)])
     R.cleanup_dirs(tier_dir, keep=keep_cells, extra=[log_dir])

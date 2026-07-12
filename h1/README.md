@@ -291,12 +291,12 @@ python h1/validate_d4_saturation.py h1/out/.../summary.json h1/out/.../requests.
 | | `EDGEKV_H1_PROFILE_POLICY_TIME` | 是否记录策略决策耗时 | `1` |
 | **LPE 核心** | `EDGEKV_C_RE_MS_PER_TOKEN` | 每 token 重计算耗时（ms） | `0.12` |
 | | `EDGEKV_MU_KV_MB_PER_TOKEN` | 每 token KV 缓存大小（MB） | 模型自动推导 |
-| **LPE 权重** | `H1_LPE_W_FREQ` | 频率权重 | `0.55` |
-| | `H1_LPE_W_RECENCY` | 近因权重 | `0.30` |
-| | `H1_LPE_W_TYPE` | 类型先验权重 | `0.15` |
-| | `H1_LPE_W_PRIOR` | 外部先验权重 | `0.70` |
-| **LPE 调度** | `H1_LPE_REORDER_MODE` | 重排模式 `window`/`full`/`off` | `window` |
-| | `H1_LPE_REORDER_WINDOW` | 重排窗口大小 | `128` |
+| **LPE 权重** | `H1_LPE_W_LRUK` | LRU-K(K=2) backward distance 权重 | `0.65` |
+| | `H1_LPE_W_FREQ_DECAY` | 指数衰减频次权重 | `0.35` |
+| | `H1_LPE_W_PRIOR_COLD` | 冷启动外部先验权重 | `0.70` |
+| | `H1_LPE_PRIOR_DECAY_ACCESSES` | 先验随访问证据衰减的访问尺度 | `2.0` |
+| **LPE 调度** | `H1_LPE_LRUK_DISTANCE_SCALE` | LRU-K 距离归一化尺度 | `8.0` |
+| | `H1_LPE_FREQ_DECAY` | 频次指数衰减系数 | `0.85` |
 | | `H1_LPE_LIGHT_PATH` | 低压力时跳过重排（优化性能） | `1` |
 | | `H1_LPE_PRESSURE_FREE_RATIO` | 触发重排的空闲块比例阈值 | `0.15` |
 | | `H1_LPE_SCORE_UPDATE_INTERVAL` | 分数更新间隔（访问次数） | `8` |

@@ -38,8 +38,8 @@ from pathlib import Path
 import run_step3_budget_tiers as step3
 
 OUT_DIR = Path("h1/out")
-POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
-# POLICIES = ["h1_lru"]
+# POLICIES = ["h1_lpe", "h1_lru", "h1_lfu", "vllm_default"]
+POLICIES = ["h1_lru", "h1_lpe"]
 # 数值型预算（gpu_memory_utilization）会在 resolve_budget 中通过 float() 解析；
 # 有意不使用 tight/mid/loose 这些命名档。
 # BUDGETS = ["0.75", "0.8", "0.85", "0.9"]
@@ -49,7 +49,7 @@ REPLAY_TRACE = Path("data/edgekv_traces/source_ablation/sharegpt_256_original_or
 # structured_conversation_v2 trace 默认包含 1536 个请求（匹配 config.json trace_size）。
 NUM_PROMPTS = 1536
 REPLAY_BATCH_SIZE = 8
-TIER = "sharegpt_batch_"
+TIER = "LPE_FIX"
 MAX_MODEL_LEN = 2048
 MAX_NUM_BATCHED_TOKENS = 8192
 BATCH_ORDER = "round_robin"
@@ -80,7 +80,7 @@ def main() -> None:
     # 原始写法：base_out = OUT_DIR / args.out_dir
     base_out = OUT_DIR
     step3.run_step3(
-        tier=args.tier+str(args.replay_batch_size),
+        tier=args.tier,
         base_out=base_out,
         budgets=args.budgets.split(),
         policies=args.policies.split(),

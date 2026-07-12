@@ -730,13 +730,6 @@ def run_cell(
     os.environ.setdefault('EDGEKV_H1_PROFILE_POLICY_TIME', '1')
     if policy == 'h1_lpe':
         os.environ.setdefault('EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES', '1')
-        os.environ.setdefault('EDGEKV_H1_RUNTIME_MONITOR', '1')
-        monitor_path = (
-            out_dir / 'runtime_monitor.jsonl'
-            if len(args.budgets) == 1 and len(args.policies) == 1
-            else out_dir / f'{budget_name}_{policy}_runtime_monitor.jsonl'
-        )
-        os.environ.setdefault('EDGEKV_H1_RUNTIME_MONITOR_PATH', str(monitor_path))
     os.environ['EDGEKV_MU_KV_MB_PER_TOKEN'] = str(kv_mib_per_token)
     os.environ['EDGEKV_C_RE_MS_PER_TOKEN'] = str(args.c_re_ms_per_token)
     cop = COPProfiler(

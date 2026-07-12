@@ -166,8 +166,6 @@ def test_runner_lpe_env_overrides_are_shared_and_policy_specific(tmp_path: Path)
 
     assert lpe_env == {
         "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
-        "EDGEKV_H1_RUNTIME_MONITOR": "1",
-        "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(tmp_path / "cell" / "runtime_monitor.jsonl"),
     }
     assert lru_env == {}
 
@@ -267,3 +265,148 @@ def test_default_lpe_scorer_matches_score_formula(monkeypatch) -> None:
     p4 = {"n_tokens": 20, "bytes_per_token": 1024.0}
     scorer.recompute_score(p4)
     assert p4["score"] == 0.5 * 0.0 / max(20 * 1024.0 / 1024.0 / 1024.0, 1e-9)
+
+
+def test_sitecustomize_lpe_reuse_estimator_uses_lruk_decay_and_cold_prior() -> None:
+    script = r"""
+import math
+import os
+import sitecustomize as s
+
+os.environ["H1_LPE_SCORE_UPDATE_INTERVAL"] = "1"
+os.environ["H1_LPE_LRUK_DISTANCE_SCALE"] = "4"
+os.environ["H1_LPE_FREQ_DECAY"] = "0.5"
+os.environ["H1_LPE_W_PRIOR_COLD"] = "0.9"
+os.environ["H1_LPE_PRIOR_DECAY_ACCESSES"] = "1"
+s.reset_edgekv_gpu_cache_stats()
+
+short = s._edgekv_profile_from_values("short", "cold", 16, {})
+s._edgekv_note_profile_access(short, hit=True)
+s._edgekv_note_profile_access(short, hit=True)
+
+long = s._edgekv_profile_from_values("long", "hot", 16, {})
+s._edgekv_note_profile_access(long, hit=True)
+for idx in range(12):
+    filler = s._edgekv_profile_from_values(f"filler-{idx}", "hot", 16, {})
+    s._edgekv_note_profile_access(filler, hit=True)
+s._edgekv_note_profile_access(long, hit=True)
+assert short["lruk_backward_distance"] < long["lruk_backward_distance"]
+assert short["p_reuse"] > long["p_reuse"], (short, long)
+
+hot = s._edgekv_profile_from_values("early-hot", "unknown", 16, {})
+for _ in range(5):
+    s._edgekv_note_profile_access(hot, hit=True)
+before = hot["p_reuse"]
+for idx in range(20):
+    filler = s._edgekv_profile_from_values(f"decay-filler-{idx}", "unknown", 16, {})
+    s._edgekv_note_profile_access(filler, hit=True)
+s._edgekv_refresh_profile_reuse(hot)
+assert hot["p_reuse"] < before, (before, hot["p_reuse"], hot)
+
+prior = s._edgekv_profile_from_values("prior", "unknown", 16, {"p_reuse_prior": 0.95})
+assert math.isclose(prior["p_reuse"], 0.95)
+s._edgekv_note_profile_access(prior, hit=True)
+assert prior["p_reuse_prior_weight"] < 0.9
+assert prior["p_reuse"] < 0.95
+
+base = {
+    "access_count": 2,
+    "hit_count": 2,
+    "access_history": [100, 101],
+    "freq_decay": 1.0,
+    "freq_decay_last_seq": s._EDGEKV_LPE_ACCESS_SEQ,
+    "n_tokens": 16,
+    "c_recomp_ms": 1.0,
+}
+hot_type = dict(base, object_id="type-hot", object_type="hot")
+cold_type = dict(base, object_id="type-cold", object_type="cold")
+s._edgekv_refresh_profile_reuse(hot_type)
+s._edgekv_refresh_profile_reuse(cold_type)
+assert hot_type["p_reuse"] == cold_type["p_reuse"], (hot_type, cold_type)
+print("OK")
+"""
+    h1_dir = Path(__file__).resolve().parent
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(h1_dir),
+        env={**os.environ, "EDGEKV_H1_GPU_POLICY": "h1_lpe"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_lpe_promote_head_moves_lowest_score_blocks_to_free_queue_head() -> None:
+    script = r"""
+import sitecustomize as s
+
+class Block:
+    def __init__(self, block_id):
+        self.block_id = block_id
+        self.is_null = False
+        self.prev_free_block = None
+        self.next_free_block = None
+
+class Queue:
+    def __init__(self, blocks):
+        self.fake_free_list_head = Block(-1)
+        self.fake_free_list_tail = Block(-2)
+        self.num_free_blocks = len(blocks)
+        prev = self.fake_free_list_head
+        for block in blocks:
+            prev.next_free_block = block
+            block.prev_free_block = prev
+            prev = block
+        prev.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = prev
+
+    def remove(self, block):
+        block.prev_free_block.next_free_block = block.next_free_block
+        block.next_free_block.prev_free_block = block.prev_free_block
+        block.prev_free_block = None
+        block.next_free_block = None
+        self.num_free_blocks -= 1
+
+class Pool:
+    enable_caching = True
+
+def order(queue):
+    out = []
+    node = queue.fake_free_list_head.next_free_block
+    while node is not queue.fake_free_list_tail:
+        out.append(node.block_id)
+        node = node.next_free_block
+    return out
+
+s.reset_edgekv_gpu_cache_stats()
+pool = Pool()
+blocks = [Block(i) for i in [1, 2, 3, 4]]
+pool.free_block_queue = Queue(blocks)
+s._edgekv_init_pool_state(pool)
+scores = {1: 10.0, 2: 0.2, 3: 5.0, 4: 0.1}
+for block in blocks:
+    object_id = f"obj-{block.block_id}"
+    s._EDGEKV_GPU_LPE_PROFILES[object_id] = {
+        "object_id": object_id,
+        "score": scores[block.block_id],
+        "p_reuse": 0.5,
+        "admission_rejected": False,
+    }
+    s._EDGEKV_GPU_BLOCK_ID_OBJECT_HINTS[block.block_id] = object_id
+    s._edgekv_heap_touch_block(pool, block)
+
+s._edgekv_promote_lowest_score_victims(pool, 2)
+assert order(pool.free_block_queue)[:2] == [4, 2], order(pool.free_block_queue)
+print("OK")
+"""
+    h1_dir = Path(__file__).resolve().parent
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(h1_dir),
+        env={**os.environ, "EDGEKV_H1_GPU_POLICY": "h1_lpe"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout

@@ -52,11 +52,8 @@ def lpe_runtime_env_overrides(policy: str, out_dir: Path) -> dict[str, str]:
     """返回单个 cell 中仅 LPE 需要的运行时诊断环境变量覆盖。"""
     if str(policy) != "h1_lpe":
         return {}
-    out_dir = Path(out_dir)
     return {
         "EDGEKV_H1_STATS_INCLUDE_OBJECT_PROFILES": "1",
-        "EDGEKV_H1_RUNTIME_MONITOR": "1",
-        "EDGEKV_H1_RUNTIME_MONITOR_PATH": str(out_dir / "runtime_monitor.jsonl"),
     }
 
 

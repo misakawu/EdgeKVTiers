@@ -226,6 +226,7 @@ _EDGEKV_LPE_MONITOR_SEQ = 0
 _EDGEKV_LPE_ADMISSION_SEQ = 0
 _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
 _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
+_EDGEKV_LPE_ACCESS_SEQ = 0
 _EDGEKV_ENV_FLOAT_CACHE: dict[tuple[str, float], tuple[str | None, float]] = {}
 _EDGEKV_ENV_INT_CACHE: dict[tuple[str, int], tuple[str | None, int]] = {}
 _EDGEKV_ENV_BOOL_CACHE: dict[tuple[str, bool], tuple[str | None, bool]] = {}
@@ -285,6 +286,12 @@ def _edgekv_lpe_monitor_path() -> Path | None:
     return (stats_dir / 'edgekv_lpe_runtime_monitor.jsonl') if stats_dir is not None else None
 
 
+# monitor 总闸:进程启动求值一次。默认关 → 正式跑零 monitor 开销;
+# 只认 EDGEKV_H1_RUNTIME_MONITOR(不受 RUNTIME_MONITOR_PATH 影响),
+# 临时开时用 EDGEKV_H1_RUNTIME_MONITOR=1(需在子进程 import 前由 env 传入)。
+_EDGEKV_LPE_MONITOR_ENABLED = _edgekv_env_bool('EDGEKV_H1_RUNTIME_MONITOR', False)
+
+
 def _edgekv_record_lpe_monitor(
     lpe_action: str,
     *,
@@ -295,6 +302,8 @@ def _edgekv_record_lpe_monitor(
     **extra: Any,
 ) -> None:
     if not _EDGEKV_GPU_POLICY_IS_LPE:
+        return
+    if not _EDGEKV_LPE_MONITOR_ENABLED:
         return
     path = _edgekv_lpe_monitor_path()
     if path is None:
@@ -403,6 +412,7 @@ def _edgekv_note_reorder_time(start_ns: int) -> None:
 def reset_edgekv_gpu_cache_stats() -> None:
     global _EDGEKV_GPU_STATS_UPDATES, _EDGEKV_GPU_POLICY_TIME_NS, _EDGEKV_GPU_EVICTION_DECISION_TIME_NS
     global _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS, _EDGEKV_LPE_MONITOR_SEQ, _EDGEKV_LPE_ADMISSION_SEQ
+    global _EDGEKV_LPE_ACCESS_SEQ
     global _EDGEKV_GPU_EVICTED_SCORE_TOTAL, _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL
     for key in _EDGEKV_GPU_STATS:
         _EDGEKV_GPU_STATS[key] = 0
@@ -417,6 +427,7 @@ def reset_edgekv_gpu_cache_stats() -> None:
     _EDGEKV_GPU_FREE_QUEUE_REORDER_TIME_NS = 0
     _EDGEKV_LPE_MONITOR_SEQ = 0
     _EDGEKV_LPE_ADMISSION_SEQ = 0
+    _EDGEKV_LPE_ACCESS_SEQ = 0
     _EDGEKV_GPU_EVICTED_SCORE_TOTAL = 0.0
     _EDGEKV_GPU_EVICTED_P_REUSE_TOTAL = 0.0
     _EDGEKV_ENV_FLOAT_CACHE.clear()
@@ -956,6 +967,13 @@ def _edgekv_profile_from_values(
             'score': 0.0,
             'access_count': 0,
             'hit_count': 0,
+            'access_history': [],
+            'freq_decay': 0.0,
+            'freq_decay_last_seq': 0,
+            'p_lruk': 0.5,
+            'p_freq_decay': 0.0,
+            'lruk_backward_distance': '',
+            'p_reuse_prior_weight': 0.0,
             'score_update_seq': 0,
             'admission_decision': '',
             'admission_rejected': False,
@@ -974,9 +992,10 @@ def _edgekv_profile_from_values(
     )
     if p_reuse_prior is not None:
         profile['p_reuse_prior'] = p_reuse_prior
-    if 'p_reuse' in meta:
+    has_access_evidence = int(profile.get('access_count', 0) or 0) > 0
+    if 'p_reuse' in meta and not has_access_evidence:
         profile['p_reuse'] = float(meta.get('p_reuse', profile.get('p_reuse', 0.5)) or 0.5)
-    elif p_reuse_prior is not None:
+    elif p_reuse_prior is not None and not has_access_evidence:
         profile['p_reuse'] = p_reuse_prior
     _edgekv_recompute_profile_score(profile)
     return profile
@@ -1051,15 +1070,17 @@ def _edgekv_recompute_profile_score(profile: dict[str, Any]) -> None:
     )
 
 
-def _edgekv_lpe_reuse_weights() -> tuple[float, float, float, float]:
-    w_freq = _edgekv_env_float('H1_LPE_W_FREQ', 0.55)
-    w_recency = _edgekv_env_float('H1_LPE_W_RECENCY', 0.30)
-    w_type = _edgekv_env_float('H1_LPE_W_TYPE', 0.15)
-    return w_freq, w_recency, w_type, max(w_freq + w_recency + w_type, 1e-9)
+def _edgekv_lpe_reuse_weights() -> tuple[float, float, float]:
+    w_lruk = _edgekv_env_float('H1_LPE_W_LRUK', 0.65)
+    w_freq_decay = _edgekv_env_float('H1_LPE_W_FREQ_DECAY', 0.35)
+    return w_lruk, w_freq_decay, max(w_lruk + w_freq_decay, 1e-9)
 
 
-def _edgekv_p_reuse_prior_weight() -> float:
-    return _edgekv_clamp(_edgekv_env_float('H1_LPE_W_PRIOR', 0.70), 0.0, 1.0)
+def _edgekv_p_reuse_prior_weight(access_count: int) -> float:
+    base = _edgekv_clamp(_edgekv_env_float('H1_LPE_W_PRIOR_COLD', 0.70), 0.0, 1.0)
+    decay = max(_edgekv_env_float('H1_LPE_PRIOR_DECAY_ACCESSES', 2.0), 1e-9)
+    evidence = max(int(access_count), 0)
+    return _edgekv_clamp(base * math.exp(-float(evidence) / decay), 0.0, base)
 
 
 def _edgekv_meta_p_reuse_prior(meta: dict[str, Any]) -> float | None:
@@ -1075,23 +1096,6 @@ def _edgekv_clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _edgekv_object_type_prior(object_type: str) -> float:
-    normalized = str(object_type or 'unknown').lower()
-    if 'hot' in normalized:
-        return 0.90
-    if 'cold' in normalized:
-        return 0.10
-    if 'prefix' in normalized:
-        return 0.80
-    if 'session' in normalized:
-        return 0.70
-    if 'rag' in normalized or 'chunk' in normalized:
-        return 0.60
-    if 'token_block' in normalized or normalized == 'block':
-        return 0.45
-    return 0.50
-
-
 def _edgekv_should_profile_object(object_type: str) -> bool:
     normalized = str(object_type or 'unknown').lower()
     if 'token_block' in normalized or normalized == 'block':
@@ -1101,17 +1105,28 @@ def _edgekv_should_profile_object(object_type: str) -> bool:
 
 def _edgekv_refresh_profile_reuse(profile: dict[str, Any]) -> None:
     access_count = max(int(profile.get('access_count', 0) or 0), 1)
-    hit_count = int(profile.get('hit_count', 0) or 0)
-    misses = max(access_count - hit_count, 0)
-    p_freq = _edgekv_clamp(hit_count / access_count, 0.0, 1.0)
-    p_recency = 1.0 / (1.0 + math.log1p(misses))
-    p_type = _edgekv_object_type_prior(str(profile.get('object_type', 'unknown')))
-    w_freq, w_recency, w_type, weight_sum = _edgekv_lpe_reuse_weights()
-    p_reuse = (
-        (w_freq * p_freq)
-        + (w_recency * p_recency)
-        + (w_type * p_type)
-    ) / weight_sum
+    history = [
+        int(value)
+        for value in profile.get('access_history', [])
+        if int(value) > 0
+    ]
+    k = max(_edgekv_env_int('H1_LPE_LRUK_K', 2), 2)
+    if len(history) >= k:
+        backward_distance = max(history[-1] - history[-k], 1)
+        lruk_scale = max(_edgekv_env_float('H1_LPE_LRUK_DISTANCE_SCALE', 8.0), 1e-9)
+        p_lruk = 1.0 / (1.0 + (float(backward_distance) / lruk_scale))
+    else:
+        backward_distance = ''
+        p_lruk = 0.5
+    decay = _edgekv_clamp(_edgekv_env_float('H1_LPE_FREQ_DECAY', 0.85), 0.0, 0.999)
+    last_decay_seq = int(profile.get('freq_decay_last_seq', _EDGEKV_LPE_ACCESS_SEQ) or _EDGEKV_LPE_ACCESS_SEQ)
+    decay_gap = max(_EDGEKV_LPE_ACCESS_SEQ - last_decay_seq, 0)
+    freq_decay = float(profile.get('freq_decay', 0.0) or 0.0) * (decay ** decay_gap)
+    profile['freq_decay'] = freq_decay
+    profile['freq_decay_last_seq'] = _EDGEKV_LPE_ACCESS_SEQ
+    p_freq_decay = 1.0 - math.exp(-max(freq_decay, 0.0))
+    w_lruk, w_freq_decay, weight_sum = _edgekv_lpe_reuse_weights()
+    p_reuse = ((w_lruk * p_lruk) + (w_freq_decay * p_freq_decay)) / weight_sum
     p_reuse_prior = None
     if profile.get('p_reuse_prior', '') != '':
         try:
@@ -1119,11 +1134,12 @@ def _edgekv_refresh_profile_reuse(profile: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             p_reuse_prior = None
     if p_reuse_prior is not None:
-        prior_weight = _edgekv_p_reuse_prior_weight()
+        prior_weight = _edgekv_p_reuse_prior_weight(access_count)
         p_reuse = (prior_weight * p_reuse_prior) + ((1.0 - prior_weight) * p_reuse)
-    profile['p_freq'] = p_freq
-    profile['p_recency'] = p_recency
-    profile['p_type'] = p_type
+    profile['p_lruk'] = _edgekv_clamp(p_lruk, 0.0, 1.0)
+    profile['p_freq_decay'] = _edgekv_clamp(p_freq_decay, 0.0, 1.0)
+    profile['lruk_backward_distance'] = backward_distance
+    profile['p_reuse_prior_weight'] = prior_weight if p_reuse_prior is not None else 0.0
     if p_reuse_prior is not None:
         profile['p_reuse_prior'] = p_reuse_prior
     profile['p_reuse'] = _edgekv_clamp(p_reuse, 0.01, 0.99)
@@ -1227,10 +1243,22 @@ def _edgekv_drop_block_object(pool: Any, kv_cache_group_id: int | None, block_id
 
 
 def _edgekv_note_profile_access(profile: dict[str, Any], hit: bool) -> bool:
+    global _EDGEKV_LPE_ACCESS_SEQ
+    _EDGEKV_LPE_ACCESS_SEQ += 1
     profile['access_count'] = int(profile.get('access_count', 0) or 0) + 1
     if hit:
         profile['hit_count'] = int(profile.get('hit_count', 0) or 0) + 1
-    profile['last_access_seq'] = int(profile.get('access_count', 0) or 0)
+    profile['last_access_seq'] = _EDGEKV_LPE_ACCESS_SEQ
+    history_limit = max(_edgekv_env_int('H1_LPE_ACCESS_HISTORY_LIMIT', 8), 2)
+    history = list(profile.get('access_history', []))
+    history.append(_EDGEKV_LPE_ACCESS_SEQ)
+    profile['access_history'] = history[-history_limit:]
+    decay = _edgekv_clamp(_edgekv_env_float('H1_LPE_FREQ_DECAY', 0.85), 0.0, 0.999)
+    last_seq = int(profile.get('freq_decay_last_seq', _EDGEKV_LPE_ACCESS_SEQ) or _EDGEKV_LPE_ACCESS_SEQ)
+    gap = max(_EDGEKV_LPE_ACCESS_SEQ - last_seq, 0)
+    freq_decay = float(profile.get('freq_decay', 0.0) or 0.0) * (decay ** gap)
+    profile['freq_decay'] = freq_decay + 1.0
+    profile['freq_decay_last_seq'] = _EDGEKV_LPE_ACCESS_SEQ
     interval = max(_edgekv_env_int('H1_LPE_SCORE_UPDATE_INTERVAL', 8), 1)
     access_count = int(profile.get('access_count', 0) or 0)
     if access_count == 1 or access_count % interval == 0:
@@ -1522,6 +1550,94 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     _edgekv_note_reorder_time(start_ns)
 
 
+def _edgekv_prepend_n(queue: Any, blocks: list[Any]) -> None:
+    """把 blocks 插到 free queue 头部（fake_free_list_head 之后），保持 blocks 内部顺序：
+    blocks[0] 最靠近 head（最先被 vLLM popleft/驱逐）。
+
+    vLLM 的 FreeKVCacheBlockQueue 只有 append/append_n（接尾部），没有 appendleft；
+    这里手工维护与 remove/append 完全相同的链表不变量（prev/next 指针 + num_free_blocks），
+    以便把"最该驱逐"的低分块放到驱逐端，而不是像 append_n 那样放到受保护的尾端。
+    """
+    if not blocks:
+        return
+    head = getattr(queue, 'fake_free_list_head', None)
+    if head is None:
+        return
+    after = head.next_free_block            # 原头部第一个真实块（或 fake_tail）
+    if after is None:
+        return
+    prev = head
+    for block in blocks:                    # blocks[0] 紧邻 head
+        prev.next_free_block = block
+        block.prev_free_block = prev
+        prev = block
+    prev.next_free_block = after
+    after.prev_free_block = prev
+    queue.num_free_blocks += len(blocks)     # remove() 已各自 -1，这里补回
+
+
+def _edgekv_promote_lowest_score_victims(pool: Any, num_blocks: int | None = None) -> None:
+    """方案三：分配新块前，把 rank 最低（最该驱逐）的 n 个 free block 精确移到 free queue
+    头部，使 vLLM 原生 popleft_n(n) 正好驱逐它们，真正实现"分数越小越优先驱逐"。
+
+    与 _edgekv_reorder_free_queue 的区别：不重排整个头部窗口、不 append 到尾部（那会把低分
+    块搬到受保护端、方向反了），只精确搬 n 个块到头部；规模 O(n) 而非 O(window)。
+    """
+    if not _EDGEKV_GPU_POLICY_ENABLED or not getattr(pool, 'enable_caching', False):
+        return
+    _edgekv_init_pool_state(pool)
+    _edgekv_note_gpu_stat('free_queue_reorder_calls')
+    queue = pool.free_block_queue
+    n = max(int(num_blocks or 1), 1)
+    free_count = _edgekv_free_queue_length(queue)
+    if free_count <= n:
+        # 整个 free queue 都会被这次分配用掉，选谁都一样，无需搬运。
+        return
+    # 把头部尚未跟踪的 block 补进 rank heap（例如从未被 touch 的原始 block）。
+    for block in _edgekv_free_queue_head_window(queue, n):
+        block_id = _edgekv_block_id(block)
+        pool._edgekv_h1_blocks[block_id] = block
+        if block_id not in pool._edgekv_h1_rank_version:
+            _edgekv_heap_touch_block(pool, block)
+    # 随负载上升，避免懒删除 heap 被陈旧 entry 膨胀（沿用 reorder 的压缩阈值）。
+    compact_floor = max(_edgekv_env_int('H1_LPE_HEAP_COMPACT_MIN', 1024), 2)
+    if len(pool._edgekv_h1_rank_heap) > max(compact_floor, 4 * len(pool._edgekv_h1_rank_version)):
+        _edgekv_compact_rank_heap(pool)
+    # 从 rank heap 弹出 rank 最低、仍在 free queue 中的 n 个块（升序，victims[0]=最低分）。
+    victims: list[Any] = []
+    seen: set[int] = set()
+    heap = pool._edgekv_h1_rank_heap
+    while heap and len(victims) < n:
+        item = heapq.heappop(heap)
+        block = _edgekv_heap_valid_block(pool, item)
+        if block is None:
+            continue
+        block_id = _edgekv_block_id(block)
+        if block_id in seen or not _edgekv_block_in_free_queue(block):
+            continue
+        victims.append(block)
+        seen.add(block_id)
+    if not victims:
+        return
+    # 若头部已经就是这批最低分块（顺序一致），无需搬运，避免无谓的链表改写。
+    head_prefix = [
+        _edgekv_block_id(block)
+        for block in _edgekv_free_queue_head_window(queue, len(victims))
+    ]
+    victim_order = [_edgekv_block_id(block) for block in victims]
+    if head_prefix == victim_order:
+        for block in victims:
+            _edgekv_heap_touch_block(pool, block)
+        return
+    # 关键修正：把低分块搬到【头部】（驱逐端），而非 append_n 到尾部（保护端）。
+    for block in victims:
+        queue.remove(block)
+    _edgekv_prepend_n(queue, victims)
+    for block in victims:
+        _edgekv_heap_touch_block(pool, block)
+    _edgekv_note_gpu_stat('queue_reorders')
+
+
 def _install_edgekv_native_hit_rate_patch() -> None:
     """把 vLLM 原生 token 级前缀缓存覆盖率镜像到 edgekv stats。
 
@@ -1773,7 +1889,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:
         if _edgekv_gpu_policy_needs_rank_state():
             decision_start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
-            _edgekv_reorder_free_queue(self, num_blocks)
+            _edgekv_promote_lowest_score_victims(self, num_blocks)
             _edgekv_note_eviction_decision_time(decision_start_ns)
         return original_get_new_blocks(self, num_blocks)
 
