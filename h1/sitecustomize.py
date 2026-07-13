@@ -1550,94 +1550,6 @@ def _edgekv_reorder_free_queue(pool: Any, num_blocks: int | None = None) -> None
     _edgekv_note_reorder_time(start_ns)
 
 
-def _edgekv_prepend_n(queue: Any, blocks: list[Any]) -> None:
-    """把 blocks 插到 free queue 头部（fake_free_list_head 之后），保持 blocks 内部顺序：
-    blocks[0] 最靠近 head（最先被 vLLM popleft/驱逐）。
-
-    vLLM 的 FreeKVCacheBlockQueue 只有 append/append_n（接尾部），没有 appendleft；
-    这里手工维护与 remove/append 完全相同的链表不变量（prev/next 指针 + num_free_blocks），
-    以便把"最该驱逐"的低分块放到驱逐端，而不是像 append_n 那样放到受保护的尾端。
-    """
-    if not blocks:
-        return
-    head = getattr(queue, 'fake_free_list_head', None)
-    if head is None:
-        return
-    after = head.next_free_block            # 原头部第一个真实块（或 fake_tail）
-    if after is None:
-        return
-    prev = head
-    for block in blocks:                    # blocks[0] 紧邻 head
-        prev.next_free_block = block
-        block.prev_free_block = prev
-        prev = block
-    prev.next_free_block = after
-    after.prev_free_block = prev
-    queue.num_free_blocks += len(blocks)     # remove() 已各自 -1，这里补回
-
-
-def _edgekv_promote_lowest_score_victims(pool: Any, num_blocks: int | None = None) -> None:
-    """方案三：分配新块前，把 rank 最低（最该驱逐）的 n 个 free block 精确移到 free queue
-    头部，使 vLLM 原生 popleft_n(n) 正好驱逐它们，真正实现"分数越小越优先驱逐"。
-
-    与 _edgekv_reorder_free_queue 的区别：不重排整个头部窗口、不 append 到尾部（那会把低分
-    块搬到受保护端、方向反了），只精确搬 n 个块到头部；规模 O(n) 而非 O(window)。
-    """
-    if not _EDGEKV_GPU_POLICY_ENABLED or not getattr(pool, 'enable_caching', False):
-        return
-    _edgekv_init_pool_state(pool)
-    _edgekv_note_gpu_stat('free_queue_reorder_calls')
-    queue = pool.free_block_queue
-    n = max(int(num_blocks or 1), 1)
-    free_count = _edgekv_free_queue_length(queue)
-    if free_count <= n:
-        # 整个 free queue 都会被这次分配用掉，选谁都一样，无需搬运。
-        return
-    # 把头部尚未跟踪的 block 补进 rank heap（例如从未被 touch 的原始 block）。
-    for block in _edgekv_free_queue_head_window(queue, n):
-        block_id = _edgekv_block_id(block)
-        pool._edgekv_h1_blocks[block_id] = block
-        if block_id not in pool._edgekv_h1_rank_version:
-            _edgekv_heap_touch_block(pool, block)
-    # 随负载上升，避免懒删除 heap 被陈旧 entry 膨胀（沿用 reorder 的压缩阈值）。
-    compact_floor = max(_edgekv_env_int('H1_LPE_HEAP_COMPACT_MIN', 1024), 2)
-    if len(pool._edgekv_h1_rank_heap) > max(compact_floor, 4 * len(pool._edgekv_h1_rank_version)):
-        _edgekv_compact_rank_heap(pool)
-    # 从 rank heap 弹出 rank 最低、仍在 free queue 中的 n 个块（升序，victims[0]=最低分）。
-    victims: list[Any] = []
-    seen: set[int] = set()
-    heap = pool._edgekv_h1_rank_heap
-    while heap and len(victims) < n:
-        item = heapq.heappop(heap)
-        block = _edgekv_heap_valid_block(pool, item)
-        if block is None:
-            continue
-        block_id = _edgekv_block_id(block)
-        if block_id in seen or not _edgekv_block_in_free_queue(block):
-            continue
-        victims.append(block)
-        seen.add(block_id)
-    if not victims:
-        return
-    # 若头部已经就是这批最低分块（顺序一致），无需搬运，避免无谓的链表改写。
-    head_prefix = [
-        _edgekv_block_id(block)
-        for block in _edgekv_free_queue_head_window(queue, len(victims))
-    ]
-    victim_order = [_edgekv_block_id(block) for block in victims]
-    if head_prefix == victim_order:
-        for block in victims:
-            _edgekv_heap_touch_block(pool, block)
-        return
-    # 关键修正：把低分块搬到【头部】（驱逐端），而非 append_n 到尾部（保护端）。
-    for block in victims:
-        queue.remove(block)
-    _edgekv_prepend_n(queue, victims)
-    for block in victims:
-        _edgekv_heap_touch_block(pool, block)
-    _edgekv_note_gpu_stat('queue_reorders')
-
-
 def _install_edgekv_native_hit_rate_patch() -> None:
     """把 vLLM 原生 token 级前缀缓存覆盖率镜像到 edgekv stats。
 
@@ -1889,7 +1801,7 @@ def _install_edgekv_gpu_prefix_cache_patch() -> None:
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:
         if _edgekv_gpu_policy_needs_rank_state():
             decision_start_ns = time.perf_counter_ns() if _EDGEKV_GPU_PROFILE_POLICY_TIME else 0
-            _edgekv_promote_lowest_score_victims(self, num_blocks)
+            _edgekv_reorder_free_queue(self, num_blocks)
             _edgekv_note_eviction_decision_time(decision_start_ns)
         return original_get_new_blocks(self, num_blocks)
 
